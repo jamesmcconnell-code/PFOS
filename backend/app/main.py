@@ -49,24 +49,41 @@ def login(body:Login, db:Session=Depends(get_db)):
     return {'access_token':create_token(str(user.id))}
 @app.get('/api/v1/auth/me')
 def me(user=Depends(current_user)): return {'id':str(user.id),'email':user.email,'display_name':user.display_name}
+@app.patch('/api/v1/auth/me')
+def update_me(body:UserUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    other=db.scalar(select(User).where(User.email==body.email,User.id!=user.id))
+    if other: raise HTTPException(409,'Email already in use')
+    user.display_name,user.email=body.display_name,body.email
+    if body.password: user.password_hash=hash_password(body.password)
+    db.commit();return {'id':str(user.id),'email':user.email,'display_name':user.display_name}
 
 @app.get('/api/v1/household')
 def get_household(user=Depends(current_user),db:Session=Depends(get_db)):
     h=db.get(Household,household(user,db)); return serialize(h)
+@app.get('/api/v1/household/members')
+def household_members(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); members=db.scalars(select(HouseholdMember).where(HouseholdMember.household_id==h)).all(); return [{'id':str(m.user_id),'display_name':db.get(User,m.user_id).display_name,'email':db.get(User,m.user_id).email,'role':m.role} for m in members]
 @app.get('/api/v1/accounts')
-def accounts(user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); connections={x.id:x.name for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
-    for x in db.scalars(select(Account).where(Account.household_id==h,Account.is_active==True)).all():
-        row=serialize(x);row['source_name']=connections.get(x.connection_id,'Manual');result.append(row)
+def accounts(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); connections={x.id:x.name for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; users={x.id:x.display_name for x in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}; result=[]
+    q=select(Account).where(Account.household_id==h,Account.is_active==True)
+    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    for x in db.scalars(q).all():
+        row=serialize(x);row.update(source_name=connections.get(x.connection_id,'Manual'),owner_name=users.get(x.owner_id,'Joint household'));result.append(row)
     return result
 @app.post('/api/v1/accounts')
 def add_account(body:AccountIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    a=Account(household_id=household(user,db),**body.model_dump()); db.add(a); db.commit(); return serialize(a)
+    h=household(user,db)
+    if body.account_type not in {'debt','brokerage','income','spending','crypto'}: raise HTTPException(400,'Invalid account type')
+    if body.ownership=='individual' and (not body.owner_id or not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==h,HouseholdMember.user_id==body.owner_id))): raise HTTPException(400,'Select a household member for an individual account')
+    a=Account(household_id=h,**body.model_dump()); db.add(a); db.commit(); return serialize(a)
 @app.patch('/api/v1/accounts/{account_id}')
-def update_account(account_id:UUID,body:AccountIn,user=Depends(current_user),db:Session=Depends(get_db)):
+def update_account(account_id:UUID,body:AccountUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     a=db.get(Account,account_id)
     if not a or a.household_id!=household(user,db): raise HTTPException(404,'Account not found')
-    for k,v in body.model_dump().items(): setattr(a,k,v)
+    if body.account_type not in {'debt','brokerage','income','spending','crypto'}: raise HTTPException(400,'Invalid account type')
+    if body.ownership=='individual' and (not body.owner_id or not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==a.household_id,HouseholdMember.user_id==body.owner_id))): raise HTTPException(400,'Select a household member for an individual account')
+    a.name,a.balance,a.account_type,a.ownership,a.owner_id=body.name,body.balance,body.account_type,body.ownership,body.owner_id if body.ownership=='individual' else None
     db.commit(); return serialize(a)
 @app.delete('/api/v1/accounts/{account_id}',status_code=204)
 def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -80,14 +97,17 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
     db.delete(a);db.commit()
 
 @app.get('/api/v1/transactions')
-def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,limit:int=100,user=Depends(current_user),db:Session=Depends(get_db)):
-    q=select(Transaction).where(Transaction.household_id==household(user,db)).order_by(Transaction.date.desc()).limit(min(limit,500))
+def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,limit:int=100,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db)
+    visible_accounts=select(Account.id).where(Account.household_id==h)
+    if view_user_id: visible_accounts=visible_accounts.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    q=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)).order_by(Transaction.date.desc()).limit(min(limit,500))
     if search: q=q.where(Transaction.description.ilike(f'%{search}%'))
     if account_id: q=q.where(Transaction.account_id==account_id)
     if category_id: q=q.where(Transaction.category_id==category_id)
-    h=household(user,db); accounts_by_id={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}; categories_by_id={x.id:x for x in db.scalars(select(Category).where(Category.household_id==h)).all()}; connections_by_id={x.id:x for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
+    accounts_by_id={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}; categories_by_id={x.id:x for x in db.scalars(select(Category).where(Category.household_id==h)).all()}; connections_by_id={x.id:x for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
     for x in db.scalars(q).all():
-        row=serialize(x);account=accounts_by_id.get(x.account_id);row.update(account_name=account.name if account else 'Unknown account',account_type=account.type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual');result.append(row)
+        row=serialize(x);account=accounts_by_id.get(x.account_id);row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual');result.append(row)
     return result
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -175,6 +195,13 @@ def connections(user=Depends(current_user),db:Session=Depends(get_db)):
     for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h).order_by(DataConnection.created_at.desc())).all():
         rows.append(serialize_connection(x))
     return rows
+@app.delete('/api/v1/connections/{connection_id}',status_code=204)
+def unlink_connection(connection_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    x=db.get(DataConnection,connection_id)
+    if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
+    # An unlink removes source-owned data; manually created accounts are never affected.
+    for account in db.scalars(select(Account).where(Account.connection_id==x.id)).all(): db.delete(account)
+    db.delete(x);db.commit()
 @app.post('/api/v1/connections')
 def create_connection(body:ConnectionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     if body.provider not in CONNECTORS: raise HTTPException(400,'Provider must be plaid, coinbase, or gemini')
@@ -226,20 +253,32 @@ def connection_syncs(connection_id:UUID,user=Depends(current_user),db:Session=De
     if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
     return [serialize(run) for run in db.scalars(select(ConnectionSync).where(ConnectionSync.connection_id==x.id).order_by(ConnectionSync.created_at.desc())).all()]
 
-def metrics(h,db):
-    accounts=db.scalars(select(Account).where(Account.household_id==h,Account.is_active==True)).all(); net=sum(float(x.balance) for x in accounts); debt=float(db.scalar(select(func.coalesce(func.sum(Debt.balance),0)).where(Debt.household_id==h)) or 0)
-    income=float(db.scalar(select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)) or 0)
-    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.date>=date.today().replace(day=1))).all(); expenses=-sum(float(x.amount) for x in tx if float(x.amount)<0); savings=income-expenses
-    essential=-sum(float(x.amount) for x in tx if float(x.amount)<0 and x.is_essential); return {'net_worth':net-debt,'cash_available':sum(float(x.balance) for x in accounts if x.type in ('checking','savings')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
+def metrics(h,db,view_user_id=None):
+    q=select(Account).where(Account.household_id==h,Account.is_active==True)
+    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    accounts=db.scalars(q).all(); account_ids=[x.id for x in accounts]; accounts_by_id={x.id:x for x in accounts}; debt_accounts=sum(abs(float(x.balance)) for x in accounts if x.account_type=='debt'); assets=sum(float(x.balance) for x in accounts if x.account_type!='debt'); legacy_debt=float(db.scalar(select(func.coalesce(func.sum(Debt.balance),0)).where(Debt.household_id==h)) or 0); debt=debt_accounts+legacy_debt
+    income_q=select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
+    if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
+    manual_income=float(db.scalar(income_q) or 0)
+    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=date.today().replace(day=1))).all() if account_ids else []
+    payroll=sum(float(x.amount) for x in tx if float(x.amount)>0 and accounts_by_id.get(x.account_id) and accounts_by_id[x.account_id].account_type=='spending'); income=manual_income+payroll; expenses=-sum(float(x.amount) for x in tx if float(x.amount)<0); savings=income-expenses
+    essential=-sum(float(x.amount) for x in tx if float(x.amount)<0 and x.is_essential); return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
 @app.get('/api/v1/dashboard')
-def dashboard(user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); m=metrics(h,db); m['goals']=goals(user,db);m['alerts']=['Emergency fund is below six months of essential spending'] if m['cash_available']<m['essential_monthly']*6 else [];return m
+def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); m=metrics(h,db,view_user_id); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
+    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    crypto={}
+    for a in db.scalars(q).all():
+        if float(a.balance): crypto[a.asset_symbol or a.name]=crypto.get(a.asset_symbol or a.name,0)+float(a.balance)
+    m.update(goals=goals(user,db),crypto_assets=[{'symbol':k,'amount':v} for k,v in sorted(crypto.items())],alerts=['Emergency fund is below six months of essential spending'] if m['cash_available']<m['essential_monthly']*6 else []);return m
 @app.get('/api/v1/forecast')
-def forecast(monthly_savings:float|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); m=metrics(h,db); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[]
+def forecast(monthly_savings:float|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); m=metrics(h,db,view_user_id); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[]
     for g in goals(user,db):
         remaining=max(0,float(g['target_amount'])-g['saved_amount']); months=remaining/savings if savings>0 else None; output.append({'goal':g['name'],'monthly_savings':savings,'months_to_complete':round(months,1) if months is not None else None,'projected_completion':str(date.today().replace(year=date.today().year+int(months//12))) if months is not None else None})
     return {'projected_savings_12_months':savings*12,'goals':output}
 @app.get('/api/v1/analysis/live-on-one-income')
-def one_income(user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db);m=metrics(h,db); incomes=db.scalars(select(IncomeSource).where(IncomeSource.household_id==h,IncomeSource.is_active==True)).all(); return {'monthly_expenses':m['monthly_expenses'],'scenarios':[{'name':x.name,'income':float(x.monthly_amount),'surplus':float(x.monthly_amount)-m['monthly_expenses'],'sustainable':float(x.monthly_amount)>=m['monthly_expenses']} for x in incomes]+[{'name':'Combined income','income':m['monthly_income'],'surplus':m['monthly_savings'],'sustainable':m['monthly_savings']>=0}]}
+def one_income(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db);m=metrics(h,db,view_user_id); income_q=select(IncomeSource).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
+    if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
+    incomes=db.scalars(income_q).all(); return {'monthly_expenses':m['monthly_expenses'],'scenarios':[{'name':x.name,'income':float(x.monthly_amount),'surplus':float(x.monthly_amount)-m['monthly_expenses'],'sustainable':float(x.monthly_amount)>=m['monthly_expenses']} for x in incomes]+[{'name':'Combined income','income':m['monthly_income'],'surplus':m['monthly_savings'],'sustainable':m['monthly_savings']>=0}]}

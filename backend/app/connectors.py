@@ -17,7 +17,7 @@ from .models import Account, Category, DataConnection, Transaction
 
 @dataclass
 class NormalizedAccount:
-    external_id: str; name: str; type: str; balance: Decimal = Decimal('0')
+    external_id: str; name: str; type: str; balance: Decimal = Decimal('0'); asset_symbol: str | None = None
 @dataclass
 class NormalizedTransaction:
     external_id: str | None; account_external_id: str; posted_on: date; description: str; amount: Decimal; notes: str | None = None; source_category: str | None = None; is_pending: bool = False
@@ -76,7 +76,7 @@ class CoinbaseConnector(Connector):
                 params={'limit':250};
                 if page_cursor: params['cursor']=page_cursor
                 body=httpx.get('https://api.coinbase.com'+path,params=params,headers={'Authorization':f'Bearer {token}'},timeout=30).raise_for_status().json()
-                accounts.extend(NormalizedAccount(a['uuid'],a.get('name') or f"Coinbase {a['currency']}",'crypto',Decimal(str(a.get('available_balance',{}).get('value') or 0))) for a in body.get('accounts',[]) if a.get('active',True))
+                accounts.extend(NormalizedAccount(a['uuid'],a.get('name') or f"Coinbase {a['currency']}",'crypto',Decimal(str(a.get('available_balance',{}).get('value') or 0)),a.get('currency')) for a in body.get('accounts',[]) if a.get('active',True))
                 page_cursor=body.get('cursor')
                 if not body.get('has_next'): break
         except httpx.HTTPStatusError as exc:
@@ -117,8 +117,8 @@ def persist_payload(db: Session, connection: DataConnection, payload: SyncPayloa
         if source.external_id in ignored: continue
         target=account_map.get(source.external_id)
         if not target:
-            target=Account(household_id=connection.household_id,connection_id=connection.id,external_id=source.external_id,name=source.name,type=source.type,balance=source.balance); db.add(target); db.flush(); account_map[source.external_id]=target
-        else: target.name, target.type, target.balance=source.name,source.type,source.balance
+            target=Account(household_id=connection.household_id,connection_id=connection.id,external_id=source.external_id,name=source.name,type=source.type,account_type=_default_account_type(source.type),asset_symbol=source.asset_symbol,balance=source.balance); db.add(target); db.flush(); account_map[source.external_id]=target
+        else: target.name, target.type, target.balance, target.asset_symbol=source.name,source.type,source.balance,source.asset_symbol or target.asset_symbol
     categories={c.name:c for c in db.scalars(select(Category).where(Category.household_id==connection.household_id)).all()}
     added=duplicates=0
     for source in payload.transactions:
@@ -142,3 +142,5 @@ def _category_for(db: Session, cache: dict, household_id, source_category: str |
     if category: return category
     essential=source_category in {'RENT_AND_UTILITIES','MEDICAL','LOAN_PAYMENTS','TRANSPORTATION'}
     category=Category(household_id=household_id,name=name,kind='income' if amount>0 and source_category=='INCOME' else 'expense',is_essential_default=essential);db.add(category);db.flush();cache[name]=category;return category
+def _default_account_type(source_type: str) -> str:
+    return {'credit_card':'debt','crypto':'crypto','brokerage':'brokerage','savings':'income'}.get(source_type,'spending')
