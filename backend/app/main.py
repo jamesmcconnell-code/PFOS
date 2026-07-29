@@ -10,7 +10,7 @@ from .database import get_db
 from .models import *
 from .schemas import *
 from .security import hash_password, verify_password, create_token, decode_token
-from .connectors import CONNECTORS, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
+from .connectors import CONNECTORS, ConnectorAuthenticationError, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
 from .config import settings
 
 app=FastAPI(title='PFOS API', version='1.0.0')
@@ -180,7 +180,11 @@ def create_connection(body:ConnectionIn,user=Depends(current_user),db:Session=De
     if body.provider not in CONNECTORS: raise HTTPException(400,'Provider must be plaid, coinbase, or gemini')
     required={'coinbase':{'api_key','api_secret'},'gemini':{'api_key','api_secret'},'plaid':{'access_token'}}[body.provider]
     if not required.issubset(body.credentials): raise HTTPException(400,f'Missing credentials: {", ".join(sorted(required-set(body.credentials)))}')
-    x=DataConnection(household_id=household(user,db),provider=body.provider,name=body.name,encrypted_credentials=encrypt_credentials(body.credentials));db.add(x);db.commit();return serialize_connection(x)
+    h=household(user,db); x=db.scalar(select(DataConnection).where(DataConnection.household_id==h,DataConnection.provider==body.provider,DataConnection.name==body.name))
+    if x:
+        x.encrypted_credentials=encrypt_credentials(body.credentials);x.cursor=None;x.status='active'
+    else: x=DataConnection(household_id=h,provider=body.provider,name=body.name,encrypted_credentials=encrypt_credentials(body.credentials));db.add(x)
+    db.commit();return serialize_connection(x)
 @app.post('/api/v1/connections/plaid/link-token')
 def plaid_link_token(user=Depends(current_user),db:Session=Depends(get_db)):
     if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
@@ -202,6 +206,8 @@ def sync_connection(connection_id:UUID,user=Depends(current_user),db:Session=Dep
     run=ConnectionSync(connection_id=x.id,status='running');db.add(run);db.flush()
     try:
         payload=CONNECTORS[x.provider].fetch(decrypt_credentials(x.encrypted_credentials),x.cursor); added,dupes=persist_payload(db,x,payload);x.cursor=payload.cursor;x.last_synced_at=datetime.utcnow();run.status='complete';run.imported_count=added;run.duplicate_count=dupes;db.commit();return {'imported':added,'duplicates':dupes,'connection':serialize_connection(x)}
+    except ConnectorAuthenticationError as exc:
+        db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc));db.add(run);db.commit();raise HTTPException(422,str(exc))
     except Exception as exc:
         db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc)[:500]);db.add(run);db.commit();raise HTTPException(502,'Sync failed; review the connection credentials and provider status')
 @app.post('/api/v1/connections/csv/{account_id}')

@@ -1,12 +1,15 @@
 """Provider adapters and the canonical PFOS normalization/persistence pipeline."""
-import base64, csv, hashlib, hmac, io, json, time
+import base64, binascii, csv, hashlib, hmac, io, json, secrets, time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 import httpx
+import jwt
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import settings
@@ -32,6 +35,7 @@ def decrypt_credentials(value: str | None) -> dict[str, Any]: return json.loads(
 class Connector(ABC):
     @abstractmethod
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload: ...
+class ConnectorAuthenticationError(Exception): pass
 
 class CsvConnector(Connector):
     """Accepts conventional date/description/amount rows; callers supply an account external id."""
@@ -66,12 +70,36 @@ def _plaid_type(subtype: str | None, kind: str | None) -> str:
 
 class CoinbaseConnector(Connector):
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload:
-        # Coinbase Advanced Trade authentication signs METHOD + PATH + timestamp + body.
-        ts=str(int(time.time())); path='/api/v3/brokerage/accounts'; secret=credentials['api_secret'].encode(); message=f'{ts}GET{path}'.encode()
-        signature=hmac.new(secret,message,hashlib.sha256).hexdigest(); headers={'CB-ACCESS-KEY':credentials['api_key'],'CB-ACCESS-SIGN':signature,'CB-ACCESS-TIMESTAMP':ts}
-        body=httpx.get('https://api.coinbase.com'+path,headers=headers,timeout=30).raise_for_status().json()
-        accounts=[NormalizedAccount(a['uuid'],f"Coinbase {a['currency']}",'crypto',Decimal(str(a.get('available_balance',{}).get('value') or 0))) for a in body.get('accounts',[])]
+        path='/api/v3/brokerage/accounts'; token=_coinbase_rest_jwt(credentials['api_key'],credentials['api_secret'],'GET',path); accounts=[]; page_cursor=None
+        try:
+            while True:
+                params={'limit':250};
+                if page_cursor: params['cursor']=page_cursor
+                body=httpx.get('https://api.coinbase.com'+path,params=params,headers={'Authorization':f'Bearer {token}'},timeout=30).raise_for_status().json()
+                accounts.extend(NormalizedAccount(a['uuid'],a.get('name') or f"Coinbase {a['currency']}",'crypto',Decimal(str(a.get('available_balance',{}).get('value') or 0))) for a in body.get('accounts',[]) if a.get('active',True))
+                page_cursor=body.get('cursor')
+                if not body.get('has_next'): break
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401,403): raise ConnectorAuthenticationError('Coinbase rejected this connection. Use a CDP Advanced Trade API key with View permission and its private-key secret.') from exc
+            raise
         return SyncPayload(accounts,[],cursor)
+
+def _coinbase_rest_jwt(api_key: str, api_secret: str, method: str, path: str) -> str:
+    """Build the request-bound JWT required by Coinbase Advanced Trade CDP keys."""
+    secret=api_secret.replace('\\n','\n')
+    if secret.lstrip().startswith('-----BEGIN'):
+        try: private_key=serialization.load_pem_private_key(secret.encode(),password=None)
+        except ValueError as exc: raise ConnectorAuthenticationError('Coinbase private key is not a valid PEM private key.') from exc
+    else:
+        try: raw=base64.b64decode(''.join(secret.split()),validate=True)
+        except (ValueError,binascii.Error) as exc: raise ConnectorAuthenticationError('Coinbase private key is neither PEM nor valid base64.') from exc
+        if len(raw) not in (32,64): raise ConnectorAuthenticationError('Coinbase private key must be a PEM key or a 32/64-byte base64 Ed25519 key.')
+        private_key=ed25519.Ed25519PrivateKey.from_private_bytes(raw[:32])
+    if isinstance(private_key,ed25519.Ed25519PrivateKey): algorithm='EdDSA'
+    elif isinstance(private_key,ec.EllipticCurvePrivateKey): algorithm='ES256'
+    else: raise ConnectorAuthenticationError('Coinbase key must use ECDSA P-256 or Ed25519.')
+    now=int(time.time()); uri=f'{method.upper()} api.coinbase.com{path}'
+    return jwt.encode({'sub':api_key,'iss':'cdp','nbf':now,'exp':now+120,'uri':uri},private_key,algorithm=algorithm,headers={'kid':api_key,'nonce':secrets.token_hex()})
 
 class GeminiConnector(Connector):
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload:
