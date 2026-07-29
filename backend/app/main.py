@@ -30,6 +30,9 @@ def household(user: User, db: Session):
     return member.household_id
 def serialize(o):
     return {c.name: (str(getattr(o,c.name)) if getattr(o,c.name) is not None else None) for c in o.__table__.columns}
+def serialize_connection(connection: DataConnection):
+    """Connection credentials are write-only: never return ciphertext to any client."""
+    row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
 
 @app.get('/health')
 def health(): return {'status':'ok'}
@@ -52,7 +55,10 @@ def get_household(user=Depends(current_user),db:Session=Depends(get_db)):
     h=db.get(Household,household(user,db)); return serialize(h)
 @app.get('/api/v1/accounts')
 def accounts(user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); return [serialize(x) for x in db.scalars(select(Account).where(Account.household_id==h,Account.is_active==True)).all()]
+    h=household(user,db); connections={x.id:x.name for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
+    for x in db.scalars(select(Account).where(Account.household_id==h,Account.is_active==True)).all():
+        row=serialize(x);row['source_name']=connections.get(x.connection_id,'Manual');result.append(row)
+    return result
 @app.post('/api/v1/accounts')
 def add_account(body:AccountIn,user=Depends(current_user),db:Session=Depends(get_db)):
     a=Account(household_id=household(user,db),**body.model_dump()); db.add(a); db.commit(); return serialize(a)
@@ -69,7 +75,10 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     if search: q=q.where(Transaction.description.ilike(f'%{search}%'))
     if account_id: q=q.where(Transaction.account_id==account_id)
     if category_id: q=q.where(Transaction.category_id==category_id)
-    return [serialize(x) for x in db.scalars(q).all()]
+    h=household(user,db); accounts_by_id={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}; categories_by_id={x.id:x for x in db.scalars(select(Category).where(Category.household_id==h)).all()}; connections_by_id={x.id:x for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
+    for x in db.scalars(q).all():
+        row=serialize(x);account=accounts_by_id.get(x.account_id);row.update(account_name=account.name if account else 'Unknown account',account_type=account.type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual');result.append(row)
+    return result
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); a=db.get(Account,body.account_id)
@@ -143,14 +152,14 @@ def imports(user=Depends(current_user),db:Session=Depends(get_db)): return [seri
 def connections(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); rows=[]
     for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h).order_by(DataConnection.created_at.desc())).all():
-        row=serialize(x); row['credentials_configured']=bool(x.encrypted_credentials); rows.append(row)
+        rows.append(serialize_connection(x))
     return rows
 @app.post('/api/v1/connections')
 def create_connection(body:ConnectionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     if body.provider not in CONNECTORS: raise HTTPException(400,'Provider must be plaid, coinbase, or gemini')
     required={'coinbase':{'api_key','api_secret'},'gemini':{'api_key','api_secret'},'plaid':{'access_token'}}[body.provider]
     if not required.issubset(body.credentials): raise HTTPException(400,f'Missing credentials: {", ".join(sorted(required-set(body.credentials)))}')
-    x=DataConnection(household_id=household(user,db),provider=body.provider,name=body.name,encrypted_credentials=encrypt_credentials(body.credentials));db.add(x);db.commit();return serialize(x)
+    x=DataConnection(household_id=household(user,db),provider=body.provider,name=body.name,encrypted_credentials=encrypt_credentials(body.credentials));db.add(x);db.commit();return serialize_connection(x)
 @app.post('/api/v1/connections/plaid/link-token')
 def plaid_link_token(user=Depends(current_user),db:Session=Depends(get_db)):
     if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
@@ -164,14 +173,14 @@ def plaid_exchange(body:PlaidExchangeIn,user=Depends(current_user),db:Session=De
     import httpx
     try: raw=httpx.post(f'{plaid_host()}/item/public_token/exchange',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'public_token':body.public_token},timeout=30).raise_for_status().json()
     except httpx.HTTPError as exc: raise HTTPException(502,'Plaid account authorization could not be saved') from exc
-    x=DataConnection(household_id=household(user,db),provider='plaid',name=body.name,encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}));db.add(x);db.commit();return serialize(x)
+    x=DataConnection(household_id=household(user,db),provider='plaid',name=body.name,encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}));db.add(x);db.commit();return serialize_connection(x)
 @app.post('/api/v1/connections/{connection_id}/sync')
 def sync_connection(connection_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     x=db.get(DataConnection,connection_id)
     if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
     run=ConnectionSync(connection_id=x.id,status='running');db.add(run);db.flush()
     try:
-        payload=CONNECTORS[x.provider].fetch(decrypt_credentials(x.encrypted_credentials),x.cursor); added,dupes=persist_payload(db,x,payload);x.cursor=payload.cursor;x.last_synced_at=datetime.utcnow();run.status='complete';run.imported_count=added;run.duplicate_count=dupes;db.commit();return {'imported':added,'duplicates':dupes,'connection':serialize(x)}
+        payload=CONNECTORS[x.provider].fetch(decrypt_credentials(x.encrypted_credentials),x.cursor); added,dupes=persist_payload(db,x,payload);x.cursor=payload.cursor;x.last_synced_at=datetime.utcnow();run.status='complete';run.imported_count=added;run.duplicate_count=dupes;db.commit();return {'imported':added,'duplicates':dupes,'connection':serialize_connection(x)}
     except Exception as exc:
         db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc)[:500]);db.add(run);db.commit();raise HTTPException(502,'Sync failed; review the connection credentials and provider status')
 @app.post('/api/v1/connections/csv/{account_id}')
