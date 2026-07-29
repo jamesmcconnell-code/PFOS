@@ -1,0 +1,47 @@
+import uuid
+from datetime import datetime, date
+from sqlalchemy import String, Boolean, DateTime, Date, Numeric, ForeignKey, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+from .database import Base
+
+def uid(): return uuid.uuid4()
+class Audit:
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class User(Audit, Base):
+    __tablename__='users'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); email: Mapped[str]=mapped_column(String(320),unique=True,index=True); password_hash: Mapped[str]=mapped_column(String(255)); display_name: Mapped[str]=mapped_column(String(100)); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
+class Household(Audit, Base):
+    __tablename__='households'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); name: Mapped[str]=mapped_column(String(120)); currency: Mapped[str]=mapped_column(String(3),default='USD')
+class HouseholdMember(Audit, Base):
+    __tablename__='household_members'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); user_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('users.id',ondelete='CASCADE')); role: Mapped[str]=mapped_column(String(30),default='member'); __table_args__=(UniqueConstraint('household_id','user_id'),)
+class Institution(Audit, Base):
+    __tablename__='institutions'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(150));
+class Account(Audit, Base):
+    __tablename__='accounts'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); institution_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('institutions.id',ondelete='SET NULL'),nullable=True); connection_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('data_connections.id',ondelete='SET NULL'),nullable=True); external_id: Mapped[str|None]=mapped_column(String(255),nullable=True); name: Mapped[str]=mapped_column(String(100)); type: Mapped[str]=mapped_column(String(30)); balance: Mapped[float]=mapped_column(Numeric(14,2),default=0); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
+class Category(Audit, Base):
+    __tablename__='categories'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(100)); kind: Mapped[str]=mapped_column(String(20)); is_essential_default: Mapped[bool]=mapped_column(Boolean,default=False)
+class Transaction(Audit, Base):
+    __tablename__='transactions'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE')); connection_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('data_connections.id',ondelete='SET NULL'),nullable=True); external_id: Mapped[str|None]=mapped_column(String(255),nullable=True); category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True); owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True); date: Mapped[date]=mapped_column(Date); description: Mapped[str]=mapped_column(String(255)); amount: Mapped[float]=mapped_column(Numeric(14,2)); notes: Mapped[str|None]=mapped_column(Text,nullable=True); is_essential: Mapped[bool]=mapped_column(Boolean,default=False); is_recurring: Mapped[bool]=mapped_column(Boolean,default=False); fingerprint: Mapped[str|None]=mapped_column(String(64),nullable=True,index=True); __table_args__=(UniqueConstraint('connection_id','external_id',name='uq_transaction_connection_external'),)
+class TransactionSplit(Audit, Base):
+    __tablename__='transaction_splits'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE')); member_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('household_members.id',ondelete='SET NULL'),nullable=True); amount: Mapped[float]=mapped_column(Numeric(14,2))
+class Tag(Audit, Base):
+    __tablename__='tags'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(50))
+class TransactionTag(Base):
+    __tablename__='transaction_tags'; transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE'),primary_key=True); tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
+class Goal(Audit, Base):
+    __tablename__='goals'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(120)); type: Mapped[str]=mapped_column(String(30)); target_amount: Mapped[float]=mapped_column(Numeric(14,2)); target_date: Mapped[date|None]=mapped_column(Date,nullable=True); is_complete: Mapped[bool]=mapped_column(Boolean,default=False)
+class GoalContribution(Audit, Base):
+    __tablename__='goal_contributions'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); goal_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('goals.id',ondelete='CASCADE')); transaction_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('transactions.id',ondelete='SET NULL'),nullable=True); amount: Mapped[float]=mapped_column(Numeric(14,2)); contributed_on: Mapped[date]=mapped_column(Date,default=date.today)
+class IncomeSource(Audit, Base):
+    __tablename__='income_sources'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True); name: Mapped[str]=mapped_column(String(100)); monthly_amount: Mapped[float]=mapped_column(Numeric(14,2)); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
+class Debt(Audit, Base):
+    __tablename__='debts'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('accounts.id',ondelete='SET NULL'),nullable=True); name: Mapped[str]=mapped_column(String(100)); balance: Mapped[float]=mapped_column(Numeric(14,2)); interest_rate: Mapped[float]=mapped_column(Numeric(5,2),default=0); minimum_payment: Mapped[float]=mapped_column(Numeric(14,2),default=0)
+class ImportBatch(Audit, Base):
+    __tablename__='import_batches'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE')); filename: Mapped[str]=mapped_column(String(255)); imported_count: Mapped[int]=mapped_column(default=0); duplicate_count: Mapped[int]=mapped_column(default=0)
+class DataConnection(Audit, Base):
+    __tablename__='data_connections'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); provider: Mapped[str]=mapped_column(String(30)); name: Mapped[str]=mapped_column(String(120)); status: Mapped[str]=mapped_column(String(20),default='active'); encrypted_credentials: Mapped[str|None]=mapped_column(Text,nullable=True); cursor: Mapped[str|None]=mapped_column(Text,nullable=True); last_synced_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True); __table_args__=(UniqueConstraint('household_id','provider','name'),)
+class ConnectionSync(Audit, Base):
+    __tablename__='connection_syncs'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); connection_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('data_connections.id',ondelete='CASCADE')); status: Mapped[str]=mapped_column(String(20),default='running'); imported_count: Mapped[int]=mapped_column(default=0); duplicate_count: Mapped[int]=mapped_column(default=0); error_message: Mapped[str|None]=mapped_column(Text,nullable=True)
+class ForecastingProfile(Audit, Base):
+    __tablename__='forecasting_profiles'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(100)); monthly_savings_override: Mapped[float|None]=mapped_column(Numeric(14,2),nullable=True); assumptions: Mapped[str|None]=mapped_column(Text,nullable=True)

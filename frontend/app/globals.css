@@ -1,0 +1,2 @@
+@tailwind base;@tailwind components;@tailwind utilities;
+*{box-sizing:border-box} body{@apply bg-slate-50 text-ink antialiased} button,input,select{font:inherit}.card{@apply rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200}.metric{@apply text-2xl font-semibold tracking-tight}.label{@apply text-xs font-medium uppercase tracking-wider text-slate-500}
