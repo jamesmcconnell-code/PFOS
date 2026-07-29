@@ -131,6 +131,17 @@ def goals(user=Depends(current_user),db:Session=Depends(get_db)):
 @app.post('/api/v1/goals')
 def add_goal(body:GoalIn,user=Depends(current_user),db:Session=Depends(get_db)):
     g=Goal(household_id=household(user,db),**body.model_dump());db.add(g);db.commit();return serialize(g)
+@app.patch('/api/v1/goals/{goal_id}')
+def update_goal(goal_id:UUID,body:GoalUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    g=db.get(Goal,goal_id)
+    if not g or g.household_id!=household(user,db): raise HTTPException(404,'Goal not found')
+    g.name=body.name;g.target_amount=body.target_amount
+    db.commit();return serialize(g)
+@app.delete('/api/v1/goals/{goal_id}',status_code=204)
+def delete_goal(goal_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    g=db.get(Goal,goal_id)
+    if not g or g.household_id!=household(user,db): raise HTTPException(404,'Goal not found')
+    db.delete(g);db.commit()
 @app.post('/api/v1/goals/{goal_id}/contributions')
 def contribute(goal_id:UUID,amount:float,user=Depends(current_user),db:Session=Depends(get_db)):
     g=db.get(Goal,goal_id)
