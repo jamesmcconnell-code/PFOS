@@ -1,4 +1,4 @@
-import csv, hashlib, io
+import csv, hashlib, io, json
 from datetime import date, datetime
 from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
@@ -68,6 +68,16 @@ def update_account(account_id:UUID,body:AccountIn,user=Depends(current_user),db:
     if not a or a.household_id!=household(user,db): raise HTTPException(404,'Account not found')
     for k,v in body.model_dump().items(): setattr(a,k,v)
     db.commit(); return serialize(a)
+@app.delete('/api/v1/accounts/{account_id}',status_code=204)
+def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    a=db.get(Account,account_id)
+    if not a or a.household_id!=household(user,db): raise HTTPException(404,'Account not found')
+    # Linked accounts are excluded before deletion, preventing future provider syncs from recreating them.
+    if a.connection_id and a.external_id:
+        connection=db.get(DataConnection,a.connection_id)
+        if connection:
+            ignored=set(json.loads(connection.ignored_account_ids or '[]'));ignored.add(a.external_id);connection.ignored_account_ids=json.dumps(sorted(ignored))
+    db.delete(a);db.commit()
 
 @app.get('/api/v1/transactions')
 def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,limit:int=100,user=Depends(current_user),db:Session=Depends(get_db)):

@@ -84,7 +84,9 @@ CONNECTORS={'plaid':PlaidConnector(),'coinbase':CoinbaseConnector(),'gemini':Gem
 
 def persist_payload(db: Session, connection: DataConnection, payload: SyncPayload) -> tuple[int,int]:
     account_map={x.external_id:x for x in db.scalars(select(Account).where(Account.connection_id==connection.id)).all()}
+    ignored=set(json.loads(connection.ignored_account_ids or '[]'))
     for source in payload.accounts:
+        if source.external_id in ignored: continue
         target=account_map.get(source.external_id)
         if not target:
             target=Account(household_id=connection.household_id,connection_id=connection.id,external_id=source.external_id,name=source.name,type=source.type,balance=source.balance); db.add(target); db.flush(); account_map[source.external_id]=target
@@ -92,6 +94,7 @@ def persist_payload(db: Session, connection: DataConnection, payload: SyncPayloa
     categories={c.name:c for c in db.scalars(select(Category).where(Category.household_id==connection.household_id)).all()}
     added=duplicates=0
     for source in payload.transactions:
+        if source.account_external_id in ignored: continue
         account=account_map.get(source.account_external_id)
         if not account: continue
         fingerprint=hashlib.sha256(f'{account.id}|{source.posted_on}|{source.amount}|{source.description.lower()}'.encode()).hexdigest()
