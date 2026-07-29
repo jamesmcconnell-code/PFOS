@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     plaid_client_id: str | None = None
     plaid_secret: str | None = None
     plaid_environment: str = "sandbox"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 settings = Settings()

@@ -14,8 +14,12 @@ from .connectors import CONNECTORS, CsvConnector, decrypt_credentials, encrypt_c
 from .config import settings
 
 app=FastAPI(title='PFOS API', version='1.0.0')
-app.add_middleware(CORSMiddleware, allow_origins=['http://localhost:3000'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 bearer=HTTPBearer()
+def plaid_host() -> str:
+    hosts={'sandbox':'https://sandbox.plaid.com','development':'https://development.plaid.com','production':'https://production.plaid.com'}
+    try: return hosts[settings.plaid_environment]
+    except KeyError: raise HTTPException(500,'Invalid PLAID_ENVIRONMENT configuration')
 def current_user(c: HTTPAuthorizationCredentials=Depends(bearer), db: Session=Depends(get_db)):
     user=db.get(User, decode_token(c.credentials))
     if not user: raise HTTPException(401,'User not found')
@@ -151,15 +155,15 @@ def create_connection(body:ConnectionIn,user=Depends(current_user),db:Session=De
 def plaid_link_token(user=Depends(current_user),db:Session=Depends(get_db)):
     if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
     import httpx
-    host={'sandbox':'https://sandbox.plaid.com','development':'https://development.plaid.com','production':'https://production.plaid.com'}[settings.plaid_environment]
-    response=httpx.post(f'{host}/link/token/create',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'client_name':'PFOS','language':'en','country_codes':['US'],'products':['transactions'],'user':{'client_user_id':str(user.id)}},timeout=30).raise_for_status().json()
+    try: response=httpx.post(f'{plaid_host()}/link/token/create',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'client_name':'PFOS','language':'en','country_codes':['US'],'products':['transactions'],'user':{'client_user_id':str(user.id)}},timeout=30).raise_for_status().json()
+    except httpx.HTTPError as exc: raise HTTPException(502,'Plaid Link could not be initialized; verify your Plaid production configuration') from exc
     return {'link_token':response['link_token']}
 @app.post('/api/v1/connections/plaid/exchange')
 def plaid_exchange(body:PlaidExchangeIn,user=Depends(current_user),db:Session=Depends(get_db)):
     if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
     import httpx
-    host={'sandbox':'https://sandbox.plaid.com','development':'https://development.plaid.com','production':'https://production.plaid.com'}
-    raw=httpx.post(f'{host}/item/public_token/exchange',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'public_token':body.public_token},timeout=30).raise_for_status().json()
+    try: raw=httpx.post(f'{plaid_host()}/item/public_token/exchange',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'public_token':body.public_token},timeout=30).raise_for_status().json()
+    except httpx.HTTPError as exc: raise HTTPException(502,'Plaid account authorization could not be saved') from exc
     x=DataConnection(household_id=household(user,db),provider='plaid',name=body.name,encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}));db.add(x);db.commit();return serialize(x)
 @app.post('/api/v1/connections/{connection_id}/sync')
 def sync_connection(connection_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
