@@ -28,6 +28,9 @@ def household(user: User, db: Session):
     member=db.scalar(select(HouseholdMember).where(HouseholdMember.user_id==user.id))
     if not member: raise HTTPException(400,'No household configured')
     return member.household_id
+def validate_view_member(household_id, view_user_id: UUID|None, db: Session):
+    if view_user_id and not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==household_id,HouseholdMember.user_id==view_user_id)):
+        raise HTTPException(400,'Selected user is not part of this household')
 def serialize(o):
     return {c.name: (str(getattr(o,c.name)) if getattr(o,c.name) is not None else None) for c in o.__table__.columns}
 def serialize_connection(connection: DataConnection):
@@ -63,11 +66,19 @@ def get_household(user=Depends(current_user),db:Session=Depends(get_db)):
 @app.get('/api/v1/household/members')
 def household_members(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); members=db.scalars(select(HouseholdMember).where(HouseholdMember.household_id==h)).all(); return [{'id':str(m.user_id),'display_name':db.get(User,m.user_id).display_name,'email':db.get(User,m.user_id).email,'role':m.role} for m in members]
+@app.post('/api/v1/household/members')
+def add_household_member(body:HouseholdUserIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); requester=db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==h,HouseholdMember.user_id==user.id))
+    if not requester or requester.role!='owner': raise HTTPException(403,'Only the household owner can add members')
+    if db.scalar(select(User).where(User.email==body.email)): raise HTTPException(409,'Email already registered')
+    member_user=User(email=body.email,display_name=body.display_name,password_hash=hash_password(body.password));db.add(member_user);db.flush();db.add(HouseholdMember(household_id=h,user_id=member_user.id,role='member'));db.commit()
+    return {'id':str(member_user.id),'display_name':member_user.display_name,'email':member_user.email,'role':'member'}
 @app.get('/api/v1/accounts')
 def accounts(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); connections={x.id:x.name for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; users={x.id:x.display_name for x in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}; result=[]
     q=select(Account).where(Account.household_id==h,Account.is_active==True)
-    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    validate_view_member(h,view_user_id,db)
+    if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     for x in db.scalars(q).all():
         row=serialize(x);row.update(source_name=connections.get(x.connection_id,'Manual'),owner_name=users.get(x.owner_id,'Joint household'));result.append(row)
     return result
@@ -100,7 +111,8 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
 def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,limit:int=100,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db)
     visible_accounts=select(Account.id).where(Account.household_id==h)
-    if view_user_id: visible_accounts=visible_accounts.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    validate_view_member(h,view_user_id,db)
+    if view_user_id: visible_accounts=visible_accounts.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     q=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)).order_by(Transaction.date.desc()).limit(min(limit,500))
     if search: q=q.where(Transaction.description.ilike(f'%{search}%'))
     if account_id: q=q.where(Transaction.account_id==account_id)
@@ -257,7 +269,8 @@ def connection_syncs(connection_id:UUID,user=Depends(current_user),db:Session=De
 
 def metrics(h,db,view_user_id=None):
     q=select(Account).where(Account.household_id==h,Account.is_active==True)
-    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    validate_view_member(h,view_user_id,db)
+    if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     accounts=db.scalars(q).all(); account_ids=[x.id for x in accounts]; accounts_by_id={x.id:x for x in accounts}; debt_accounts=sum(abs(float(x.balance)) for x in accounts if x.account_type=='debt'); assets=sum(float(x.balance) for x in accounts if x.account_type!='debt'); legacy_debt=float(db.scalar(select(func.coalesce(func.sum(Debt.balance),0)).where(Debt.household_id==h)) or 0); debt=debt_accounts+legacy_debt
     income_q=select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
@@ -268,7 +281,7 @@ def metrics(h,db,view_user_id=None):
 @app.get('/api/v1/dashboard')
 def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); m=metrics(h,db,view_user_id); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
-    if view_user_id: q=q.where(or_(Account.ownership=='joint',Account.owner_id==view_user_id))
+    if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     crypto={}
     for a in db.scalars(q).all():
         if float(a.balance): crypto[a.asset_symbol or a.name]=crypto.get(a.asset_symbol or a.name,0)+float(a.balance)

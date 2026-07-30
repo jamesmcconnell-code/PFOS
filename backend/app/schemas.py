@@ -8,6 +8,7 @@ class AccountIn(BaseModel): name: str; type: str='manual'; balance: float=0; ins
 class AccountUpdate(BaseModel):
     name: str; balance: float; account_type: str; ownership: str='joint'; owner_id: UUID|None=None
 class UserUpdate(BaseModel): display_name: str = Field(min_length=1,max_length=100); email: EmailStr; password: str|None = Field(default=None,min_length=8)
+class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float; target_date: date|None=None
 class GoalUpdate(BaseModel):
