@@ -64,6 +64,12 @@ def update_me(body:UserUpdate,user=Depends(current_user),db:Session=Depends(get_
 @app.get('/api/v1/household')
 def get_household(user=Depends(current_user),db:Session=Depends(get_db)):
     h=db.get(Household,household(user,db)); return serialize(h)
+@app.get('/api/v1/household/financial-settings')
+def get_financial_settings(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=db.get(Household,household(user,db));return {'checking_account_ceiling':float(h.checking_account_ceiling)}
+@app.patch('/api/v1/household/financial-settings')
+def update_financial_settings(body:FinancialSettingsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=db.get(Household,household(user,db));h.checking_account_ceiling=body.checking_account_ceiling;db.commit();return {'checking_account_ceiling':float(h.checking_account_ceiling)}
 @app.get('/api/v1/household/members')
 def household_members(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); members=db.scalars(select(HouseholdMember).where(HouseholdMember.household_id==h)).all(); return [{'id':str(m.user_id),'display_name':db.get(User,m.user_id).display_name,'email':db.get(User,m.user_id).email,'role':m.role} for m in members]
@@ -195,21 +201,31 @@ def debts(user=Depends(current_user),db:Session=Depends(get_db)): return [serial
 @app.get('/api/v1/forecasting-profiles')
 def profiles(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(ForecastingProfile).where(ForecastingProfile.household_id==household(user,db))).all()]
 
+def _months_remaining(target_date):
+    if not target_date or target_date<date.today(): return None
+    return max(1,(target_date.year-date.today().year)*12+target_date.month-date.today().month+(1 if target_date.day>date.today().day else 0))
+
 @app.get('/api/v1/goals')
 def goals(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); result=[]
-    for g in db.scalars(select(Goal).where(Goal.household_id==h)).all():
-        saved=float(db.scalar(select(func.coalesce(func.sum(GoalContribution.amount),0)).where(GoalContribution.goal_id==g.id)) or 0); row=serialize(g); row.update(saved_amount=saved,progress=round(saved/float(g.target_amount)*100,1) if g.target_amount else 0); result.append(row)
+    for g in db.scalars(select(Goal).where(Goal.household_id==h).order_by(Goal.priority_order,Goal.created_at)).all():
+        current=float(g.current_amount);target=float(g.target_amount);months=_months_remaining(g.target_date);remaining=max(0,target-current);row=serialize(g);row.update(saved_amount=current,progress=round(current/target*100,1) if target else 0,remaining_amount=remaining,months_remaining=months,required_monthly_contribution=round(remaining/months,2) if months else None);result.append(row)
     return result
 @app.post('/api/v1/goals')
 def add_goal(body:GoalIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    g=Goal(household_id=household(user,db),**body.model_dump());db.add(g);db.commit();return serialize(g)
+    h=household(user,db);last_priority=db.scalar(select(func.max(Goal.priority_order)).where(Goal.household_id==h));priority=(int(last_priority) if last_priority is not None else -1)+1;g=Goal(household_id=h,priority_order=priority,**body.model_dump());db.add(g);db.commit();return serialize(g)
 @app.patch('/api/v1/goals/{goal_id}')
 def update_goal(goal_id:UUID,body:GoalUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     g=db.get(Goal,goal_id)
     if not g or g.household_id!=household(user,db): raise HTTPException(404,'Goal not found')
-    g.name=body.name;g.target_amount=body.target_amount
+    g.name,g.target_amount,g.current_amount,g.target_date=body.name,body.target_amount,body.current_amount,body.target_date
     db.commit();return serialize(g)
+@app.put('/api/v1/goals/reorder')
+def reorder_goals(body:GoalPriorityUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db);existing=db.scalars(select(Goal).where(Goal.household_id==h)).all();by_id={x.id:x for x in existing}
+    if len(body.goal_ids)!=len(existing) or len(set(body.goal_ids))!=len(body.goal_ids) or set(body.goal_ids)!=set(by_id): raise HTTPException(400,'Goal order must contain every household goal exactly once')
+    for priority,goal_id in enumerate(body.goal_ids): by_id[goal_id].priority_order=priority
+    db.commit();return goals(user,db)
 @app.delete('/api/v1/goals/{goal_id}',status_code=204)
 def delete_goal(goal_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     g=db.get(Goal,goal_id)
@@ -219,7 +235,7 @@ def delete_goal(goal_id:UUID,user=Depends(current_user),db:Session=Depends(get_d
 def contribute(goal_id:UUID,amount:float,user=Depends(current_user),db:Session=Depends(get_db)):
     g=db.get(Goal,goal_id)
     if not g or g.household_id!=household(user,db): raise HTTPException(404,'Goal not found')
-    x=GoalContribution(goal_id=goal_id,amount=amount);db.add(x);db.commit();return serialize(x)
+    x=GoalContribution(goal_id=goal_id,amount=amount);g.current_amount=float(g.current_amount)+amount;db.add(x);db.commit();return serialize(x)
 
 @app.post('/api/v1/imports/preview')
 async def preview_import(account_id:UUID, file:UploadFile=File(...),user=Depends(current_user),db:Session=Depends(get_db)):
@@ -332,7 +348,8 @@ def metrics(h,db,view_user_id=None):
                 expenses-=amount
                 if item.is_essential: essential-=amount
     income=transaction_income if transaction_income else manual_income;savings=automated+spending_net
-    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
+    spending_balance=sum(float(x.balance) for x in accounts if x.account_type=='spending' and x.id not in designated_accounts);ceiling=float(db.get(Household,h).checking_account_ceiling)
+    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential,'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling)}
 @app.get('/api/v1/dashboard')
 def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
@@ -349,10 +366,12 @@ def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=
     m.update(goals=goals(user,db),crypto_assets=[crypto[k] for k in sorted(crypto)],alerts=['Emergency fund is below six months of essential spending'] if m['cash_available']<m['essential_monthly']*6 else []);return m
 @app.get('/api/v1/forecast')
 def forecast(monthly_savings:float|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); m=metrics(h,db,view_user_id); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[]
+    h=household(user,db); m=metrics(h,db,view_user_id); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[];elapsed=0.0;lump_sum=m['sweep_surplus']
     for g in goals(user,db):
-        remaining=max(0,float(g['target_amount'])-g['saved_amount']); months=remaining/savings if savings>0 else None; output.append({'goal':g['name'],'monthly_savings':savings,'months_to_complete':round(months,1) if months is not None else None,'projected_completion':str(date.today().replace(year=date.today().year+int(months//12))) if months is not None else None})
-    return {'projected_savings_12_months':savings*12,'goals':output}
+        remaining=float(g['remaining_amount']);sweep=min(remaining,lump_sum);remaining-=sweep;lump_sum-=sweep;months=remaining/savings if savings>0 else (0 if remaining==0 else None);completion=elapsed+(months or 0) if months is not None else None
+        output.append({'goal':g['name'],'priority_order':g['priority_order'],'monthly_savings':savings,'one_time_sweep':sweep,'months_to_complete':round(completion,1) if completion is not None else None,'projected_completion':str(date.today()+timedelta(days=round(completion*30.44))) if completion is not None else None,'required_monthly_contribution':g['required_monthly_contribution']})
+        if months is not None: elapsed+=months
+    return {'projected_savings_12_months':savings*12,'one_time_sweep_surplus':m['sweep_surplus'],'goals':output}
 @app.get('/api/v1/analysis/live-on-one-income')
 def one_income(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);m=metrics(h,db,view_user_id); income_q=select(IncomeSource).where(IncomeSource.household_id==h,IncomeSource.is_active==True)

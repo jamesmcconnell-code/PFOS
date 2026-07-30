@@ -1,224 +1,34 @@
-"use client";
-import { useEffect, useState } from "react";
-import { api, money } from "@/lib/api";
-import { Protected } from "@/components/protected";
+'use client';
 
-type Goal = {
-  id: string;
-  name: string;
-  target_amount: string | number;
-  current_amount?: string | number;
-};
+import { useEffect, useState } from 'react';
+import { api, money } from '@/lib/api';
+import { Protected } from '@/components/protected';
+
+type Goal = Record<string, any>;
 
 export default function Goals() {
-  const [rows, setRows] = useState<Goal[]>([]),
-    [name, setName] = useState(""),
-    [targetAmount, setTargetAmount] = useState(""),
-    [selected, setSelected] = useState<Goal | null>(null),
-    [editTargetAmount, setEditTargetAmount] = useState(""),
-    [deleting, setDeleting] = useState(false),
-    [error, setError] = useState("");
+  const [rows, setRows] = useState<Goal[]>([]), [selected, setSelected] = useState<Goal | null>(null), [dirtyOrder, setDirtyOrder] = useState(false);
+  const [name, setName] = useState(''), [targetAmount, setTargetAmount] = useState(''), [currentAmount, setCurrentAmount] = useState('0'), [targetDate, setTargetDate] = useState('');
+  const [ceiling, setCeiling] = useState('0'), [error, setError] = useState(''), [message, setMessage] = useState(''), [deleting, setDeleting] = useState(false);
+  const load = async () => { const [goals, settings] = await Promise.all([api('/goals'), api('/household/financial-settings')]); setRows(goals); setCeiling(String(settings.checking_account_ceiling)); setDirtyOrder(false); };
+  useEffect(() => { void load(); }, []);
 
-  const load = () => api("/goals").then(setRows);
-
-  useEffect(() => {
-    void load();
-  }, []);
-
-  function open(g: Goal) {
-    setSelected(g);
-    setEditTargetAmount(String(g.target_amount));
-    setDeleting(false);
-    setError("");
+  function reorder(goalId: string, newPosition: number) {
+    const source = rows.findIndex((goal) => goal.id === goalId); if (source < 0) return;
+    const destination = Math.max(0, Math.min(rows.length - 1, newPosition - 1)); if (source === destination) return;
+    const next = [...rows]; const [goal] = next.splice(source, 1); next.splice(destination, 0, goal); setRows(next); setDirtyOrder(true);
   }
+  async function saveOrder() { try { await api('/goals/reorder', { method: 'PUT', body: JSON.stringify({ goal_ids: rows.map((goal) => goal.id) }) }); await load(); setMessage('Priority order saved.'); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save order'); } }
+  async function saveCeiling(event: React.FormEvent) { event.preventDefault(); try { await api('/household/financial-settings', { method: 'PATCH', body: JSON.stringify({ checking_account_ceiling: Number(ceiling) }) }); setMessage('Checking ceiling saved.'); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not save checking ceiling'); } }
+  async function add(event: React.FormEvent) { event.preventDefault(); try { await api('/goals', { method: 'POST', body: JSON.stringify({ name, target_amount: Number(targetAmount), current_amount: Number(currentAmount), target_date: targetDate }) }); setName(''); setTargetAmount(''); setCurrentAmount('0'); setTargetDate(''); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not add goal'); } }
+  async function save(event: React.FormEvent) { event.preventDefault(); if (!selected) return; try { await api(`/goals/${selected.id}`, { method: 'PATCH', body: JSON.stringify({ name: selected.name, target_amount: Number(selected.target_amount), current_amount: Number(selected.current_amount), target_date: selected.target_date }) }); setSelected(null); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not update goal'); } }
+  async function remove() { if (!selected) return; try { await api(`/goals/${selected.id}`, { method: 'DELETE' }); setSelected(null); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not delete goal'); } }
 
-  async function add(e: React.FormEvent) {
-    e.preventDefault();
-    await api("/goals", {
-      method: "POST",
-      body: JSON.stringify({ name, target_amount: Number(targetAmount) }),
-    });
-    setName("");
-    setTargetAmount("");
-    load();
-  }
-
-  async function save(e: React.FormEvent) {
-    e.preventDefault();
-    if (!selected) return;
-    try {
-      await api(`/goals/${selected.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          name: selected.name,
-          target_amount: Number(editTargetAmount),
-        }),
-      });
-      setSelected(null);
-      load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not update goal");
-    }
-  }
-
-  async function remove() {
-    if (!selected) return;
-    try {
-      await api(`/goals/${selected.id}`, { method: "DELETE" });
-      setSelected(null);
-      load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not delete goal");
-    }
-  }
-
-  return (
-    <Protected>
-      <h1 className="text-3xl font-bold">Goals</h1>
-      <p className="mt-1 text-slate-500">
-        Track your savings goals and progress over time.
-      </p>
-
-      <div className="mt-6 grid gap-4 md:grid-cols-3">
-        {rows.map((g) => (
-          <button
-            onClick={() => open(g)}
-            className="card text-left transition hover:-translate-y-0.5 hover:ring-slate-400 focus:outline-none focus:ring-2 focus:ring-mint"
-            key={g.id}
-            aria-label={`Edit ${g.name}`}
-          >
-            <div className="flex justify-between gap-2">
-              <p className="label">Goal Target</p>
-            </div>
-            <p className="mt-2 font-semibold">{g.name}</p>
-            <p className="metric mt-3">{money(g.target_amount)}</p>
-            <p className="mt-3 text-xs text-slate-400">Click to edit</p>
-          </button>
-        ))}
-      </div>
-
-      <form onSubmit={add} className="card mt-6 flex flex-wrap gap-3">
-        <input
-          className="rounded border p-2"
-          placeholder="Goal name"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          required
-        />
-        <input
-          className="rounded border p-2"
-          type="number"
-          step="0.01"
-          placeholder="Target amount"
-          value={targetAmount}
-          onChange={(e) => setTargetAmount(e.target.value)}
-          required
-        />
-        <button className="rounded bg-navy px-4 text-white">Add goal</button>
-      </form>
-
-      {selected && (
-        <div
-          className="fixed inset-0 z-50 grid place-items-center bg-slate-950/50 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="goal-editor"
-        >
-          <form
-            onSubmit={save}
-            className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"
-          >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="label">Goal</p>
-                <h2 id="goal-editor" className="mt-1 text-xl font-bold">
-                  Edit goal
-                </h2>
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelected(null)}
-                aria-label="Close editor"
-                className="text-xl text-slate-400"
-              >
-                ×
-              </button>
-            </div>
-
-            {error && (
-              <p className="mt-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">
-                {error}
-              </p>
-            )}
-
-            <label className="label mt-5 block">Goal name</label>
-            <input
-              className="mt-1 w-full rounded border p-2"
-              value={selected.name}
-              onChange={(e) =>
-                setSelected({ ...selected, name: e.target.value })
-              }
-              required
-            />
-
-            <label className="label mt-4 block">Target amount</label>
-            <input
-              className="mt-1 w-full rounded border p-2"
-              type="number"
-              step="0.01"
-              value={editTargetAmount}
-              onChange={(e) => setEditTargetAmount(e.target.value)}
-              required
-            />
-
-            <div className="mt-6 flex justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => setDeleting(true)}
-                className="text-sm font-medium text-red-700"
-              >
-                Delete goal
-              </button>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setSelected(null)}
-                  className="rounded border px-4 py-2"
-                >
-                  Cancel
-                </button>
-                <button className="rounded bg-navy px-4 py-2 text-white">
-                  Save changes
-                </button>
-              </div>
-            </div>
-
-            {deleting && (
-              <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4">
-                <p className="text-sm text-red-800">
-                  Delete <b>{selected.name}</b>? This action cannot be undone.
-                </p>
-                <div className="mt-3 flex justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setDeleting(false)}
-                    className="rounded border bg-white px-3 py-2 text-sm"
-                  >
-                    Keep goal
-                  </button>
-                  <button
-                    type="button"
-                    onClick={remove}
-                    className="rounded bg-red-700 px-3 py-2 text-sm text-white"
-                  >
-                    Delete permanently
-                  </button>
-                </div>
-              </div>
-            )}
-          </form>
-        </div>
-      )}
-    </Protected>
-  );
+  return <Protected><h1 className="text-3xl font-bold">Goals</h1><p className="mt-1 text-slate-500">Household-wide goals are funded in priority order.</p>{(error || message) && <p className={`mt-4 rounded-xl p-3 text-sm ${error ? 'bg-red-50 text-red-700' : 'bg-slate-100 text-slate-700'}`}>{error || message}</p>}
+    <section className="card mt-5 max-w-xl"><h2 className="font-semibold">Checking account ceiling</h2><p className="mt-1 text-sm text-slate-500">Spending-account cash above this amount is shown as a one-time sweep for the highest-priority goals in forecasts.</p><form onSubmit={saveCeiling} className="mt-3 flex gap-2"><input className="w-full rounded border p-2" type="number" min="0" step="0.01" value={ceiling} onChange={(event) => setCeiling(event.target.value)} required/><button className="rounded bg-navy px-4 text-white">Save</button></form></section>
+    {dirtyOrder && <div className="mt-5 flex items-center justify-between rounded-xl bg-amber-50 p-3 text-sm text-amber-900"><span>Priority changes are not saved yet.</span><button onClick={() => void saveOrder()} className="rounded bg-navy px-4 py-2 text-white">Save Order</button></div>}
+    <div className="mt-6 grid gap-4 md:grid-cols-2">{rows.map((goal, index) => <div className="card" key={goal.id}><div className="flex items-start justify-between gap-3"><button onClick={() => { setSelected({ ...goal }); setDeleting(false); setError(''); }} className="min-w-0 text-left"><p className="font-semibold">{goal.name}</p><p className="mt-1 text-sm text-slate-500">{money(goal.current_amount)} of {money(goal.target_amount)}</p></button><label className="text-right text-xs text-slate-500">Priority<input aria-label={`Priority for ${goal.name}`} className="mt-1 block w-16 rounded border p-2 text-center" type="number" min="1" max={rows.length} value={index + 1} onChange={(event) => reorder(goal.id, Number(event.target.value))}/></label></div><div className="mt-4 h-2 overflow-hidden rounded bg-slate-100"><div className="h-full bg-mint" style={{ width: `${Math.min(goal.progress, 100)}%` }}/></div><p className="mt-3 text-sm">Required baseline: <b>{goal.required_monthly_contribution == null ? 'Set a future target date' : `${money(goal.required_monthly_contribution)}/month`}</b></p><p className="mt-1 text-xs text-slate-500">Target {goal.target_date || 'not set'} · {goal.months_remaining ?? '—'} months remaining</p><div className="mt-4 flex gap-2"><button disabled={index === 0} onClick={() => reorder(goal.id, index)} className="rounded border px-3 py-2 text-sm disabled:opacity-40">Move up</button><button disabled={index === rows.length - 1} onClick={() => reorder(goal.id, index + 2)} className="rounded border px-3 py-2 text-sm disabled:opacity-40">Move down</button></div></div>)}</div>
+    <form onSubmit={add} className="card mt-6"><h2 className="font-semibold">Add household goal</h2><div className="mt-4 grid gap-3 md:grid-cols-4"><input className="rounded border p-2" placeholder="Goal name" value={name} onChange={(event) => setName(event.target.value)} required/><input className="rounded border p-2" type="number" min="0.01" step="0.01" placeholder="Target amount" value={targetAmount} onChange={(event) => setTargetAmount(event.target.value)} required/><input className="rounded border p-2" type="number" min="0" step="0.01" placeholder="Current amount" value={currentAmount} onChange={(event) => setCurrentAmount(event.target.value)} required/><input className="rounded border p-2" type="date" value={targetDate} onChange={(event) => setTargetDate(event.target.value)} required/></div><button className="mt-4 rounded bg-navy px-4 py-2 text-white">Add goal</button></form>
+    {selected && <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/50 p-4" role="dialog" aria-modal="true"><form onSubmit={save} className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"><div className="flex justify-between"><h2 className="text-xl font-bold">Edit goal</h2><button type="button" onClick={() => setSelected(null)} aria-label="Close">×</button></div><label className="label mt-4 block">Name</label><input className="mt-1 w-full rounded border p-2" value={selected.name} onChange={(event) => setSelected({ ...selected, name: event.target.value })} required/><label className="label mt-4 block">Target amount</label><input className="mt-1 w-full rounded border p-2" type="number" min="0.01" step="0.01" value={selected.target_amount} onChange={(event) => setSelected({ ...selected, target_amount: event.target.value })} required/><label className="label mt-4 block">Current amount</label><input className="mt-1 w-full rounded border p-2" type="number" min="0" step="0.01" value={selected.current_amount} onChange={(event) => setSelected({ ...selected, current_amount: event.target.value })} required/><label className="label mt-4 block">Target date</label><input className="mt-1 w-full rounded border p-2" type="date" value={selected.target_date || ''} onChange={(event) => setSelected({ ...selected, target_date: event.target.value })} required/><div className="mt-6 flex justify-between"><button type="button" onClick={() => setDeleting(true)} className="text-red-700">Delete goal</button><button className="rounded bg-navy px-4 py-2 text-white">Save</button></div>{deleting && <div className="mt-4 rounded bg-red-50 p-3 text-sm text-red-800">Delete this goal permanently?<div className="mt-2 flex justify-end gap-2"><button type="button" onClick={() => setDeleting(false)}>Cancel</button><button type="button" className="rounded bg-red-700 px-3 py-1 text-white" onClick={() => void remove()}>Delete</button></div></div>}</form></div>}
+  </Protected>;
 }
