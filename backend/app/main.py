@@ -199,7 +199,9 @@ def connections(user=Depends(current_user),db:Session=Depends(get_db)):
 def unlink_connection(connection_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     x=db.get(DataConnection,connection_id)
     if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
-    # An unlink removes source-owned data; manually created accounts are never affected.
+    # This transaction intentionally touches only data owned by this connection.
+    # The connection row contains its encrypted provider token; its deletion removes it.
+    for transaction in db.scalars(select(Transaction).where(Transaction.connection_id==x.id)).all(): db.delete(transaction)
     for account in db.scalars(select(Account).where(Account.connection_id==x.id)).all(): db.delete(account)
     db.delete(x);db.commit()
 @app.post('/api/v1/connections')
