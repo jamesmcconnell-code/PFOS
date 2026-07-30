@@ -20,7 +20,7 @@ class NormalizedAccount:
     external_id: str; name: str; type: str; balance: Decimal = Decimal('0'); asset_symbol: str | None = None
 @dataclass
 class NormalizedTransaction:
-    external_id: str | None; account_external_id: str; posted_on: date; description: str; amount: Decimal; notes: str | None = None; source_category: str | None = None; is_pending: bool = False
+    external_id: str | None; account_external_id: str; posted_on: date; description: str; amount: Decimal; notes: str | None = None; source_category: str | None = None; is_pending: bool = False; is_internal_transfer: bool = False
 @dataclass
 class SyncPayload:
     accounts: list[NormalizedAccount]; transactions: list[NormalizedTransaction]; cursor: str | None = None
@@ -59,7 +59,9 @@ class PlaidConnector(Connector):
             data={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'access_token':credentials['access_token'],'cursor':page_cursor,'count':500}
             body=httpx.post(f'{host}/transactions/sync',json=data,timeout=45).raise_for_status().json()
             for a in body.get('accounts',[]): accounts[a['account_id']]=NormalizedAccount(a['account_id'],a['name'],_plaid_type(a.get('subtype'),a.get('type')),Decimal(str(a['balances'].get('current') or 0)))
-            transactions.extend(NormalizedTransaction(t['transaction_id'],t['account_id'],date.fromisoformat(t['date']),t['name'],Decimal(str(-t['amount'])),t.get('merchant_name'),(t.get('personal_finance_category') or {}).get('primary'),bool(t.get('pending'))) for t in body.get('added',[])+body.get('modified',[]))
+            for t in body.get('added',[])+body.get('modified',[]):
+                source_category=(t.get('personal_finance_category') or {}).get('primary')
+                transactions.append(NormalizedTransaction(t['transaction_id'],t['account_id'],date.fromisoformat(t['date']),t['name'],Decimal(str(-t['amount'])),t.get('merchant_name'),source_category,bool(t.get('pending')),source_category in {'TRANSFER_IN','TRANSFER_OUT'}))
             page_cursor=body.get('next_cursor')
             if not body.get('has_more'): break
         return SyncPayload(list(accounts.values()),transactions,page_cursor)
@@ -129,10 +131,10 @@ def persist_payload(db: Session, connection: DataConnection, payload: SyncPayloa
         existing=db.scalar(select(Transaction).where(Transaction.connection_id==connection.id,Transaction.external_id==source.external_id)) if source.external_id else None
         category=_category_for(db, categories, connection.household_id, source.source_category, source.amount)
         if existing:
-            existing.account_id,existing.date,existing.description,existing.amount,existing.notes,existing.fingerprint,existing.category_id,existing.source_category,existing.is_pending,existing.is_essential=account.id,source.posted_on,source.description,source.amount,source.notes,fingerprint,category.id if category else None,source.source_category,source.is_pending,category.is_essential_default if category else False
+            existing.account_id,existing.date,existing.description,existing.amount,existing.notes,existing.fingerprint,existing.category_id,existing.source_category,existing.is_pending,existing.is_essential,existing.is_internal_transfer=account.id,source.posted_on,source.description,source.amount,source.notes,fingerprint,category.id if category else None,source.source_category,source.is_pending,category.is_essential_default if category else False,source.is_internal_transfer
             continue
         if db.scalar(select(Transaction.id).where(Transaction.fingerprint==fingerprint)): duplicates+=1; continue
-        db.add(Transaction(household_id=connection.household_id,account_id=account.id,connection_id=connection.id,external_id=source.external_id,date=source.posted_on,description=source.description,amount=source.amount,notes=source.notes,fingerprint=fingerprint,category_id=category.id if category else None,source_category=source.source_category,is_pending=source.is_pending,is_essential=category.is_essential_default if category else False)); added+=1
+        db.add(Transaction(household_id=connection.household_id,account_id=account.id,connection_id=connection.id,external_id=source.external_id,date=source.posted_on,description=source.description,amount=source.amount,notes=source.notes,fingerprint=fingerprint,category_id=category.id if category else None,source_category=source.source_category,is_pending=source.is_pending,is_essential=category.is_essential_default if category else False,is_internal_transfer=source.is_internal_transfer)); added+=1
     return added,duplicates
 
 def _category_for(db: Session, cache: dict, household_id, source_category: str | None, amount: Decimal):

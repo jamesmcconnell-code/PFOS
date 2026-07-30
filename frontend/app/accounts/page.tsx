@@ -56,6 +56,7 @@ export default function Accounts() {
           account_type: selected.account_type,
           ownership: selected.ownership,
           owner_id: selected.ownership === 'individual' ? selected.owner_id : null,
+          is_savings_direct_deposit: selected.is_savings_direct_deposit,
         }),
       });
       setSelected(null);
@@ -110,6 +111,8 @@ export default function Accounts() {
         </select>}
         <label className="label mt-4 block">Balance</label>
         <input className="mt-1 w-full rounded border p-2" type="number" step="0.01" value={balance} onChange={(event) => setBalance(event.target.value)} required />
+        <label className="mt-4 flex items-center gap-2 text-sm"><input type="checkbox" checked={Boolean(selected.is_savings_direct_deposit)} onChange={(event) => setSelected({ ...selected, is_savings_direct_deposit: event.target.checked })} /> Savings Direct Deposit account</label>
+        <p className="mt-1 text-xs text-slate-500">Credits into this account count as automated savings; its investment and transfer outflows are excluded.</p>
         <div className="mt-6 flex justify-between"><button type="button" onClick={() => setDeleting(true)} className="text-red-700">Delete account</button><button className="rounded bg-navy px-4 py-2 text-white">Save</button></div>
         {deleting && <div className="mt-4 rounded bg-red-50 p-3 text-sm text-red-800">Permanently delete this account and its local transactions?<div className="mt-2 flex justify-end gap-2"><button type="button" onClick={() => setDeleting(false)}>Cancel</button><button type="button" className="rounded bg-red-700 px-3 py-1 text-white" onClick={remove}>Delete</button></div></div>}
       </form>

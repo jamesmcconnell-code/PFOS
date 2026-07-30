@@ -1,5 +1,5 @@
 import csv, hashlib, io, json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,7 +94,7 @@ def update_account(account_id:UUID,body:AccountUpdate,user=Depends(current_user)
     if not a or a.household_id!=household(user,db): raise HTTPException(404,'Account not found')
     if body.account_type not in {'debt','brokerage','income','spending','crypto'}: raise HTTPException(400,'Invalid account type')
     if body.ownership=='individual' and (not body.owner_id or not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==a.household_id,HouseholdMember.user_id==body.owner_id))): raise HTTPException(400,'Select a household member for an individual account')
-    a.name,a.balance,a.account_type,a.ownership,a.owner_id=body.name,body.balance,body.account_type,body.ownership,body.owner_id if body.ownership=='individual' else None
+    a.name,a.balance,a.account_type,a.ownership,a.owner_id,a.is_savings_direct_deposit=body.name,body.balance,body.account_type,body.ownership,body.owner_id if body.ownership=='individual' else None,body.is_savings_direct_deposit
     db.commit(); return serialize(a)
 @app.delete('/api/v1/accounts/{account_id}',status_code=204)
 def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -147,6 +147,11 @@ def update_transaction(transaction_id:UUID,body:TransactionIn,user=Depends(curre
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     for k,v in body.model_dump().items(): setattr(t,k,v)
     db.commit(); return serialize(t)
+@app.patch('/api/v1/transactions/{transaction_id}/internal-transfer')
+def update_internal_transfer(transaction_id:UUID,body:TransactionTransferUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
+    t.is_internal_transfer=body.is_internal_transfer;db.commit();return serialize(t)
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==household(user,db))).all()]
@@ -158,6 +163,27 @@ def tags(user=Depends(current_user),db:Session=Depends(get_db)): return [seriali
 @app.post('/api/v1/tags')
 def add_tag(name:str,user=Depends(current_user),db:Session=Depends(get_db)):
     x=Tag(household_id=household(user,db),name=name);db.add(x);db.commit();return serialize(x)
+@app.get('/api/v1/savings-rules')
+def savings_rules(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); rows=[]
+    for rule in db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all():
+        target_type,target_id,label=('account',rule.account_id,db.get(Account,rule.account_id).name) if rule.account_id else ('category',rule.category_id,db.get(Category,rule.category_id).name) if rule.category_id else ('tag',rule.tag_id,db.get(Tag,rule.tag_id).name)
+        rows.append({**serialize(rule),'target_type':target_type,'target_id':str(target_id),'label':label})
+    return rows
+@app.post('/api/v1/savings-rules')
+def add_savings_rule(body:SavingsRuleIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); targets={'account':Account,'category':Category,'tag':Tag}
+    if body.target_type not in targets: raise HTTPException(400,'Target type must be account, category, or tag')
+    target=db.get(targets[body.target_type],body.target_id)
+    if not target or target.household_id!=h: raise HTTPException(400,'Invalid savings rule target')
+    field=f'{body.target_type}_id'
+    if db.scalar(select(SavingsRule).where(SavingsRule.household_id==h,getattr(SavingsRule,field)==body.target_id,SavingsRule.is_active==True)): raise HTTPException(409,'Savings rule already exists')
+    rule=SavingsRule(household_id=h,**{field:body.target_id});db.add(rule);db.commit();return serialize(rule)
+@app.delete('/api/v1/savings-rules/{rule_id}',status_code=204)
+def delete_savings_rule(rule_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    rule=db.get(SavingsRule,rule_id)
+    if not rule or rule.household_id!=household(user,db): raise HTTPException(404,'Savings rule not found')
+    db.delete(rule);db.commit()
 @app.get('/api/v1/income-sources')
 def income_sources(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(IncomeSource).where(IncomeSource.household_id==household(user,db))).all()]
 @app.post('/api/v1/income-sources')
@@ -289,9 +315,23 @@ def metrics(h,db,view_user_id=None):
     income_q=select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
     manual_income=float(db.scalar(income_q) or 0)
-    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=date.today().replace(day=1))).all() if account_ids else []
-    payroll=sum(float(x.amount) for x in tx if float(x.amount)>0 and accounts_by_id.get(x.account_id) and accounts_by_id[x.account_id].account_type=='spending'); income=manual_income+payroll; expenses=-sum(float(x.amount) for x in tx if float(x.amount)<0); savings=income-expenses
-    essential=-sum(float(x.amount) for x in tx if float(x.amount)<0 and x.is_essential); return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
+    month_start=date.today().replace(day=1);month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
+    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False)).all() if account_ids else []
+    rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all(); designated_accounts={x.id for x in accounts if x.is_savings_direct_deposit}|{x.account_id for x in rules if x.account_id}; designated_categories={x.category_id for x in rules if x.category_id}; designated_tags={x.tag_id for x in rules if x.tag_id}
+    tagged_transactions={transaction_id for transaction_id,tag_id in db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([x.id for x in tx]),TransactionTag.tag_id.in_(designated_tags))).all()} if tx and designated_tags else set()
+    automated=spending_net=expenses=essential=transaction_income=0.0
+    for item in tx:
+        if item.is_internal_transfer: continue
+        account=accounts_by_id[item.account_id];amount=float(item.amount);is_automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged_transactions
+        if amount>0 and is_automated_target: automated+=amount;transaction_income+=amount;continue
+        if account.account_type=='spending' and item.account_id not in designated_accounts:
+            spending_net+=amount
+            if amount>0: transaction_income+=amount
+            elif amount<0:
+                expenses-=amount
+                if item.is_essential: essential-=amount
+    income=transaction_income if transaction_income else manual_income;savings=automated+spending_net
+    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
 @app.get('/api/v1/dashboard')
 def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); m=metrics(h,db,view_user_id); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
