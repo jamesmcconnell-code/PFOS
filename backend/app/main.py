@@ -1,5 +1,6 @@
 import csv, hashlib, io, json
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +34,9 @@ def validate_view_member(household_id, view_user_id: UUID|None, db: Session):
     if view_user_id and not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==household_id,HouseholdMember.user_id==view_user_id)):
         raise HTTPException(400,'Selected user is not part of this household')
 def serialize(o):
-    return {c.name: (str(getattr(o,c.name)) if getattr(o,c.name) is not None else None) for c in o.__table__.columns}
+    def value(raw):
+        return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
+    return {c.name:value(getattr(o,c.name)) if getattr(o,c.name) is not None else None for c in o.__table__.columns}
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
     row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
