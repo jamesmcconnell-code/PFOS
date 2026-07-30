@@ -108,19 +108,33 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
     db.delete(a);db.commit()
 
 @app.get('/api/v1/transactions')
-def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,limit:int=100,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,category_ids:list[UUID]=Query(default=[]),financial_roles:list[str]=Query(default=[]),connection_ids:list[UUID]=Query(default=[]),transaction_type:str|None=None,sort:str='date_desc',page:int=1,page_size:int=25,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db)
     visible_accounts=select(Account.id).where(Account.household_id==h)
     validate_view_member(h,view_user_id,db)
     if view_user_id: visible_accounts=visible_accounts.where(Account.ownership=='individual',Account.owner_id==view_user_id)
-    q=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)).order_by(Transaction.date.desc()).limit(min(limit,500))
-    if search: q=q.where(Transaction.description.ilike(f'%{search}%'))
-    if account_id: q=q.where(Transaction.account_id==account_id)
-    if category_id: q=q.where(Transaction.category_id==category_id)
+    if page<1: raise HTTPException(400,'Page must be at least 1')
+    if page_size<1 or page_size>100: raise HTTPException(400,'Page size must be between 1 and 100')
+    valid_roles={'spending','income','debt','brokerage','crypto'}
+    if not set(financial_roles).issubset(valid_roles): raise HTTPException(400,'Invalid financial role filter')
+    if transaction_type not in {None,'credit','debit'}: raise HTTPException(400,'Transaction type must be credit or debit')
+    filters=[Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)]
+    if search: filters.append(Transaction.description.ilike(f'%{search.strip()}%'))
+    if account_id: filters.append(Transaction.account_id==account_id)
+    selected_categories=category_ids+([category_id] if category_id else [])
+    if selected_categories: filters.append(Transaction.category_id.in_(selected_categories))
+    if financial_roles: filters.append(Transaction.account_id.in_(select(Account.id).where(Account.household_id==h,Account.account_type.in_(financial_roles))))
+    if connection_ids: filters.append(Transaction.connection_id.in_(connection_ids))
+    if transaction_type=='credit': filters.append(Transaction.amount>0)
+    if transaction_type=='debit': filters.append(Transaction.amount<0)
+    orders={'date_desc':Transaction.date.desc(),'date_asc':Transaction.date.asc(),'amount_desc':Transaction.amount.desc(),'amount_asc':Transaction.amount.asc()}
+    if sort not in orders: raise HTTPException(400,'Invalid sort option')
+    total=int(db.scalar(select(func.count()).select_from(Transaction).where(*filters)) or 0)
+    q=select(Transaction).where(*filters).order_by(orders[sort],Transaction.id).offset((page-1)*page_size).limit(page_size)
     accounts_by_id={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}; categories_by_id={x.id:x for x in db.scalars(select(Category).where(Category.household_id==h)).all()}; connections_by_id={x.id:x for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
     for x in db.scalars(q).all():
         row=serialize(x);account=accounts_by_id.get(x.account_id);row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual');result.append(row)
-    return result
+    return {'items':result,'page':page,'page_size':page_size,'total':total,'total_pages':max(1,(total+page_size-1)//page_size),'sort':sort}
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); a=db.get(Account,body.account_id)
