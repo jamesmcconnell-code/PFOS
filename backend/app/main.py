@@ -11,6 +11,7 @@ from .models import *
 from .schemas import *
 from .security import hash_password, verify_password, create_token, decode_token
 from .connectors import CONNECTORS, ConnectorAuthenticationError, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
+from .crypto_prices import refresh_usd_values
 from .config import settings
 
 app=FastAPI(title='PFOS API', version='1.0.0')
@@ -311,7 +312,7 @@ def metrics(h,db,view_user_id=None):
     q=select(Account).where(Account.household_id==h,Account.is_active==True)
     validate_view_member(h,view_user_id,db)
     if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
-    accounts=db.scalars(q).all(); account_ids=[x.id for x in accounts]; accounts_by_id={x.id:x for x in accounts}; debt_accounts=sum(abs(float(x.balance)) for x in accounts if x.account_type=='debt'); assets=sum(float(x.balance) for x in accounts if x.account_type!='debt'); legacy_debt=float(db.scalar(select(func.coalesce(func.sum(Debt.balance),0)).where(Debt.household_id==h)) or 0); debt=debt_accounts+legacy_debt
+    accounts=db.scalars(q).all(); account_ids=[x.id for x in accounts]; accounts_by_id={x.id:x for x in accounts}; debt_accounts=sum(abs(float(x.balance)) for x in accounts if x.account_type=='debt'); assets=sum(float(x.crypto_usd_value or 0) if x.account_type=='crypto' else float(x.balance) for x in accounts if x.account_type!='debt'); legacy_debt=float(db.scalar(select(func.coalesce(func.sum(Debt.balance),0)).where(Debt.household_id==h)) or 0); debt=debt_accounts+legacy_debt
     income_q=select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
     manual_income=float(db.scalar(income_q) or 0)
@@ -334,12 +335,18 @@ def metrics(h,db,view_user_id=None):
     return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential}
 @app.get('/api/v1/dashboard')
 def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); m=metrics(h,db,view_user_id); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
+    h=household(user,db); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
     if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
-    crypto={}
-    for a in db.scalars(q).all():
-        if float(a.balance): crypto[a.asset_symbol or a.name]=crypto.get(a.asset_symbol or a.name,0)+float(a.balance)
-    m.update(goals=goals(user,db),crypto_assets=[{'symbol':k,'amount':v} for k,v in sorted(crypto.items())],alerts=['Emergency fund is below six months of essential spending'] if m['cash_available']<m['essential_monthly']*6 else []);return m
+    crypto_accounts=db.scalars(q).all()
+    if refresh_usd_values(crypto_accounts): db.commit()
+    m=metrics(h,db,view_user_id); crypto={}
+    for a in crypto_accounts:
+        if float(a.balance):
+            symbol=a.asset_symbol or a.name
+            entry=crypto.setdefault(symbol,{'symbol':symbol,'quantity':0.0,'usd_value':0.0,'quote_available':False,'price_updated_at':None})
+            entry['quantity']+=float(a.balance)
+            if a.crypto_usd_value is not None: entry['usd_value']+=float(a.crypto_usd_value);entry['quote_available']=True;entry['price_updated_at']=str(a.crypto_price_updated_at) if a.crypto_price_updated_at else entry['price_updated_at']
+    m.update(goals=goals(user,db),crypto_assets=[crypto[k] for k in sorted(crypto)],alerts=['Emergency fund is below six months of essential spending'] if m['cash_available']<m['essential_monthly']*6 else []);return m
 @app.get('/api/v1/forecast')
 def forecast(monthly_savings:float|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); m=metrics(h,db,view_user_id); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[]

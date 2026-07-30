@@ -107,7 +107,7 @@ class GeminiConnector(Connector):
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload:
         payload={'request':'/v1/balances','nonce':str(int(time.time()*1000))}; encoded=base64.b64encode(json.dumps(payload).encode()).decode(); signature=hmac.new(credentials['api_secret'].encode(),encoded.encode(),hashlib.sha384).hexdigest()
         body=httpx.post('https://api.gemini.com/v1/balances',headers={'X-GEMINI-APIKEY':credentials['api_key'],'X-GEMINI-PAYLOAD':encoded,'X-GEMINI-SIGNATURE':signature},timeout=30).raise_for_status().json()
-        accounts=[NormalizedAccount(x['currency'],f"Gemini {x['currency']}",'crypto',Decimal(str(x.get('amount') or 0))) for x in body]
+        accounts=[NormalizedAccount(x['currency'],f"Gemini {x['currency']}",'crypto',Decimal(str(x.get('amount') or 0)),x['currency']) for x in body]
         return SyncPayload(accounts,[],cursor)
 
 CONNECTORS={'plaid':PlaidConnector(),'coinbase':CoinbaseConnector(),'gemini':GeminiConnector()}

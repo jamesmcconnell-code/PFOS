@@ -28,3 +28,13 @@ def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
     assert result['spending_net_cash_flow']==1150
     assert result['monthly_savings']==2150
     assert result['monthly_expenses']==500
+
+
+def test_net_worth_uses_crypto_usd_value_not_token_quantity():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    home=Household(name='Test household');db.add(home);db.flush()
+    db.add(Account(household_id=home.id,name='BTC',type='crypto',account_type='crypto',asset_symbol='BTC',balance=2,crypto_usd_value=180000))
+    db.commit()
+    assert metrics(home.id,db)['net_worth']==180000
