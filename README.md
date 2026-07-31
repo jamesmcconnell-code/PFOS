@@ -22,7 +22,7 @@ docker-compose.yml  PostgreSQL + API + web application
 1. `cp .env.example .env`, generate unique values for every secret placeholder, and add only your own optional provider keys.
 2. `docker compose up --build`
 3. In another terminal run `docker compose exec api python -m app.seed` for demo data.
-4. Visit http://localhost:3000 and sign in with `james@example.com` / `change-me-now`; change the password by registering a private account for real use.
+4. Visit http://localhost:3000 and sign in with `admin@example.com` / `change-me-now`; change the password by registering a private account for real use.
 
 For development without Docker, install `backend/requirements.txt`, set `DATABASE_URL`, run `cd backend && alembic upgrade head`, and use `uvicorn app.main:app --reload`. Install frontend dependencies with `cd frontend && npm install && npm run dev`.
 
