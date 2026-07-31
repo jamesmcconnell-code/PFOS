@@ -130,7 +130,7 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
     db.delete(a);db.commit()
 
 @app.get('/api/v1/transactions')
-def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,category_ids:list[UUID]=Query(default=[]),financial_roles:list[str]=Query(default=[]),connection_ids:list[UUID]=Query(default=[]),transaction_type:str|None=None,sort:str='date_desc',page:int=1,page_size:int=25,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,category_ids:list[UUID]=Query(default=[]),financial_roles:list[str]=Query(default=[]),connection_ids:list[UUID]=Query(default=[]),transaction_type:str|None=None,start_date:date|None=None,end_date:date|None=None,sort:str='date_desc',page:int=1,page_size:int=25,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db)
     visible_accounts=select(Account.id).where(Account.household_id==h)
     validate_view_member(h,view_user_id,db)
@@ -140,6 +140,7 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     valid_roles={'spending','income','debt','brokerage','crypto'}
     if not set(financial_roles).issubset(valid_roles): raise HTTPException(400,'Invalid financial role filter')
     if transaction_type not in {None,'credit','debit'}: raise HTTPException(400,'Transaction type must be credit or debit')
+    if start_date and end_date and start_date>end_date: raise HTTPException(400,'Start date must be on or before end date')
     filters=[Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)]
     if search: filters.append(Transaction.description.ilike(f'%{search.strip()}%'))
     if account_id: filters.append(Transaction.account_id==account_id)
@@ -149,6 +150,8 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     if connection_ids: filters.append(Transaction.connection_id.in_(connection_ids))
     if transaction_type=='credit': filters.append(Transaction.amount>0)
     if transaction_type=='debit': filters.append(Transaction.amount<0)
+    if start_date: filters.append(Transaction.date>=start_date)
+    if end_date: filters.append(Transaction.date<=end_date)
     orders={'date_desc':Transaction.date.desc(),'date_asc':Transaction.date.asc(),'amount_desc':Transaction.amount.desc(),'amount_asc':Transaction.amount.asc()}
     if sort not in orders: raise HTTPException(400,'Invalid sort option')
     total=int(db.scalar(select(func.count()).select_from(Transaction).where(*filters)) or 0)
