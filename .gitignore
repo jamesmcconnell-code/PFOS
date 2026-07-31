@@ -23,4 +23,7 @@ coverage.xml
 
 # Local services and operating-system files
 postgres_data/
+backups/
+*.dump
+*.age
 .DS_Store

@@ -19,7 +19,7 @@ docker-compose.yml  PostgreSQL + API + web application
 
 ## Run locally
 
-1. `cp .env.example .env` and replace `JWT_SECRET` and database password.
+1. `cp .env.example .env`, generate unique values for every secret placeholder, and add only your own optional provider keys.
 2. `docker compose up --build`
 3. In another terminal run `docker compose exec api python -m app.seed` for demo data.
 4. Visit http://localhost:3000 and sign in with `james@example.com` / `change-me-now`; change the password by registering a private account for real use.
@@ -37,6 +37,10 @@ Run backend tests with `cd backend && pytest`. The test suite validates password
 ## Deployment
 
 Deploy the Compose stack to a private VPS or a home server behind HTTPS (Caddy or a managed reverse proxy). Do not expose PostgreSQL publicly. Persist the `postgres_data` volume, set a unique high-entropy JWT secret, maintain encrypted backups, and update images regularly.
+
+## Public code, private household data
+
+PFOS can be shared as source code without sharing a household's data. Keep `.env`, database exports, `backups/`, provider keys, and financial CSV files outside Git. Each user copies `.env.example`, generates their own secrets, and supplies their own optional Plaid, Coinbase, or Gemini credentials. See [Security and private deployment](docs/SECURITY.md) for encrypted backup and restore instructions, recovery requirements, and the public-repository checklist.
 
 ## Data integrations
 
