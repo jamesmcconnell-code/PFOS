@@ -42,7 +42,6 @@ export default function ConnectedSources() {
       const result = await api(`/connections/${connection.id}/sync`, { method: 'POST' });
       setMessage(`Sync complete: ${result.imported} transactions imported, ${result.duplicates} duplicates skipped.`);
       await load();
-      setSelected(result.connection);
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : 'Sync failed'); }
     finally { setSyncing(null); }
   }
