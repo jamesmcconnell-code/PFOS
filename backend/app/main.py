@@ -6,6 +6,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .database import get_db
 from .models import *
@@ -40,6 +41,17 @@ def serialize(o):
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
     row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
+def next_connection_name(household_id, provider: str, requested_name: str, db: Session):
+    """Give separately authorized items a stable, readable source name."""
+    base=requested_name.strip()[:120] or provider.title()
+    existing=set(db.scalars(select(DataConnection.name).where(DataConnection.household_id==household_id,DataConnection.provider==provider)).all())
+    if base not in existing: return base
+    index=2
+    while True:
+        suffix=f' · {index}'
+        candidate=f'{base[:120-len(suffix)]}{suffix}'
+        if candidate not in existing: return candidate
+        index+=1
 
 @app.get('/health')
 def health(): return {'status':'ok'}
@@ -299,7 +311,14 @@ def plaid_exchange(body:PlaidExchangeIn,user=Depends(current_user),db:Session=De
     import httpx
     try: raw=httpx.post(f'{plaid_host()}/item/public_token/exchange',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'public_token':body.public_token},timeout=30).raise_for_status().json()
     except httpx.HTTPError as exc: raise HTTPException(502,'Plaid account authorization could not be saved') from exc
-    x=DataConnection(household_id=household(user,db),provider='plaid',name=body.name,encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}));db.add(x);db.commit();return serialize_connection(x)
+    h=household(user,db)
+    x=DataConnection(household_id=h,provider='plaid',name=next_connection_name(h,'plaid',body.name,db),encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}))
+    try:
+        db.add(x);db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409,'This Plaid authorization could not be saved. Please retry the link flow.') from exc
+    return serialize_connection(x)
 @app.post('/api/v1/connections/{connection_id}/sync')
 def sync_connection(connection_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     x=db.get(DataConnection,connection_id)

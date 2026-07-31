@@ -65,8 +65,11 @@ export default function ConnectedSources() {
         script.onload = () => resolve(); script.onerror = () => reject(new Error('Could not load Plaid Link')); document.head.appendChild(script);
       });
       window.Plaid!.create({ token: link_token, onSuccess: async (public_token, metadata) => {
-        try { await api('/connections/plaid/exchange', { method: 'POST', body: JSON.stringify({ public_token, name: metadata.institution?.name || 'Plaid bank' }) }); await load(); }
-        catch { setMessage('Could not save Plaid connection'); }
+        try {
+          const connection = await api('/connections/plaid/exchange', { method: 'POST', body: JSON.stringify({ public_token, name: metadata.institution?.name || 'Plaid bank' }) });
+          setMessage(`${connection.name} connected. Select Sync to retrieve its balances and transactions.`);
+          await load();
+        } catch (caught) { setMessage(caught instanceof Error ? caught.message : 'Could not save Plaid connection'); }
       }, onExit: () => {} }).open();
     } catch { setMessage('Plaid Link could not start'); }
   }
