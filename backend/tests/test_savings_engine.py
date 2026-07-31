@@ -28,6 +28,11 @@ def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
     assert result['spending_net_cash_flow']==1150
     assert result['monthly_savings']==2150
     assert result['monthly_expenses']==500
+    sources={source['account_name']:source for source in result['monthly_sources']}
+    assert sources['Brokerage funding']['automated_savings']==1000
+    assert sources['Checking']['income']==1650
+    assert sources['Checking']['expenses']==500
+    assert sources['Checking']['spending_cash_flow']==1150
 
 
 def test_net_worth_uses_crypto_usd_value_not_token_quantity():

@@ -358,20 +358,32 @@ def metrics(h,db,view_user_id=None):
     tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False)).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all(); designated_accounts={x.id for x in accounts if x.is_savings_direct_deposit}|{x.account_id for x in rules if x.account_id}; designated_categories={x.category_id for x in rules if x.category_id}; designated_tags={x.tag_id for x in rules if x.tag_id}
     tagged_transactions={transaction_id for transaction_id,tag_id in db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([x.id for x in tx]),TransactionTag.tag_id.in_(designated_tags))).all()} if tx and designated_tags else set()
+    connection_names=dict(db.execute(select(DataConnection.id,DataConnection.name).where(DataConnection.id.in_([x.connection_id for x in accounts if x.connection_id]))).all())
+    monthly_sources={}
+    def source_row(account):
+        if account.id not in monthly_sources:
+            monthly_sources[account.id]={'account_id':str(account.id),'account_name':account.name,'source_name':connection_names.get(account.connection_id,'Manual'),'account_type':account.account_type,'income':0.0,'expenses':0.0,'automated_savings':0.0,'spending_cash_flow':0.0}
+        return monthly_sources[account.id]
     automated=spending_net=expenses=essential=transaction_income=0.0
     for item in tx:
         if item.is_internal_transfer: continue
         account=accounts_by_id[item.account_id];amount=float(item.amount);is_automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged_transactions
-        if amount>0 and is_automated_target: automated+=amount;transaction_income+=amount;continue
+        if amount>0 and is_automated_target:
+            automated+=amount;transaction_income+=amount
+            source=source_row(account);source['income']+=amount;source['automated_savings']+=amount
+            continue
         if account.account_type=='spending' and item.account_id not in designated_accounts:
             spending_net+=amount
+            source=source_row(account);source['spending_cash_flow']+=amount
             if amount>0: transaction_income+=amount
             elif amount<0:
                 expenses-=amount
                 if item.is_essential: essential-=amount
+            if amount>0: source['income']+=amount
+            elif amount<0: source['expenses']-=amount
     income=transaction_income if transaction_income else manual_income;savings=automated+spending_net
     spending_balance=sum(float(x.balance) for x in accounts if x.account_type=='spending' and x.id not in designated_accounts);ceiling=float(db.get(Household,h).checking_account_ceiling)
-    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential,'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling)}
+    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':savings,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round(savings/income*100,1) if income else 0,'essential_monthly':essential,'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling),'monthly_sources':[ {**row,**{key:round(value,2) if isinstance(value,float) else value for key,value in row.items()}} for row in sorted(monthly_sources.values(),key=lambda row:row['account_name'].lower())]}
 @app.get('/api/v1/dashboard')
 def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)

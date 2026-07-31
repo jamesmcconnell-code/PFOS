@@ -4,9 +4,31 @@ import { useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
 import { Protected } from '@/components/protected';
 
+function MetricSources({ sources, metric, label }: { sources: any[]; metric: string; label: string }) {
+  const rows = sources.filter((source) => Number(source[metric]) !== 0);
+  if (!rows.length) return null;
+  return <details className="border-t border-slate-100 pt-2 text-xs">
+    <summary className="cursor-pointer text-slate-600">{label} sources ({rows.length})</summary>
+    <ul className="mt-2 space-y-2">
+      {rows.map((source) => <li className="flex items-start justify-between gap-3" key={source.account_id}>
+        <span className="min-w-0"><b className="block truncate text-slate-700">{source.account_name}</b><span className="text-slate-400">{source.source_name}</span></span>
+        <span className="shrink-0 font-medium text-slate-700">{money(source[metric])}</span>
+      </li>)}
+    </ul>
+  </details>;
+}
+
 export default function Dashboard() {
   const [data, setData] = useState<any>();
-  useEffect(() => { const load = () => api('/dashboard').then(setData).catch(() => {}); load(); window.addEventListener('pfos-view-change', load); return () => window.removeEventListener('pfos-view-change', load); }, []);
+  useEffect(() => {
+    const load = () => api('/dashboard').then(setData).catch(() => {});
+    load();
+    const refresh = window.setInterval(load, 30000);
+    window.addEventListener('pfos-view-change', load);
+    window.addEventListener('focus', load);
+    return () => { window.clearInterval(refresh); window.removeEventListener('pfos-view-change', load); window.removeEventListener('focus', load); };
+  }, []);
   const cards = [['Net worth','net_worth'],['Cash available','cash_available'],['Debt total','debt_total'],['Monthly savings','monthly_savings']];
-  return <Protected><header><p className="label">Overview</p><h1 className="text-3xl font-bold">Financial command center</h1></header>{!data ? <p className="mt-8">Loading…</p> : <><section className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{cards.map(([label,key]) => <div className="card" key={key}><p className="label">{label}</p><p className="metric mt-2">{money(data[key])}</p></div>)}</section><section className="mt-6 grid gap-5 lg:grid-cols-3"><div className="card"><h2 className="font-semibold">This month</h2><dl className="mt-4 space-y-3 text-sm"><div className="flex justify-between"><dt>Income</dt><dd>{money(data.monthly_income)}</dd></div><div className="flex justify-between"><dt>Expenses</dt><dd>{money(data.monthly_expenses)}</dd></div><div className="flex justify-between"><dt>Automated savings</dt><dd>{money(data.automated_savings)}</dd></div><div className="flex justify-between"><dt>Spending cash flow</dt><dd>{money(data.spending_net_cash_flow)}</dd></div><div className="flex justify-between font-semibold"><dt>Savings rate</dt><dd>{data.savings_rate}%</dd></div></dl></div><div className="card"><h2 className="font-semibold">Crypto investments</h2>{data.crypto_assets?.length ? data.crypto_assets.map((asset:any) => <div className="mt-3 flex justify-between text-sm" key={asset.symbol}><span>{Number(asset.quantity).toLocaleString(undefined,{maximumFractionDigits:8})} {asset.symbol}</span><b>{asset.quote_available ? money(asset.usd_value) : 'Quote unavailable'}</b></div>) : <p className="mt-3 text-sm text-slate-500">No crypto assets linked.</p>}</div><div className="card"><h2 className="font-semibold">Goals</h2>{data.goals.map((goal:any) => <div className="mt-4" key={goal.id}><div className="flex justify-between text-sm"><span>{goal.name}</span><span>{goal.progress}%</span></div><div className="mt-2 h-2 overflow-hidden rounded bg-slate-100"><div className="h-full bg-mint" style={{width:`${Math.min(goal.progress,100)}%`}}/></div></div>)}</div></section></>}</Protected>;
+  const sources = data?.monthly_sources || [];
+  return <Protected><header><p className="label">Overview</p><h1 className="text-3xl font-bold">Financial command center</h1></header>{!data ? <p className="mt-8">Loading…</p> : <><section className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">{cards.map(([label,key]) => <div className="card" key={key}><p className="label">{label}</p><p className="metric mt-2">{money(data[key])}</p></div>)}</section><section className="mt-6 grid gap-5 lg:grid-cols-3"><div className="card"><div className="flex items-baseline justify-between gap-3"><h2 className="font-semibold">This month</h2><span className="text-xs text-slate-400">Updates automatically</span></div><dl className="mt-4 space-y-3 text-sm"><div className="flex justify-between"><dt>Income</dt><dd>{money(data.monthly_income)}</dd></div><MetricSources sources={sources} metric="income" label="Income" /><div className="flex justify-between"><dt>Expenses</dt><dd>{money(data.monthly_expenses)}</dd></div><MetricSources sources={sources} metric="expenses" label="Expense" /><div className="flex justify-between"><dt>Automated savings</dt><dd>{money(data.automated_savings)}</dd></div><MetricSources sources={sources} metric="automated_savings" label="Automated savings" /><div className="flex justify-between"><dt>Spending cash flow</dt><dd>{money(data.spending_net_cash_flow)}</dd></div><MetricSources sources={sources} metric="spending_cash_flow" label="Cash-flow" /><div className="flex justify-between font-semibold"><dt>Savings rate</dt><dd>{data.savings_rate}%</dd></div><p className="text-xs text-slate-400">Savings rate uses this month’s income and monthly savings above.</p></dl></div><div className="card"><h2 className="font-semibold">Crypto investments</h2>{data.crypto_assets?.length ? data.crypto_assets.map((asset:any) => <div className="mt-3 flex justify-between text-sm" key={asset.symbol}><span>{Number(asset.quantity).toLocaleString(undefined,{maximumFractionDigits:8})} {asset.symbol}</span><b>{asset.quote_available ? money(asset.usd_value) : 'Quote unavailable'}</b></div>) : <p className="mt-3 text-sm text-slate-500">No crypto assets linked.</p>}</div><div className="card"><h2 className="font-semibold">Goals</h2>{data.goals.map((goal:any) => <div className="mt-4" key={goal.id}><div className="flex justify-between text-sm"><span>{goal.name}</span><span>{goal.progress}%</span></div><div className="mt-2 h-2 overflow-hidden rounded bg-slate-100"><div className="h-full bg-mint" style={{width:`${Math.min(goal.progress,100)}%`}}/></div></div>)}</div></section></>}</Protected>;
 }
