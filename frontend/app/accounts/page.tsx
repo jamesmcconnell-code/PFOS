@@ -14,6 +14,8 @@ export default function Accounts() {
   const [balance, setBalance] = useState('');
   const [newName, setNewName] = useState('');
   const [newRole, setNewRole] = useState('spending');
+  const [roleFilter, setRoleFilter] = useState('');
+  const [ownershipFilter, setOwnershipFilter] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState('');
 
@@ -77,18 +79,42 @@ export default function Accounts() {
     }
   }
 
+  const filteredRows = rows.filter((account) => {
+    if (roleFilter && account.account_type !== roleFilter) return false;
+    if (ownershipFilter === 'joint' && account.ownership !== 'joint') return false;
+    if (ownershipFilter.startsWith('member:') && account.owner_id !== ownershipFilter.slice('member:'.length)) return false;
+    return true;
+  });
+
   return <Protected>
     <h1 className="text-3xl font-bold">Accounts</h1>
     <p className="mt-1 text-slate-500">Classify each account for accurate household reporting.</p>
     {error && !selected && <p className="mt-4 rounded bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+    <section className="card mt-6" aria-label="Account filters">
+      <div className="flex flex-wrap items-end gap-3">
+        <label className="text-sm font-medium text-slate-700">Financial role
+          <select className="mt-1 block rounded border p-2 font-normal" value={roleFilter} onChange={(event) => setRoleFilter(event.target.value)}>
+            <option value="">All roles</option>{roles.map((role) => <option key={role} value={role} className="capitalize">{role}</option>)}
+          </select>
+        </label>
+        <label className="text-sm font-medium text-slate-700">Ownership
+          <select className="mt-1 block rounded border p-2 font-normal" value={ownershipFilter} onChange={(event) => setOwnershipFilter(event.target.value)}>
+            <option value="">All ownership</option><option value="joint">Joint</option>{members.map((member) => <option value={`member:${member.id}`} key={member.id}>{member.display_name}</option>)}
+          </select>
+        </label>
+        {(roleFilter || ownershipFilter) && <button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => { setRoleFilter(''); setOwnershipFilter(''); }}>Clear filters</button>}
+        <p className="pb-2 text-sm text-slate-500">Showing {filteredRows.length} of {rows.length}</p>
+      </div>
+    </section>
     <div className="mt-6 grid gap-4 md:grid-cols-3">
-      {rows.map((account) => <button key={account.id} onClick={() => open(account)} className="card text-left transition hover:-translate-y-0.5 hover:ring-2 hover:ring-mint">
+      {filteredRows.map((account) => <button key={account.id} onClick={() => open(account)} className="card text-left transition hover:-translate-y-0.5 hover:ring-2 hover:ring-mint">
         <div className="flex justify-between gap-2"><span className="label capitalize">{account.account_type}</span><span className="text-xs text-slate-400">{account.ownership === 'joint' ? 'Joint' : account.owner_name}</span></div>
         <b className="mt-2 block">{account.name}</b>
         <p className="metric mt-3">{account.account_type === 'crypto' ? `${Number(account.balance).toLocaleString(undefined,{maximumFractionDigits:8})} ${account.asset_symbol || ''}` : money(account.balance)}</p>
         {account.account_type === 'crypto' && <p className="mt-1 text-sm text-slate-500">{account.crypto_usd_value == null ? 'Quote unavailable' : money(account.crypto_usd_value)}</p>}
         <p className="mt-2 text-xs text-slate-400">{account.source_name} · Click to edit</p>
       </button>)}
+      {!filteredRows.length && <p className="card text-sm text-slate-500 md:col-span-3">No accounts match the selected filters.</p>}
     </div>
     <form onSubmit={add} className="card mt-6 flex flex-wrap items-center gap-3">
       <input className="rounded border p-2" placeholder="Account name" value={newName} onChange={(event) => setNewName(event.target.value)} required />
