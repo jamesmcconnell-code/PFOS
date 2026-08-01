@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .database import get_db
@@ -34,6 +34,12 @@ def household(user: User, db: Session):
 def validate_view_member(household_id, view_user_id: UUID|None, db: Session):
     if view_user_id and not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==household_id,HouseholdMember.user_id==view_user_id)):
         raise HTTPException(400,'Selected user is not part of this household')
+def ensure_groceries_category(household_id, db: Session):
+    category=db.scalar(select(Category).where(Category.household_id==household_id,func.lower(Category.name)=='groceries'))
+    if not category:
+        category=Category(household_id=household_id,name='Groceries',kind='expense')
+        db.add(category); db.commit(); db.refresh(category)
+    return category
 def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
@@ -132,6 +138,7 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
 @app.get('/api/v1/transactions')
 def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,category_ids:list[UUID]=Query(default=[]),financial_roles:list[str]=Query(default=[]),connection_ids:list[UUID]=Query(default=[]),transaction_type:str|None=None,start_date:date|None=None,end_date:date|None=None,sort:str='date_desc',page:int=1,page_size:int=25,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db)
+    ensure_groceries_category(h,db)
     visible_accounts=select(Account.id).where(Account.household_id==h)
     validate_view_member(h,view_user_id,db)
     if view_user_id: visible_accounts=visible_accounts.where(Account.ownership=='individual',Account.owner_id==view_user_id)
@@ -157,8 +164,12 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     total=int(db.scalar(select(func.count()).select_from(Transaction).where(*filters)) or 0)
     q=select(Transaction).where(*filters).order_by(orders[sort],Transaction.id).offset((page-1)*page_size).limit(page_size)
     accounts_by_id={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}; categories_by_id={x.id:x for x in db.scalars(select(Category).where(Category.household_id==h)).all()}; connections_by_id={x.id:x for x in db.scalars(select(DataConnection).where(DataConnection.household_id==h)).all()}; result=[]
-    for x in db.scalars(q).all():
-        row=serialize(x);account=accounts_by_id.get(x.account_id);row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual');result.append(row)
+    page_transactions=db.scalars(q).all(); page_ids=[item.id for item in page_transactions]
+    tags_by_transaction={transaction_id:[] for transaction_id in page_ids}
+    if page_ids:
+        for transaction_id,tag_id,tag_name in db.execute(select(TransactionTag.transaction_id,Tag.id,Tag.name).join(Tag,Tag.id==TransactionTag.tag_id).where(TransactionTag.transaction_id.in_(page_ids))).all(): tags_by_transaction[transaction_id].append({'id':str(tag_id),'name':tag_name})
+    for x in page_transactions:
+        row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags]);result.append(row)
     return {'items':result,'page':page,'page_size':page_size,'total':total,'total_pages':max(1,(total+page_size-1)//page_size),'sort':sort}
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -177,6 +188,21 @@ def update_internal_transfer(transaction_id:UUID,body:TransactionTransferUpdate,
     t=db.get(Transaction,transaction_id)
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     t.is_internal_transfer=body.is_internal_transfer;db.commit();return serialize(t)
+@app.patch('/api/v1/transactions/{transaction_id}/category')
+def update_transaction_category(transaction_id:UUID,body:TransactionCategoryUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=h: raise HTTPException(404,'Transaction not found')
+    if body.category_id and not db.scalar(select(Category.id).where(Category.id==body.category_id,Category.household_id==h)): raise HTTPException(400,'Invalid category')
+    t.category_id=body.category_id; db.commit(); return serialize(t)
+@app.put('/api/v1/transactions/{transaction_id}/tags')
+def update_transaction_tags(transaction_id:UUID,body:TransactionTagsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=h: raise HTTPException(404,'Transaction not found')
+    tag_ids=list(dict.fromkeys(body.tag_ids)); valid_ids=set(db.scalars(select(Tag.id).where(Tag.household_id==h,Tag.id.in_(tag_ids))).all()) if tag_ids else set()
+    if len(valid_ids)!=len(tag_ids): raise HTTPException(400,'Invalid tag')
+    db.execute(delete(TransactionTag).where(TransactionTag.transaction_id==t.id))
+    db.add_all([TransactionTag(transaction_id=t.id,tag_id=tag_id) for tag_id in tag_ids]); db.commit()
+    return {'transaction_id':str(t.id),'tag_ids':[str(tag_id) for tag_id in tag_ids]}
 
 @app.patch('/api/v1/transactions/{transaction_id}/planner-flags')
 def update_transaction_planner_flags(transaction_id:UUID,body:TransactionPlannerFlagsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -249,7 +275,8 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 @app.get('/api/v1/categories')
-def categories(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==household(user,db))).all()]
+def categories(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); ensure_groceries_category(h,db); return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()]
 @app.post('/api/v1/categories')
 def add_category(name:str,kind:str='expense',essential:bool=False,user=Depends(current_user),db:Session=Depends(get_db)):
     c=Category(household_id=household(user,db),name=name,kind=kind,is_essential_default=essential);db.add(c);db.commit();return serialize(c)
