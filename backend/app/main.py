@@ -270,7 +270,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     def is_debt_payment(item,account):
         category_name=(categories.get(item.category_id).name if item.category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
-    paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; debt_items=[]
+    paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; automated_savings_sources=[]; debt_items=[]
     for item in transactions_in_period:
         account=accounts_by_id[item.account_id]; amount=float(item.amount)
         # An explicit refund classification takes precedence over the transfer
@@ -282,7 +282,9 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if item.is_internal_transfer: continue
         automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged
         if amount>0:
-            if automated_target: automated+=amount
+            if automated_target:
+                automated+=amount
+                automated_savings_sources.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount})
             elif account.account_type=='spending': paycheck+=amount
             continue
         if amount>=0 or is_debt_payment(item,account) or item.is_annual: continue
@@ -304,7 +306,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
     regular_expected_annual=fixed_regular+expected+annual_prorated; debt_total=sum(item['amount'] for item in debt_items)
     gross_total_expenses=regular_expected_annual+debt_total; total_expenses=gross_total_expenses-refunds_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):
