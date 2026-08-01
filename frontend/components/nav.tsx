@@ -10,7 +10,7 @@ const links = [['/dashboard','Dashboard',LayoutDashboard],['/accounts','Accounts
 export function Nav() {
   const path = usePathname(), router = useRouter();
   const [members, setMembers] = useState<any[]>([]), [view, setView] = useState('');
-  const supportsScopedView = path === '/dashboard' || path === '/transactions';
+  const supportsScopedView = path === '/dashboard' || path === '/transactions' || path === '/crypto';
 
   useEffect(() => {
     setView(localStorage.getItem('pfos_view_user_id') || '');
