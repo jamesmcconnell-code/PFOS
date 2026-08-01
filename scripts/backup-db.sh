@@ -14,8 +14,12 @@ fi
 backup_dir="${BACKUP_DIR:-./backups}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 output="${backup_dir}/pfos-${timestamp}.dump.age"
+temporary_output="${output}.partial"
 mkdir -p "$backup_dir"
 umask 077
 
-docker compose exec -T db pg_dump -U "${POSTGRES_USER:-pfos}" -Fc "${POSTGRES_DB:-pfos}" | age -r "$BACKUP_RECIPIENT" -o "$output"
+trap 'rm -f "$temporary_output"' EXIT
+docker compose exec -T db pg_dump -U "${POSTGRES_USER:-pfos}" -Fc "${POSTGRES_DB:-pfos}" | age -r "$BACKUP_RECIPIENT" -o "$temporary_output"
+mv "$temporary_output" "$output"
+trap - EXIT
 echo "Encrypted PFOS backup created: $output"
