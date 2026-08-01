@@ -3,20 +3,20 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { LayoutDashboard, WalletCards, ReceiptText, Target, ChartNoAxesCombined, Settings, Upload, Plug, Coins } from 'lucide-react';
+import { LayoutDashboard, WalletCards, ReceiptText, Target, ChartNoAxesCombined, Settings, Upload, Plug, Coins, HandCoins } from 'lucide-react';
 
-const links = [['/dashboard','Dashboard',LayoutDashboard],['/accounts','Accounts',WalletCards],['/transactions','Transactions',ReceiptText],['/import','CSV Import',Upload],['/connections','Connected Sources',Plug],['/crypto','Crypto assets',Coins],['/goals','Goals',Target],['/forecasting','Forecasting',ChartNoAxesCombined],['/settings','Settings',Settings]] as const;
+const links = [['/dashboard','Dashboard',LayoutDashboard],['/available-cash','Available cash',HandCoins],['/accounts','Accounts',WalletCards],['/transactions','Transactions',ReceiptText],['/import','CSV Import',Upload],['/connections','Connected Sources',Plug],['/crypto','Crypto assets',Coins],['/goals','Goals',Target],['/forecasting','Forecasting',ChartNoAxesCombined],['/settings','Settings',Settings]] as const;
 
 export function Nav() {
   const path = usePathname(), router = useRouter();
   const [members, setMembers] = useState<any[]>([]), [view, setView] = useState('');
-  const supportsScopedView = path === '/dashboard' || path === '/transactions' || path === '/crypto';
+  const supportsScopedView = path === '/dashboard' || path === '/transactions' || path === '/crypto' || path === '/available-cash';
 
   useEffect(() => {
     setView(localStorage.getItem('pfos_view_user_id') || '');
     fetch((process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1') + '/household/members', { headers: { Authorization: `Bearer ${localStorage.getItem('pfos_token')}` } })
       .then((response) => response.json()).then(setMembers).catch(() => {});
-  }, []);
+  }, [path]);
 
   function changeView(value: string) {
     setView(value);

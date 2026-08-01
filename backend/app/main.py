@@ -178,6 +178,70 @@ def update_internal_transfer(transaction_id:UUID,body:TransactionTransferUpdate,
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     t.is_internal_transfer=body.is_internal_transfer;db.commit();return serialize(t)
 
+@app.patch('/api/v1/transactions/{transaction_id}/planner-flags')
+def update_transaction_planner_flags(transaction_id:UUID,body:TransactionPlannerFlagsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
+    changes=body.model_dump(exclude_unset=True)
+    if changes.get('is_refund') and float(t.amount)<=0: raise HTTPException(400,'Only positive transactions can be refunds')
+    for field,value in changes.items(): setattr(t,field,value)
+    if changes.get('is_refund') is False: t.refund_included=True
+    db.commit();return serialize(t)
+
+def planner_window(period, anchor):
+    if period=='monthly':
+        start=anchor.replace(day=1);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Monthly view',2
+    if period=='paycheck':
+        if anchor.day<=15: return anchor.replace(day=1),anchor.replace(day=16),'Paycheck view',1
+        start=anchor.replace(day=16);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Paycheck view',1
+    raise HTTPException(400,'Period must be paycheck or monthly')
+
+@app.get('/api/v1/available-cash-planner')
+def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    """Server-side available-cash inputs; savings-rate what-if is intentionally client-only."""
+    h=household(user,db); validate_view_member(h,view_user_id,db)
+    anchor=anchor_date or date.today(); start,end,label,multiplier=planner_window(period,anchor)
+    account_q=select(Account).where(Account.household_id==h,Account.is_active==True)
+    if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+    accounts=db.scalars(account_q).all(); account_ids=[account.id for account in accounts]; accounts_by_id={account.id:account for account in accounts}
+    categories={category.id:category for category in db.scalars(select(Category).where(Category.household_id==h)).all()}
+    transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start,Transaction.date<end,Transaction.is_pending==False)).all() if account_ids else []
+    rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
+    designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
+    tagged={transaction_id for transaction_id,tag_id in db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(designated_tags))).all()} if transactions_in_period and designated_tags else set()
+    def is_debt_payment(item,account):
+        category_name=(categories.get(item.category_id).name if item.category_id in categories else '').lower()
+        return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
+    paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; debt_items=[]
+    for item in transactions_in_period:
+        account=accounts_by_id[item.account_id]; amount=float(item.amount)
+        if item.is_internal_transfer: continue
+        automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged
+        if amount>0:
+            if item.is_refund:
+                refunds.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':item.refund_included})
+                if item.refund_included: refunds_total+=amount
+            elif automated_target: automated+=amount
+            elif account.account_type=='spending': paycheck+=amount
+            continue
+        if amount>=0 or is_debt_payment(item,account) or item.is_annual: continue
+        value=abs(amount)
+        if item.is_expected:
+            expected+=value
+        elif account.account_type=='debt':
+            debt_items.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':value})
+        elif account.account_type=='spending': fixed_regular+=value
+    annual_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_annual==True,Transaction.is_pending==False,Transaction.date<end).order_by(Transaction.date.desc())).all() if account_ids else []
+    latest_annual={}
+    for item in annual_candidates:
+        account=accounts_by_id[item.account_id]
+        if float(item.amount)>=0 or is_debt_payment(item,account): continue
+        latest_annual.setdefault((item.account_id,item.description.strip().lower()),item)
+    annual_total=sum(abs(float(item.amount)) for item in latest_annual.values()); annual_prorated=annual_total/(24 if period=='paycheck' else 12)
+    raw_nmp=paycheck+automated+refunds_total; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
+    regular_expected_annual=fixed_regular+expected+annual_prorated; debt_total=sum(item['amount'] for item in debt_items); total_expenses=regular_expected_annual+debt_total
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'included_refunds':refunds_total/multiplier,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==household(user,db))).all()]
 @app.post('/api/v1/categories')
