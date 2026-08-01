@@ -37,8 +37,12 @@ def validate_view_member(household_id, view_user_id: UUID|None, db: Session):
 def ensure_groceries_category(household_id, db: Session):
     category=db.scalar(select(Category).where(Category.household_id==household_id,func.lower(Category.name)=='groceries'))
     if not category:
-        category=Category(household_id=household_id,name='Groceries',kind='expense')
-        db.add(category); db.commit(); db.refresh(category)
+        try:
+            category=Category(household_id=household_id,name='Groceries',kind='expense')
+            db.add(category); db.commit(); db.refresh(category)
+        except IntegrityError:
+            db.rollback()
+            category=db.scalar(select(Category).where(Category.household_id==household_id,func.lower(Category.name)=='groceries'))
     return category
 def serialize(o):
     def value(raw):
