@@ -70,7 +70,7 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
     db.add_all([
         Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Paycheck',amount=1000),
         Transaction(household_id=home.id,account_id=savings.id,date=date.today(),description='Savings',amount=300),
-        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Refund',amount=50,is_refund=True),
+        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Refund',amount=50,is_refund=True,is_internal_transfer=True),
         Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Rent',amount=-200),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Subscription',amount=-20,is_expected=True),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Purchase',amount=-100),

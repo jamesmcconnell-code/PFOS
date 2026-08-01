@@ -215,13 +215,16 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; debt_items=[]
     for item in transactions_in_period:
         account=accounts_by_id[item.account_id]; amount=float(item.amount)
+        # An explicit refund classification takes precedence over the transfer
+        # heuristic. A reimbursement may be received in any account role.
+        if amount>0 and item.is_refund:
+            refunds.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':item.refund_included})
+            if item.refund_included: refunds_total+=amount
+            continue
         if item.is_internal_transfer: continue
         automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged
         if amount>0:
-            if item.is_refund:
-                refunds.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':item.refund_included})
-                if item.refund_included: refunds_total+=amount
-            elif automated_target: automated+=amount
+            if automated_target: automated+=amount
             elif account.account_type=='spending': paycheck+=amount
             continue
         if amount>=0 or is_debt_payment(item,account) or item.is_annual: continue
