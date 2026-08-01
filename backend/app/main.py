@@ -238,9 +238,12 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if float(item.amount)>=0 or is_debt_payment(item,account): continue
         latest_annual.setdefault((item.account_id,item.description.strip().lower()),item)
     annual_total=sum(abs(float(item.amount)) for item in latest_annual.values()); annual_prorated=annual_total/(24 if period=='paycheck' else 12)
-    raw_nmp=paycheck+automated+refunds_total; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
-    regular_expected_annual=fixed_regular+expected+annual_prorated; debt_total=sum(item['amount'] for item in debt_items); total_expenses=regular_expected_annual+debt_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'included_refunds':refunds_total/multiplier,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    # Refunds are expense credits, rather than income. This keeps NMP limited to
+    # paycheck and automated-savings inflows while transparently reducing costs.
+    raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
+    regular_expected_annual=fixed_regular+expected+annual_prorated; debt_total=sum(item['amount'] for item in debt_items)
+    gross_total_expenses=regular_expected_annual+debt_total; total_expenses=gross_total_expenses-refunds_total
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==household(user,db))).all()]

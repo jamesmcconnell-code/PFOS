@@ -77,8 +77,10 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
         Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Annual fee',amount=-240,is_annual=True),
     ]);db.commit()
     result=available_cash_planner('paycheck',date.today(),None,user,db)
-    assert result['nmp_paycheck']==1350
+    assert result['nmp_paycheck']==1300
     assert result['regular_expected_annual_expenses']==230
     assert result['debt_line_item_total']==100
-    assert result['total_period_expenses']==330
+    assert result['gross_total_period_expenses']==330
+    assert result['refund_expense_offset']==50
+    assert result['total_period_expenses']==280
     assert result['refunds'][0]['refund_included'] is True
