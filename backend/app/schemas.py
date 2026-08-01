@@ -14,6 +14,7 @@ class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
 class TransactionTagsUpdate(BaseModel): tag_ids: list[UUID]=[]
 class TransactionPlannerFlagsUpdate(BaseModel):
+    is_essential: bool|None=None
     is_refund: bool|None=None
     refund_included: bool|None=None
     is_expected: bool|None=None
