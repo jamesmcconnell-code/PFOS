@@ -175,6 +175,34 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     for x in page_transactions:
         row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags]);result.append(row)
     return {'items':result,'page':page,'page_size':page_size,'total':total,'total_pages':max(1,(total+page_size-1)//page_size),'sort':sort}
+
+def category_tracker_filters(h, start_date, end_date, view_user_id, db):
+    validate_view_member(h,view_user_id,db)
+    if start_date>end_date: raise HTTPException(400,'Start date must be on or before end date')
+    account_ids=select(Account.id).where(Account.household_id==h)
+    if view_user_id: account_ids=account_ids.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+    return [Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start_date,Transaction.date<=end_date,Transaction.is_pending==False]
+
+@app.get('/api/v1/category-tracker')
+def category_tracker(start_date:date|None=None,end_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); today=date.today(); end=end_date or today; start=start_date or end.replace(day=1)
+    ensure_groceries_category(h,db); categories=db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()
+    totals={str(category.id):{'id':str(category.id),'name':category.name,'kind':category.kind,'transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0} for category in categories}
+    totals['uncategorized']={'id':None,'name':'Uncategorized','kind':'uncategorized','transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0}
+    for transaction in db.scalars(select(Transaction).where(*category_tracker_filters(h,start,end,view_user_id,db))).all():
+        row=totals.get(str(transaction.category_id),totals['uncategorized']); amount=float(transaction.amount); row['transaction_count']+=1; row['credits']+=max(amount,0); row['debits']+=abs(min(amount,0)); row['net_amount']+=amount; row['activity_total']+=abs(amount)
+    return {'start_date':str(start),'end_date':str(end),'categories':list(totals.values())}
+
+@app.get('/api/v1/category-tracker/transactions')
+def category_tracker_transactions(start_date:date,end_date:date,category_id:UUID|None=None,uncategorized:bool=False,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); filters=category_tracker_filters(h,start_date,end_date,view_user_id,db)
+    if uncategorized: filters.append(Transaction.category_id.is_(None))
+    elif category_id:
+        if not db.scalar(select(Category.id).where(Category.id==category_id,Category.household_id==h)): raise HTTPException(404,'Category not found')
+        filters.append(Transaction.category_id==category_id)
+    else: raise HTTPException(400,'A category is required')
+    items=db.scalars(select(Transaction).where(*filters).order_by(Transaction.date.desc(),Transaction.id).limit(1000)).all(); accounts={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}
+    return {'items':[dict(serialize(item),account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account') for item in items]}
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); a=db.get(Account,body.account_id)
