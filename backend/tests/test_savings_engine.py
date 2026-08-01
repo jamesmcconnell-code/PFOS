@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -43,3 +43,17 @@ def test_net_worth_uses_crypto_usd_value_not_token_quantity():
     db.add(Account(household_id=home.id,name='BTC',type='crypto',account_type='crypto',asset_symbol='BTC',balance=2,crypto_usd_value=180000))
     db.commit()
     assert metrics(home.id,db)['net_worth']==180000
+
+def test_rolling_30_days_includes_today_and_excludes_day_31():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    home=Household(name='Test household');db.add(home);db.flush()
+    spending=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(spending);db.flush()
+    db.add_all([
+        Transaction(household_id=home.id,account_id=spending.id,date=date.today()-timedelta(days=29),description='Included',amount=100),
+        Transaction(household_id=home.id,account_id=spending.id,date=date.today()-timedelta(days=30),description='Excluded',amount=200),
+    ]);db.commit()
+    result=metrics(home.id,db,period='rolling_30_days')
+    assert result['monthly_income']==100
+    assert result['period_start']==str(date.today()-timedelta(days=29))

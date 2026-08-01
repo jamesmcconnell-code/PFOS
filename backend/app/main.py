@@ -382,7 +382,7 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
     income=transaction_income if transaction_income else manual_income
     return {'monthly_income':income,'monthly_expenses':expenses,'monthly_savings':automated+spending_net,'automated_savings':automated,'spending_net_cash_flow':spending_net,'savings_rate':round((automated+spending_net)/income*100,1) if income else 0,'essential_monthly':essential,'monthly_sources':[ {**row,**{key:round(value,2) if isinstance(value,float) else value for key,value in row.items()}} for row in sorted(sources.values(),key=lambda row:row['account_name'].lower())]}
 
-def metrics(h,db,view_user_id=None):
+def metrics(h,db,view_user_id=None,period='calendar_month'):
     q=select(Account).where(Account.household_id==h,Account.is_active==True)
     validate_view_member(h,view_user_id,db)
     if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
@@ -390,20 +390,24 @@ def metrics(h,db,view_user_id=None):
     income_q=select(func.coalesce(func.sum(IncomeSource.monthly_amount),0)).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
     manual_income=float(db.scalar(income_q) or 0)
-    month_start=date.today().replace(day=1);month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
+    if period=='rolling_30_days':
+        month_start=date.today()-timedelta(days=29);month_end=date.today()+timedelta(days=1)
+    elif period=='calendar_month':
+        month_start=date.today().replace(day=1);month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
+    else: raise HTTPException(400,'Period must be calendar_month or rolling_30_days')
     tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False)).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
     monthly=monthly_breakdown(accounts,tx,rules,db,manual_income)
     designated_accounts={x.id for x in accounts if x.is_savings_direct_deposit}|{x.account_id for x in rules if x.account_id}
     spending_balance=sum(float(x.balance) for x in accounts if x.account_type=='spending' and x.id not in designated_accounts);ceiling=float(db.get(Household,h).checking_account_ceiling)
-    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,**monthly,'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling)}
+    return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,**monthly,'period':period,'period_start':str(month_start),'period_end':str(month_end-timedelta(days=1)),'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling)}
 @app.get('/api/v1/dashboard')
-def dashboard(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+def dashboard(period:str='calendar_month',view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); q=select(Account).where(Account.household_id==h,Account.account_type=='crypto',Account.is_active==True)
     if view_user_id: q=q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     crypto_accounts=db.scalars(q).all()
     if refresh_usd_values(crypto_accounts): db.commit()
-    m=metrics(h,db,view_user_id); crypto={}
+    m=metrics(h,db,view_user_id,period); crypto={}
     for a in crypto_accounts:
         if float(a.balance):
             symbol=a.asset_symbol or a.name
