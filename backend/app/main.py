@@ -361,8 +361,26 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); ensure_groceries_category(h,db); return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()]
 @app.post('/api/v1/categories')
-def add_category(name:str,kind:str='expense',essential:bool=False,user=Depends(current_user),db:Session=Depends(get_db)):
-    c=Category(household_id=household(user,db),name=name,kind=kind,is_essential_default=essential);db.add(c);db.commit();return serialize(c)
+def add_category(body:CategoryIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); name=body.name.strip()
+    if body.kind not in {'income','expense','transfer','other'}: raise HTTPException(400,'Invalid category kind')
+    if db.scalar(select(Category.id).where(Category.household_id==h,func.lower(Category.name)==name.lower())): raise HTTPException(409,'A category with this name already exists')
+    c=Category(household_id=h,name=name,kind=body.kind,is_essential_default=body.is_essential_default);db.add(c);db.commit();return serialize(c)
+@app.patch('/api/v1/categories/{category_id}')
+def rename_category(category_id:UUID,body:CategoryRename,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); category=db.get(Category,category_id); name=body.name.strip()
+    if not category or category.household_id!=h: raise HTTPException(404,'Category not found')
+    if db.scalar(select(Category.id).where(Category.household_id==h,func.lower(Category.name)==name.lower(),Category.id!=category.id)): raise HTTPException(409,'A category with this name already exists')
+    category.name=name;db.commit();return serialize(category)
+@app.delete('/api/v1/categories/{category_id}')
+def delete_category(category_id:UUID,body:CategoryDelete,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); category=db.get(Category,category_id); replacement=db.get(Category,body.replacement_category_id)
+    if not category or category.household_id!=h: raise HTTPException(404,'Category not found')
+    if not replacement or replacement.household_id!=h or replacement.id==category.id: raise HTTPException(400,'Select a different replacement category')
+    # Keep all financial records intact: only their category pointer is reassigned.
+    for transaction in db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.category_id==category.id)).all(): transaction.category_id=replacement.id
+    for rule in db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.category_id==category.id)).all(): rule.category_id=replacement.id
+    db.delete(category);db.commit();return {'deleted_category_id':str(category_id),'replacement_category_id':str(replacement.id)}
 @app.get('/api/v1/tags')
 def tags(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Tag).where(Tag.household_id==household(user,db))).all()]
 @app.post('/api/v1/tags')

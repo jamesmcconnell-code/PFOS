@@ -3,8 +3,9 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import available_cash_planner, metrics, reports
-from app.models import Account, AccountBalanceSnapshot, Household, HouseholdMember, Transaction, User
+from app.main import available_cash_planner, delete_category, metrics, reports
+from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, Transaction, User
+from app.schemas import CategoryDelete
 
 
 def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
@@ -111,3 +112,14 @@ def test_reports_scopes_data_and_creates_balance_snapshots():
     assert result['cash_flow']['categories'][0]['name']=='Uncategorized'
     assert result['simple_mode']['spend_target']['target']==500
     assert db.scalar(select(func.count()).select_from(AccountBalanceSnapshot))==3
+
+def test_category_delete_reassigns_transactions_without_deleting_them():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='categories@example.com',display_name='Categories',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);old=Category(household_id=home.id,name='Old',kind='expense');new=Category(household_id=home.id,name='New',kind='expense');db.add_all([account,old,new]);db.flush()
+    transaction=Transaction(household_id=home.id,account_id=account.id,category_id=old.id,date=date.today(),description='Purchase',amount=-10);db.add(transaction);db.commit()
+    delete_category(old.id,CategoryDelete(replacement_category_id=new.id),user,db)
+    assert db.get(Category,old.id) is None
+    assert db.get(Transaction,transaction.id).category_id==new.id

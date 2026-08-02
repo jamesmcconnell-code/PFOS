@@ -17,6 +17,12 @@ class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; 
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
 class TransactionTagsUpdate(BaseModel): tag_ids: list[UUID]=[]
+class CategoryIn(BaseModel):
+    name: str=Field(min_length=1,max_length=100)
+    kind: str='expense'
+    is_essential_default: bool=False
+class CategoryRename(BaseModel): name: str=Field(min_length=1,max_length=100)
+class CategoryDelete(BaseModel): replacement_category_id: UUID
 class TransactionPlannerFlagsUpdate(BaseModel):
     is_essential: bool|None=None
     is_refund: bool|None=None
