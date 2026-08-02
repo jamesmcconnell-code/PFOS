@@ -27,6 +27,12 @@ def current_user(c: HTTPAuthorizationCredentials=Depends(bearer), db: Session=De
     user=db.get(User, decode_token(c.credentials))
     if not user: raise HTTPException(401,'User not found')
     return user
+def require_admin(user: User=Depends(current_user)):
+    if user.role!='ADMIN': raise HTTPException(403,'Administrator access required')
+    return user
+def validate_password(password: str):
+    if len(password)<10 or not any(character.isalpha() for character in password) or not any(character.isdigit() for character in password):
+        raise HTTPException(400,'Password must be at least 10 characters and include a letter and a number')
 def household(user: User, db: Session):
     member=db.scalar(select(HouseholdMember).where(HouseholdMember.user_id==user.id))
     if not member: raise HTTPException(400,'No household configured')
@@ -68,7 +74,7 @@ def health(): return {'status':'ok'}
 @app.post('/api/v1/auth/register', response_model=Token)
 def register(body:Register, db:Session=Depends(get_db)):
     if db.scalar(select(User).where(User.email==body.email)): raise HTTPException(409,'Email already registered')
-    user=User(email=body.email,display_name=body.display_name,password_hash=hash_password(body.password)); db.add(user); db.flush()
+    validate_password(body.password); user=User(email=body.email,display_name=body.display_name,password_hash=hash_password(body.password),role='ADMIN' if not db.scalar(select(func.count()).select_from(User)) else 'USER'); db.add(user); db.flush()
     home=Household(name=f"{body.display_name}'s Household"); db.add(home); db.flush(); db.add(HouseholdMember(household_id=home.id,user_id=user.id,role='owner')); db.commit()
     return {'access_token':create_token(str(user.id))}
 @app.post('/api/v1/auth/login', response_model=Token)
@@ -77,14 +83,29 @@ def login(body:Login, db:Session=Depends(get_db)):
     if not user or not verify_password(body.password,user.password_hash): raise HTTPException(401,'Invalid email or password')
     return {'access_token':create_token(str(user.id))}
 @app.get('/api/v1/auth/me')
-def me(user=Depends(current_user)): return {'id':str(user.id),'email':user.email,'display_name':user.display_name}
+def me(user=Depends(current_user)): return {'id':str(user.id),'email':user.email,'display_name':user.display_name,'role':user.role,'theme_preference':user.theme_preference}
 @app.patch('/api/v1/auth/me')
 def update_me(body:UserUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     other=db.scalar(select(User).where(User.email==body.email,User.id!=user.id))
     if other: raise HTTPException(409,'Email already in use')
     user.display_name,user.email=body.display_name,body.email
-    if body.password: user.password_hash=hash_password(body.password)
     db.commit();return {'id':str(user.id),'email':user.email,'display_name':user.display_name}
+@app.patch('/api/v1/users/me/password')
+def update_own_password(body:PasswordUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    if not verify_password(body.current_password,user.password_hash): raise HTTPException(400,'Current password is incorrect')
+    validate_password(body.new_password); user.password_hash=hash_password(body.new_password); db.commit(); return {'status':'updated'}
+@app.patch('/api/v1/users/me/theme')
+def update_theme(body:ThemeUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    if body.theme_preference not in {'system','emerald','midnight'}: raise HTTPException(400,'Invalid theme preference')
+    user.theme_preference=body.theme_preference; db.commit(); return {'theme_preference':user.theme_preference}
+@app.get('/api/v1/admin/users')
+def admin_users(user=Depends(require_admin),db:Session=Depends(get_db)):
+    return [{'id':str(item.id),'display_name':item.display_name,'email':item.email,'role':item.role,'theme_preference':item.theme_preference,'is_active':item.is_active,'created_at':item.created_at.isoformat()} for item in db.scalars(select(User).order_by(User.created_at)).all()]
+@app.patch('/api/v1/admin/users/{user_id}/password')
+def admin_update_password(user_id:UUID,body:AdminPasswordUpdate,user=Depends(require_admin),db:Session=Depends(get_db)):
+    target=db.get(User,user_id)
+    if not target: raise HTTPException(404,'User not found')
+    validate_password(body.new_password); target.password_hash=hash_password(body.new_password); db.commit(); return {'status':'updated','user_id':str(target.id)}
 
 @app.get('/api/v1/household')
 def get_household(user=Depends(current_user),db:Session=Depends(get_db)):
@@ -100,10 +121,10 @@ def household_members(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); members=db.scalars(select(HouseholdMember).where(HouseholdMember.household_id==h)).all(); return [{'id':str(m.user_id),'display_name':db.get(User,m.user_id).display_name,'email':db.get(User,m.user_id).email,'role':m.role} for m in members]
 @app.post('/api/v1/household/members')
 def add_household_member(body:HouseholdUserIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); requester=db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==h,HouseholdMember.user_id==user.id))
-    if not requester or requester.role!='owner': raise HTTPException(403,'Only the household owner can add members')
+    h=household(user,db)
+    if user.role!='ADMIN': raise HTTPException(403,'Only an administrator can add members')
     if db.scalar(select(User).where(User.email==body.email)): raise HTTPException(409,'Email already registered')
-    member_user=User(email=body.email,display_name=body.display_name,password_hash=hash_password(body.password));db.add(member_user);db.flush();db.add(HouseholdMember(household_id=h,user_id=member_user.id,role='member'));db.commit()
+    validate_password(body.password); member_user=User(email=body.email,display_name=body.display_name,password_hash=hash_password(body.password),role='USER');db.add(member_user);db.flush();db.add(HouseholdMember(household_id=h,user_id=member_user.id,role='member'));db.commit()
     return {'id':str(member_user.id),'display_name':member_user.display_name,'email':member_user.email,'role':'member'}
 @app.get('/api/v1/accounts')
 def accounts(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):

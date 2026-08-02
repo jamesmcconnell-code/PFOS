@@ -7,7 +7,10 @@ class Token(BaseModel): access_token: str; token_type: str='bearer'
 class AccountIn(BaseModel): name: str; type: str='manual'; balance: float=0; institution_id: UUID|None=None; account_type: str='spending'; ownership: str='joint'; owner_id: UUID|None=None; is_savings_direct_deposit: bool=False
 class AccountUpdate(BaseModel):
     name: str; balance: float; account_type: str; ownership: str='joint'; owner_id: UUID|None=None; is_savings_direct_deposit: bool=False
-class UserUpdate(BaseModel): display_name: str = Field(min_length=1,max_length=100); email: EmailStr; password: str|None = Field(default=None,min_length=8)
+class UserUpdate(BaseModel): display_name: str = Field(min_length=1,max_length=100); email: EmailStr
+class PasswordUpdate(BaseModel): current_password: str; new_password: str = Field(min_length=10,max_length=128)
+class AdminPasswordUpdate(BaseModel): new_password: str = Field(min_length=10,max_length=128)
+class ThemeUpdate(BaseModel): theme_preference: str
 class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
