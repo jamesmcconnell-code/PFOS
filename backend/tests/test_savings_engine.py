@@ -92,6 +92,20 @@ def test_available_cash_planner_separates_refunds_prorated_expected_and_debt_ite
     assert result['total_period_expenses']==280
     assert result['refunds'][0]['refund_included'] is True
 
+def test_monthly_planner_returns_every_paycheck_source_and_monthly_nmp():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='monthly-planner@example.com',display_name='Monthly',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0); savings=Account(household_id=home.id,name='Savings',type='savings',account_type='income',is_savings_direct_deposit=True,balance=0);db.add_all([checking,savings]);db.flush()
+    anchor=date.today().replace(day=20);first=anchor.replace(day=2);second=anchor.replace(day=17)
+    db.add_all([Transaction(household_id=home.id,account_id=checking.id,date=first,description='Paycheck one',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=second,description='Paycheck two',amount=1000),Transaction(household_id=home.id,account_id=savings.id,date=first,description='Savings one',amount=300),Transaction(household_id=home.id,account_id=savings.id,date=second,description='Savings two',amount=300)]);db.commit()
+    result=available_cash_planner('monthly',anchor,None,user,db)
+    assert result['paycheck_amount']==2000
+    assert len(result['paycheck_sources'])==2
+    assert result['automated_savings_amount']==600
+    assert result['net_monthly_pay']==2600
+
 def test_reports_scopes_data_and_creates_balance_snapshots():
     engine=create_engine('sqlite://')
     Base.metadata.create_all(engine)
