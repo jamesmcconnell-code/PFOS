@@ -80,6 +80,7 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
     assert result['nmp_paycheck']==1300
     assert result['automated_savings_sources'][0]['description']=='Savings'
     assert result['regular_expected_annual_expenses']==230
+    assert {item['type'] for item in result['expense_input_sources']}=={'Fixed','Expected','Annual'}
     assert result['debt_line_item_total']==100
     assert result['gross_total_period_expenses']==330
     assert result['refund_expense_offset']==50
