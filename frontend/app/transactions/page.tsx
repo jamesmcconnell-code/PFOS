@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
 import { Protected } from '@/components/protected';
+import { loadViewState, saveViewState } from '@/lib/persistent-view';
 
 const roles = ['spending', 'income', 'debt', 'brokerage', 'crypto'];
 const selectedValues = (event: React.ChangeEvent<HTMLSelectElement>) => Array.from(event.target.selectedOptions, (option) => option.value);
@@ -11,7 +12,7 @@ const chipStyles: Record<string, string> = { Internal: 'bg-sky-100 text-sky-800'
 export default function Transactions() {
   const [rows, setRows] = useState<any[]>([]), [categories, setCategories] = useState<any[]>([]), [sources, setSources] = useState<any[]>([]), [tags, setTags] = useState<any[]>([]), [selectedTransaction, setSelectedTransaction] = useState<any|null>(null);
   const [search, setSearch] = useState(''), [categoryIds, setCategoryIds] = useState<string[]>([]), [financialRoles, setFinancialRoles] = useState<string[]>([]), [connectionIds, setConnectionIds] = useState<string[]>([]);
-  const [transactionType, setTransactionType] = useState(''), [startDate, setStartDate] = useState(''), [endDate, setEndDate] = useState(''), [sort, setSort] = useState('date_desc'), [page, setPage] = useState(1), [total, setTotal] = useState(0), [totalPages, setTotalPages] = useState(1), [error, setError] = useState('');
+  const [transactionType, setTransactionType] = useState(''), [startDate, setStartDate] = useState(''), [endDate, setEndDate] = useState(''), [sort, setSort] = useState('date_desc'), [page, setPage] = useState(1), [total, setTotal] = useState(0), [totalPages, setTotalPages] = useState(1), [error, setError] = useState(''), [ready, setReady] = useState(false), [viewVersion,setViewVersion] = useState(0);
 
   const load = useCallback(async () => {
     try {
@@ -22,9 +23,11 @@ export default function Transactions() {
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not load transactions'); }
   }, [search, page, sort, categoryIds, financialRoles, connectionIds, transactionType, startDate, endDate]);
 
-  useEffect(() => { void load(); }, [load]);
+  const restoreView = useCallback(() => { const state=loadViewState('transactions',{search:'',categoryIds:[] as string[],financialRoles:[] as string[],connectionIds:[] as string[],transactionType:'',startDate:'',endDate:'',sort:'date_desc',page:1}); setSearch(state.search); setCategoryIds(state.categoryIds); setFinancialRoles(state.financialRoles); setConnectionIds(state.connectionIds); setTransactionType(state.transactionType); setStartDate(state.startDate); setEndDate(state.endDate); setSort(state.sort); setPage(state.page); setRows([]); setSelectedTransaction(null); setReady(true); setViewVersion((version) => version+1); }, []);
+  useEffect(() => { restoreView(); window.addEventListener('pfos-view-change',restoreView); return () => window.removeEventListener('pfos-view-change',restoreView); }, [restoreView]);
+  useEffect(() => { if (ready) void load(); }, [load,ready,viewVersion]);
   useEffect(() => { Promise.all([api('/categories'), api('/connections'), api('/tags')]).then(([nextCategories, nextSources, nextTags]) => { setCategories(nextCategories); setSources(nextSources); setTags(nextTags); }); }, []);
-  useEffect(() => { const refresh = () => { setPage(1); void load(); }; window.addEventListener('pfos-view-change', refresh); return () => window.removeEventListener('pfos-view-change', refresh); }, [load]);
+  useEffect(() => { if (ready) saveViewState('transactions',{search,categoryIds,financialRoles,connectionIds,transactionType,startDate,endDate,sort,page}); }, [search,categoryIds,financialRoles,connectionIds,transactionType,startDate,endDate,sort,page,ready]);
   function resetPage(setter: (value: any) => void, value: any) { setter(value); setPage(1); }
   async function setCategory(transaction: any, categoryId: string) { try { await api(`/transactions/${transaction.id}/category`, { method: 'PATCH', body: JSON.stringify({ category_id: categoryId || null }) }); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not update category'); } }
   async function setTransfer(transaction: any, isInternalTransfer: boolean) { try { await api(`/transactions/${transaction.id}/internal-transfer`, { method: 'PATCH', body: JSON.stringify({ is_internal_transfer: isInternalTransfer }) }); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not update internal transfer'); } }

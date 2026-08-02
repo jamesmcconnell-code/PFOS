@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
 import { Protected } from '@/components/protected';
+import { loadViewState, saveViewState } from '@/lib/persistent-view';
 
 const today = new Date().toLocaleDateString('en-CA');
 const shiftDate = (value: string, days: number) => { const date = new Date(`${value}T12:00:00`); date.setDate(date.getDate() + days); return date.toLocaleDateString('en-CA'); };
@@ -10,9 +11,12 @@ const shiftDate = (value: string, days: number) => { const date = new Date(`${va
 export default function AvailableCashPlanner() {
   const [period, setPeriod] = useState<'paycheck' | 'monthly'>('paycheck');
   const [anchorDate, setAnchorDate] = useState(today), [savingsRate, setSavingsRate] = useState(30);
-  const [data, setData] = useState<any>(), [error, setError] = useState('');
+  const [data, setData] = useState<any>(), [error, setError] = useState(''), [ready, setReady] = useState(false), [viewVersion,setViewVersion] = useState(0);
   const load = useCallback(() => api(`/available-cash-planner?period=${period}&anchor_date=${anchorDate}`).then((result) => { setData(result); setError(''); }).catch((caught) => setError(caught instanceof Error ? caught.message : 'Could not load planner')), [period, anchorDate]);
-  useEffect(() => { void load(); window.addEventListener('pfos-view-change', load); return () => window.removeEventListener('pfos-view-change', load); }, [load]);
+  const restoreView = useCallback(() => { const state=loadViewState('available-cash',{period:'paycheck',anchorDate:today,savingsRate:30}); setPeriod(state.period as 'paycheck'|'monthly'); setAnchorDate(state.anchorDate); setSavingsRate(state.savingsRate); setData(undefined); setReady(true); setViewVersion((version) => version+1); }, []);
+  useEffect(() => { restoreView(); window.addEventListener('pfos-view-change',restoreView); return () => window.removeEventListener('pfos-view-change',restoreView); }, [restoreView]);
+  useEffect(() => { if (ready) void load(); }, [load,ready,viewVersion]);
+  useEffect(() => { if (ready) saveViewState('available-cash',{period,anchorDate,savingsRate}); }, [period,anchorDate,savingsRate,ready]);
   const toggleRefund = async (refund: any, checked: boolean) => { try { await api(`/transactions/${refund.id}/planner-flags`, { method: 'PATCH', body: JSON.stringify({ refund_included: checked }) }); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not update refund'); } };
   const nmp = data ? (period === 'paycheck' ? Number(data.nmp_paycheck) : Number(data.net_monthly_pay)) : 0;
   const netAfterSavings = nmp * (1 - savingsRate / 100); const freeSpending = netAfterSavings - Number(data?.total_period_expenses || 0);
