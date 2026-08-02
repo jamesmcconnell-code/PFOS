@@ -74,6 +74,7 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
         Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Rent',amount=-200),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Subscription',amount=-20,is_expected=True),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Purchase',amount=-100),
+        Transaction(household_id=home.id,account_id=debt.id,date=date.today()+timedelta(days=1),description='Future purchase',amount=-25),
         Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Annual fee',amount=-240,is_annual=True),
     ]);db.commit()
     result=available_cash_planner('paycheck',date.today(),None,user,db)
@@ -82,6 +83,7 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
     assert result['regular_expected_annual_expenses']==230
     assert {item['type'] for item in result['expense_input_sources']}=={'Fixed','Expected','Annual'}
     assert result['debt_line_item_total']==100
+    assert result['debt_line_item_through']==str(date.today())
     assert result['gross_total_period_expenses']==330
     assert result['refund_expense_offset']==50
     assert result['total_period_expenses']==280
