@@ -22,7 +22,8 @@ class TransactionPlannerFlagsUpdate(BaseModel):
     is_refund: bool|None=None
     refund_included: bool|None=None
     is_expected: bool|None=None
-    is_annual: bool|None=None
+    is_prorated: bool|None=None
+    proration_months: int|None=Field(default=None,ge=1,le=120)
 class SavingsRuleIn(BaseModel): target_type: str; target_id: UUID
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date
 class GoalUpdate(BaseModel):

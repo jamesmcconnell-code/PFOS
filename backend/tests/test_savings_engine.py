@@ -58,7 +58,7 @@ def test_rolling_30_days_includes_today_and_excludes_day_31():
     assert result['monthly_income']==100
     assert result['period_start']==str(date.today()-timedelta(days=29))
 
-def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items():
+def test_available_cash_planner_separates_refunds_prorated_expected_and_debt_items():
     engine=create_engine('sqlite://')
     Base.metadata.create_all(engine)
     db=sessionmaker(bind=engine)()
@@ -75,13 +75,15 @@ def test_available_cash_planner_separates_refunds_annual_expected_and_debt_items
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Subscription',amount=-20,is_expected=True),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today(),description='Purchase',amount=-100),
         Transaction(household_id=home.id,account_id=debt.id,date=date.today()+timedelta(days=1),description='Future purchase',amount=-25),
-        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Annual fee',amount=-240,is_annual=True),
+        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Prorated fee',amount=-240,is_prorated=True,proration_months=12),
+        Transaction(household_id=home.id,account_id=checking.id,date=date.today()-timedelta(days=120),description='Expired proration',amount=-300,is_prorated=True,proration_months=3),
     ]);db.commit()
     result=available_cash_planner('paycheck',date.today(),None,user,db)
     assert result['nmp_paycheck']==1300
     assert result['automated_savings_sources'][0]['description']=='Savings'
-    assert result['regular_expected_annual_expenses']==230
-    assert {item['type'] for item in result['expense_input_sources']}=={'Fixed','Expected','Annual'}
+    assert result['regular_expected_prorated_expenses']==230
+    assert {item['type'] for item in result['expense_input_sources']}=={'Fixed','Expected','Prorated'}
+    assert result['expense_input_sources'][-1]['proration_months']==12
     assert result['debt_line_item_total']==100
     assert result['debt_line_item_through']==str(date.today())
     assert result['gross_total_period_expenses']==330

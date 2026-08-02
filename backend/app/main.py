@@ -1,4 +1,4 @@
-import csv, hashlib, io, json
+import calendar, csv, hashlib, io, json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -278,6 +278,11 @@ def planner_window(period, anchor):
         start=anchor.replace(day=16);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Paycheck view',1
     raise HTTPException(400,'Period must be paycheck or monthly')
 
+def add_months(value: date, months: int) -> date:
+    """Return the inclusive-start date shifted by whole calendar months."""
+    month_index=value.month-1+months; year=value.year+month_index//12; month=month_index%12+1
+    return date(year,month,min(value.day,calendar.monthrange(year,month)[1]))
+
 @app.get('/api/v1/available-cash-planner')
 def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     """Server-side available-cash inputs; savings-rate what-if is intentionally client-only."""
@@ -311,7 +316,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 automated_savings_sources.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount})
             elif account.account_type=='spending': paycheck+=amount
             continue
-        if amount>=0 or is_debt_payment(item,account) or item.is_annual: continue
+        if amount>=0 or is_debt_payment(item,account) or item.is_prorated: continue
         value=abs(amount)
         if item.is_expected:
             expected+=value
@@ -324,21 +329,22 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         elif account.account_type=='spending':
             fixed_regular+=value
             expense_input_sources.append({'id':str(item.id),'type':'Fixed','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
-    annual_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_annual==True,Transaction.is_pending==False,Transaction.date<end).order_by(Transaction.date.desc())).all() if account_ids else []
-    latest_annual={}
-    for item in annual_candidates:
-        account=accounts_by_id[item.account_id]
-        if float(item.amount)>=0 or is_debt_payment(item,account): continue
-        latest_annual.setdefault((item.account_id,item.description.strip().lower()),item)
-    annual_total=sum(abs(float(item.amount)) for item in latest_annual.values()); annual_divisor=24 if period=='paycheck' else 12; annual_prorated=annual_total/annual_divisor
-    for item in latest_annual.values():
-        account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); expense_input_sources.append({'id':str(item.id),'type':'Annual','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value/annual_divisor})
+    prorated_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_prorated==True,Transaction.is_pending==False,Transaction.date<=anchor).order_by(Transaction.date.desc())).all() if account_ids else []
+    active_prorated=[]
+    for item in prorated_candidates:
+        account=accounts_by_id[item.account_id]; duration=max(1,int(item.proration_months or 12))
+        # A purchase contributes from its purchase date up to, but not including,
+        # the matching duration anniversary (3, 6, 12 months, or another choice).
+        if float(item.amount)<0 and not is_debt_payment(item,account) and anchor<add_months(item.date,duration): active_prorated.append(item)
+    prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(24 if period=='paycheck' else 12); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
+    for item in active_prorated:
+        account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
     # Refunds are expense credits, rather than income. This keeps NMP limited to
     # paycheck and automated-savings inflows while transparently reducing costs.
     raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
-    regular_expected_annual=fixed_regular+expected+annual_prorated; debt_total=sum(item['amount'] for item in debt_items)
-    gross_total_expenses=regular_expected_annual+debt_total; total_expenses=gross_total_expenses-refunds_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'debt_line_item_through':str(anchor),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'annual_expense_total':annual_total,'annual_prorated_expenses':annual_prorated,'regular_expected_annual_expenses':regular_expected_annual,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    regular_expected_prorated=fixed_regular+expected+prorated_expenses; debt_total=sum(item['amount'] for item in debt_items)
+    gross_total_expenses=regular_expected_prorated+debt_total; total_expenses=gross_total_expenses-refunds_total
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'debt_line_item_through':str(anchor),'paycheck_amount':paycheck/multiplier,'automated_savings_amount':automated/multiplier,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):
