@@ -57,6 +57,16 @@ def serialize(o):
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
     row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
+def record_balance_snapshots(db: Session, accounts: list[Account], snapshot_date: date|None=None, source: str='calculated'):
+    """Upsert one point-in-time balance per account/day without changing balances."""
+    captured_on=snapshot_date or date.today()
+    for account in accounts:
+        snapshot=db.scalar(select(AccountBalanceSnapshot).where(AccountBalanceSnapshot.account_id==account.id,AccountBalanceSnapshot.snapshot_date==captured_on))
+        usd_value=float(account.crypto_usd_value) if account.account_type=='crypto' and account.crypto_usd_value is not None else None
+        if snapshot:
+            snapshot.balance=account.balance; snapshot.usd_value=usd_value; snapshot.source=source
+        else:
+            db.add(AccountBalanceSnapshot(household_id=account.household_id,account_id=account.id,snapshot_date=captured_on,balance=account.balance,usd_value=usd_value,source=source))
 def next_connection_name(household_id, provider: str, requested_name: str, db: Session):
     """Give separately authorized items a stable, readable source name."""
     base=requested_name.strip()[:120] or provider.title()
@@ -143,7 +153,7 @@ def add_account(body:AccountIn,user=Depends(current_user),db:Session=Depends(get
     h=household(user,db)
     if body.account_type not in {'debt','brokerage','income','spending','crypto'}: raise HTTPException(400,'Invalid account type')
     if body.ownership=='individual' and (not body.owner_id or not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==h,HouseholdMember.user_id==body.owner_id))): raise HTTPException(400,'Select a household member for an individual account')
-    a=Account(household_id=h,**body.model_dump()); db.add(a); db.commit(); return serialize(a)
+    a=Account(household_id=h,**body.model_dump()); db.add(a); db.flush(); record_balance_snapshots(db,[a],source='manual'); db.commit(); return serialize(a)
 @app.patch('/api/v1/accounts/{account_id}')
 def update_account(account_id:UUID,body:AccountUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     a=db.get(Account,account_id)
@@ -151,6 +161,7 @@ def update_account(account_id:UUID,body:AccountUpdate,user=Depends(current_user)
     if body.account_type not in {'debt','brokerage','income','spending','crypto'}: raise HTTPException(400,'Invalid account type')
     if body.ownership=='individual' and (not body.owner_id or not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==a.household_id,HouseholdMember.user_id==body.owner_id))): raise HTTPException(400,'Select a household member for an individual account')
     a.name,a.balance,a.account_type,a.ownership,a.owner_id,a.is_savings_direct_deposit=body.name,body.balance,body.account_type,body.ownership,body.owner_id if body.ownership=='individual' else None,body.is_savings_direct_deposit
+    record_balance_snapshots(db,[a],source='manual')
     db.commit(); return serialize(a)
 @app.delete('/api/v1/accounts/{account_id}',status_code=204)
 def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -232,7 +243,7 @@ def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Dep
     h=household(user,db); a=db.get(Account,body.account_id)
     if not a or a.household_id!=h: raise HTTPException(400,'Invalid account')
     data=body.model_dump(); data['fingerprint']=hashlib.sha256(f'{body.account_id}|{body.date}|{body.amount}|{body.description.lower()}'.encode()).hexdigest()
-    t=Transaction(household_id=h,**data); db.add(t); a.balance=float(a.balance)+body.amount; db.commit(); return serialize(t)
+    t=Transaction(household_id=h,**data); db.add(t); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return serialize(t)
 @app.patch('/api/v1/transactions/{transaction_id}')
 def update_transaction(transaction_id:UUID,body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     t=db.get(Transaction,transaction_id)
@@ -609,6 +620,79 @@ def finance_trends(months:int=6,view_user_id:UUID|None=None,user=Depends(current
         point=monthly_breakdown(accounts,[item for item in transactions_in_range if month_start<=item.date<month_end],rules,db,manual_income)
         series.append({'month':str(month_start),'label':month_start.strftime('%b %Y'),**point})
     return {'months':months,'series':series}
+
+def report_timeframe_dates(timeframe: str, db: Session, household_id, account_ids: list[UUID]) -> list[date]:
+    today=date.today(); valid={'1M','3M','6M','YTD','1Y','All'}
+    if timeframe not in valid: raise HTTPException(400,'Timeframe must be 1M, 3M, 6M, YTD, 1Y, or All')
+    if timeframe=='1M': return [today-timedelta(days=offset) for offset in range(29,-1,-1)]
+    if timeframe=='3M': start=today-timedelta(days=89); return [start+timedelta(days=offset) for offset in range(0,90,7)]+[today]
+    if timeframe=='6M': months=6
+    elif timeframe=='YTD': months=today.month
+    elif timeframe=='1Y': months=12
+    else:
+        earliest=db.scalar(select(func.min(Transaction.date)).where(Transaction.household_id==household_id,Transaction.account_id.in_(account_ids))) if account_ids else None
+        snapshot_earliest=db.scalar(select(func.min(AccountBalanceSnapshot.snapshot_date)).where(AccountBalanceSnapshot.household_id==household_id,AccountBalanceSnapshot.account_id.in_(account_ids))) if account_ids else None
+        starts=[value for value in (earliest,snapshot_earliest) if value]
+        first=min(starts) if starts else today
+        months=min(60,max(1,(today.year-first.year)*12+today.month-first.month+1))
+    first_month=today.replace(day=1)
+    return [date((first_month.year*12+first_month.month-1-offset-1)//12,(first_month.year*12+first_month.month-1-offset-1)%12+1,1) for offset in range(months-1,-1,-1)] + [today]
+
+@app.get('/api/v1/reports')
+def reports(timeframe:str='3M',view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    """Scope-aware reporting built from snapshots, normalized transactions, and current account data."""
+    h=household(user,db); validate_view_member(h,view_user_id,db)
+    account_q=select(Account).where(Account.household_id==h,Account.is_active==True)
+    if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+    accounts=db.scalars(account_q).all(); account_ids=[account.id for account in accounts]; account_by_id={account.id:account for account in accounts}
+    record_balance_snapshots(db,accounts); db.commit()
+    dates=report_timeframe_dates(timeframe,db,h,account_ids)
+    snapshots=db.scalars(select(AccountBalanceSnapshot).where(AccountBalanceSnapshot.account_id.in_(account_ids),AccountBalanceSnapshot.snapshot_date<=date.today()).order_by(AccountBalanceSnapshot.snapshot_date) if account_ids else select(AccountBalanceSnapshot).where(False)).all()
+    snapshots_by_account={account.id:[] for account in accounts}
+    for snapshot in snapshots: snapshots_by_account.setdefault(snapshot.account_id,[]).append(snapshot)
+    all_transactions=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date<=date.today(),Transaction.is_pending==False) if account_ids else select(Transaction).where(False)).all()
+    def historical_value(account, point):
+        matches=[snapshot for snapshot in snapshots_by_account.get(account.id,[]) if snapshot.snapshot_date<=point]
+        if matches:
+            latest=matches[-1]; return float(latest.usd_value) if account.account_type=='crypto' and latest.usd_value is not None else float(latest.balance)
+        # Pre-snapshot transaction backfill is an estimate. Future snapshots replace it with observed balances.
+        later=sum(float(item.amount) for item in all_transactions if item.account_id==account.id and item.date>point)
+        if account.account_type=='crypto': return float(account.crypto_usd_value or 0)
+        return float(account.balance)-later
+    net_worth_series=[]
+    for point in dates:
+        types={name:0.0 for name in ('spending','income','brokerage','crypto','debt')}; assets=debt=0.0
+        for account in accounts:
+            value=historical_value(account,point)
+            if account.account_type=='debt': debt+=abs(value); types['debt']+=abs(value)
+            else: assets+=value; types[account.account_type]=types.get(account.account_type,0)+value
+        net_worth_series.append({'date':str(point),'label':point.strftime('%b %-d' if timeframe in {'1M','3M'} else '%b %Y'),'assets':round(assets,2),'liabilities':round(debt,2),'net_worth':round(assets-debt,2),'by_account_type':{key:round(value,2) for key,value in types.items()}})
+    start=dates[0]; expense_transactions=[item for item in all_transactions if start<=item.date<=date.today() and float(item.amount)<0 and not item.is_internal_transfer and account_by_id[item.account_id].account_type in {'spending','debt'}]
+    categories={category.id:category.name for category in db.scalars(select(Category).where(Category.household_id==h)).all()}
+    category_totals={}
+    for item in expense_transactions: category_totals[categories.get(item.category_id,'Uncategorized')]=category_totals.get(categories.get(item.category_id,'Uncategorized'),0)+abs(float(item.amount))
+    monthly_points=[]; month_cursor=start.replace(day=1); current_month=date.today().replace(day=1)
+    while month_cursor<=current_month:
+        month_end=(month_cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
+        month_items=[item for item in expense_transactions if month_cursor<=item.date<month_end]
+        recurring=sum(abs(float(item.amount)) for item in month_items if item.is_recurring or item.is_expected or item.is_prorated)
+        discretionary=sum(abs(float(item.amount)) for item in month_items if not (item.is_recurring or item.is_expected or item.is_prorated))
+        monthly_points.append({'month':str(month_cursor),'label':month_cursor.strftime('%b %Y'),'recurring':round(recurring,2),'discretionary':round(discretionary,2),'total':round(recurring+discretionary,2)})
+        month_cursor=month_end
+    latest_spend=monthly_points[-1]['total'] if monthly_points else 0; previous_spend=monthly_points[-2]['total'] if len(monthly_points)>1 else 0
+    month_days=((current_month.replace(day=28)+timedelta(days=4)).replace(day=1)-current_month).days; elapsed=max(1,(date.today()-current_month).days+1)
+    average_spend=sum(point['total'] for point in monthly_points)/len(monthly_points) if monthly_points else 0
+    current_values={account.id:(float(account.crypto_usd_value or 0) if account.account_type=='crypto' else float(account.balance)) for account in accounts}
+    investment_accounts=[account for account in accounts if account.account_type in {'brokerage','crypto'}]
+    investment_value=sum(current_values[account.id] for account in investment_accounts)
+    investment_contributions=sum(float(item.amount) for item in all_transactions if item.account_id in {account.id for account in investment_accounts} and float(item.amount)>0 and not item.is_internal_transfer)
+    allocation=[{'name':account.name,'type':account.account_type,'value':round(current_values[account.id],2)} for account in investment_accounts if current_values[account.id]!=0]
+    latest_month_transactions=[item for item in all_transactions if current_month<=item.date<=date.today()]
+    rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
+    current_cash=monthly_breakdown(accounts,latest_month_transactions,rules,db)
+    target=float(db.get(Household,h).checking_account_ceiling or 0) or average_spend
+    current_net=net_worth_series[-1]['net_worth'] if net_worth_series else 0; previous_net=net_worth_series[0]['net_worth'] if net_worth_series else 0
+    return {'timeframe':timeframe,'net_worth':{'current':current_net,'change':round(current_net-previous_net,2),'change_percent':round(((current_net-previous_net)/abs(previous_net))*100,1) if previous_net else 0,'series':net_worth_series},'investments':{'current_value':round(investment_value,2),'net_contributions':round(investment_contributions,2),'return_amount':round(investment_value-investment_contributions,2),'return_percent':round(((investment_value-investment_contributions)/investment_contributions)*100,1) if investment_contributions else None,'allocation':allocation},'cost_of_living':{'average_monthly_spend':round(average_spend,2),'projected_month_end_spend':round(latest_spend/elapsed*month_days,2),'month_over_month_percent':round(((latest_spend-previous_spend)/previous_spend)*100,1) if previous_spend else None,'series':monthly_points,'recurring_total':round(sum(point['recurring'] for point in monthly_points),2),'discretionary_total':round(sum(point['discretionary'] for point in monthly_points),2)},'cash_flow':{'income':current_cash['monthly_income'],'savings':current_cash['monthly_savings'],'expenses':current_cash['monthly_expenses'],'categories':[{'name':name,'value':round(value,2)} for name,value in sorted(category_totals.items(),key=lambda row:row[1],reverse=True)]},'simple_mode':{'net_worth_trend':net_worth_series,'spend_target':{'actual':round(latest_spend,2),'target':round(target,2),'target_source':'Checking ceiling' if float(db.get(Household,h).checking_account_ceiling or 0) else 'Average monthly spend'},'top_categories':[{'name':name,'value':round(value,2)} for name,value in sorted(category_totals.items(),key=lambda row:row[1],reverse=True)[:3]]}}
 @app.get('/api/v1/forecast')
 def forecast(monthly_savings:float|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); m=metrics(h,db,view_user_id); savings=monthly_savings if monthly_savings is not None else m['monthly_savings']; output=[];elapsed=0.0;lump_sum=m['sweep_surplus']

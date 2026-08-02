@@ -1,10 +1,10 @@
 from datetime import date, timedelta
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import available_cash_planner, metrics
-from app.models import Account, Household, HouseholdMember, Transaction, User
+from app.main import available_cash_planner, metrics, reports
+from app.models import Account, AccountBalanceSnapshot, Household, HouseholdMember, Transaction, User
 
 
 def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
@@ -90,3 +90,24 @@ def test_available_cash_planner_separates_refunds_prorated_expected_and_debt_ite
     assert result['refund_expense_offset']==50
     assert result['total_period_expenses']==280
     assert result['refunds'][0]['refund_included'] is True
+
+def test_reports_scopes_data_and_creates_balance_snapshots():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='reports@example.com',display_name='Reports',password_hash='x'); home=Household(name='Test household',checking_account_ceiling=500); db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=1200)
+    card=Account(household_id=home.id,name='Card',type='credit',account_type='debt',balance=-300)
+    brokerage=Account(household_id=home.id,name='Brokerage',type='investment',account_type='brokerage',balance=5000)
+    db.add_all([checking,card,brokerage]);db.flush()
+    db.add_all([
+        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Pay',amount=1000),
+        Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Groceries',amount=-100),
+        Transaction(household_id=home.id,account_id=brokerage.id,date=date.today(),description='Contribution',amount=400),
+    ]);db.commit()
+    result=reports('1M',None,user,db)
+    assert result['net_worth']['current']==5900
+    assert result['investments']['current_value']==5000
+    assert result['cash_flow']['categories'][0]['name']=='Uncategorized'
+    assert result['simple_mode']['spend_target']['target']==500
+    assert db.scalar(select(func.count()).select_from(AccountBalanceSnapshot))==3
