@@ -3,9 +3,9 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { LayoutDashboard, WalletCards, ReceiptText, Target, ChartNoAxesCombined, Settings, Upload, Plug, Coins, HandCoins, Tags } from 'lucide-react';
+import { LayoutDashboard, WalletCards, ReceiptText, Target, ChartNoAxesCombined, Upload, Plug, Coins, HandCoins, Tags } from 'lucide-react';
 
-const links = [['/dashboard','Dashboard',LayoutDashboard],['/available-cash','Available cash',HandCoins],['/accounts','Accounts',WalletCards],['/transactions','Transactions',ReceiptText],['/category-tracker','Category tracker',Tags],['/import','CSV Import',Upload],['/connections','Connected Sources',Plug],['/crypto','Crypto assets',Coins],['/goals','Goals',Target],['/forecasting','Forecasting',ChartNoAxesCombined],['/settings','Settings',Settings]] as const;
+const links = [['/dashboard','Dashboard',LayoutDashboard],['/available-cash','Available cash',HandCoins],['/accounts','Accounts',WalletCards],['/transactions','Transactions',ReceiptText],['/category-tracker','Category tracker',Tags],['/import','CSV Import',Upload],['/connections','Connected Sources',Plug],['/crypto','Crypto assets',Coins],['/goals','Goals',Target],['/forecasting','Forecasting',ChartNoAxesCombined]] as const;
 
 export function Nav() {
   const path = usePathname(), router = useRouter();
