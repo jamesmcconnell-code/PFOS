@@ -1,4 +1,197 @@
-@tailwind base;@tailwind components;@tailwind utilities;
-*{box-sizing:border-box} body{@apply bg-slate-50 text-ink antialiased} button,input,select{font:inherit}.card{@apply rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200}.metric{@apply text-2xl font-semibold tracking-tight}.label{@apply text-xs font-medium uppercase tracking-wider text-slate-500}
-html[data-theme='emerald'] body{@apply bg-emerald-50 text-emerald-950}html[data-theme='emerald'] .card{@apply bg-white ring-emerald-200}html[data-theme='midnight'] body{@apply bg-slate-950 text-slate-100}html[data-theme='midnight'] .card{@apply bg-slate-900 text-slate-100 ring-slate-700}html[data-theme='midnight'] .label{color:#94a3b8}html[data-theme='midnight'] input,html[data-theme='midnight'] select{background:#0f172a;color:#f8fafc;border-color:#475569}
-@keyframes simple-bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}@keyframes simple-pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.03)}}html[data-simple-mode='true'] body{@apply bg-amber-50 text-slate-800}.simple-mode{padding:1rem}.simple-hero{@apply rounded-3xl bg-gradient-to-br from-emerald-200 via-lime-100 to-amber-100 p-7 shadow-lg;animation:simple-pulse 4s ease-in-out infinite}.simple-hero h1{@apply mt-2 text-4xl font-black tracking-tight text-emerald-950}.simple-sparkle{float:right;font-size:3rem;animation:simple-bob 2s ease-in-out infinite}.simple-card{@apply rounded-3xl bg-white p-6 text-left shadow-lg ring-1 ring-white}.simple-spend{min-height:240px}.simple-good{@apply bg-gradient-to-br from-emerald-100 to-lime-100}.simple-watch{@apply bg-gradient-to-br from-amber-100 to-rose-100}.simple-stash{@apply bg-gradient-to-br from-teal-100 to-emerald-50}.simple-eyebrow{@apply mt-3 text-sm font-bold uppercase tracking-wider text-slate-600}.simple-money{@apply mt-2 text-5xl font-black tracking-tight text-emerald-900}.simple-meter,.simple-billbar{@apply mt-5 h-5 overflow-hidden rounded-full bg-white/70}.simple-meter i{@apply block h-full rounded-full bg-emerald-500 transition-all duration-500}.simple-billbar i{@apply block h-full rounded-full bg-amber-400 transition-all duration-500}.simple-pill{@apply rounded-full px-4 py-2 text-sm font-bold text-emerald-900}.simple-pill-active{@apply rounded-full bg-emerald-600 px-4 py-2 text-sm font-bold text-white shadow}.simple-refund{@apply rounded-full px-3 py-2 text-sm font-bold transition-transform hover:scale-105}.simple-refund-on{@apply bg-emerald-500 text-white}.simple-refund-off{@apply bg-slate-200 text-slate-600}
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --chart-income: #2563eb;
+  --chart-expense: #e11d48;
+  --chart-savings: #059669;
+  --chart-cash-flow: #7c3aed;
+  --chart-monthly-savings: #0f766e;
+  --chart-rate: #d97706;
+  --chart-grid: #e2e8f0;
+  --chart-tick: #64748b;
+  --chart-tooltip: #ffffff;
+  --chart-tooltip-border: #e2e8f0;
+  --chart-tooltip-shadow: 0 10px 25px rgba(15, 23, 42, 0.12);
+}
+
+* { box-sizing: border-box; }
+body { @apply bg-slate-50 text-ink antialiased; }
+button, input, select { font: inherit; }
+.card { @apply rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200; }
+.metric { @apply text-2xl font-semibold tracking-tight; }
+.label { @apply text-xs font-medium uppercase tracking-wider text-slate-500; }
+
+html[data-theme='emerald'] body { @apply bg-emerald-50 text-emerald-950; }
+html[data-theme='emerald'] .card { @apply bg-white ring-emerald-200; }
+
+/* Midnight Obsidian / OLED: visual-only theme tokens and component treatment. */
+html[data-theme='midnight']:not([data-simple-mode='true']) {
+  color-scheme: dark;
+  --oled-canvas: #000000;
+  --oled-surface: #0b0b0c;
+  --oled-surface-raised: #111113;
+  --oled-text: #f5f5f7;
+  --oled-muted: #a1a1aa;
+  --oled-subtle: #8e8e93;
+  --oled-border: rgba(255, 255, 255, 0.12);
+  --oled-border-active: rgba(255, 255, 255, 0.28);
+  --oled-divider: #1c1c1e;
+  --oled-positive: #30d158;
+  --oled-positive-bg: rgba(48, 209, 88, 0.12);
+  --oled-positive-border: rgba(48, 209, 88, 0.3);
+  --oled-negative: #ff453a;
+  --oled-negative-bg: rgba(255, 69, 58, 0.12);
+  --oled-negative-border: rgba(255, 69, 58, 0.3);
+  --chart-income: #5e9cff;
+  --chart-expense: #ff453a;
+  --chart-savings: #30d158;
+  --chart-cash-flow: #bf8cff;
+  --chart-monthly-savings: #64d2ff;
+  --chart-rate: #ffd60a;
+  --chart-grid: #1c1c1e;
+  --chart-tick: #a1a1aa;
+  --chart-tooltip: #111113;
+  --chart-tooltip-border: rgba(255, 255, 255, 0.2);
+  --chart-tooltip-shadow: 0 12px 30px rgba(0, 0, 0, 0.72);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) body {
+  background: var(--oled-canvas);
+  color: var(--oled-text);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .card {
+  background: var(--oled-surface);
+  color: var(--oled-text);
+  box-shadow: 0 0 0 1px var(--oled-border), 0 0 12px rgba(255, 255, 255, 0.03);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .label,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-500,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-600 {
+  color: var(--oled-muted);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-400 {
+  color: var(--oled-subtle);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-700,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-800,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-slate-900 {
+  color: var(--oled-text);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-white,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-slate-50,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-slate-100 {
+  background-color: var(--oled-surface-raised);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .border,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-slate-100,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-slate-200,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-slate-300 {
+  border-color: var(--oled-border);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) input,
+html[data-theme='midnight']:not([data-simple-mode='true']) select,
+html[data-theme='midnight']:not([data-simple-mode='true']) textarea {
+  background: #0a0a0b;
+  color: var(--oled-text);
+  border: 1px solid var(--oled-border);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) input:focus,
+html[data-theme='midnight']:not([data-simple-mode='true']) select:focus,
+html[data-theme='midnight']:not([data-simple-mode='true']) textarea:focus {
+  border-color: var(--oled-border-active);
+  outline: 2px solid rgba(100, 210, 255, 0.55);
+  outline-offset: 2px;
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) table tbody tr {
+  border-color: var(--oled-divider);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .hover\:bg-slate-50:hover,
+html[data-theme='midnight']:not([data-simple-mode='true']) .hover\:bg-slate-100:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .hover\:ring-2:hover,
+html[data-theme='midnight']:not([data-simple-mode='true']) .hover\:border-slate-300:hover {
+  border-color: var(--oled-border-active);
+  box-shadow: 0 0 0 1px var(--oled-border-active), 0 0 12px rgba(255, 255, 255, 0.04);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-red-50,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-red-100,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-rose-50,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-rose-100 {
+  background-color: var(--oled-negative-bg);
+  box-shadow: inset 0 0 0 1px var(--oled-negative-border);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-red-100,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-red-200,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-rose-100,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-rose-200 {
+  border-color: var(--oled-negative-border);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-red-600,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-red-700,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-red-800,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-rose-700,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-rose-800 {
+  color: var(--oled-negative);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-emerald-50,
+html[data-theme='midnight']:not([data-simple-mode='true']) .bg-emerald-100 {
+  background-color: var(--oled-positive-bg);
+  box-shadow: inset 0 0 0 1px var(--oled-positive-border);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-emerald-100,
+html[data-theme='midnight']:not([data-simple-mode='true']) .border-emerald-200 {
+  border-color: var(--oled-positive-border);
+}
+
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-emerald-600,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-emerald-700,
+html[data-theme='midnight']:not([data-simple-mode='true']) .text-emerald-800 {
+  color: var(--oled-positive);
+}
+
+@keyframes simple-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+@keyframes simple-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
+html[data-simple-mode='true'] body { @apply bg-amber-50 text-slate-800; }
+.simple-mode { padding: 1rem; }
+.simple-hero { @apply rounded-3xl bg-gradient-to-br from-emerald-200 via-lime-100 to-amber-100 p-7 shadow-lg; animation: simple-pulse 4s ease-in-out infinite; }
+.simple-hero h1 { @apply mt-2 text-4xl font-black tracking-tight text-emerald-950; }
+.simple-sparkle { float: right; font-size: 3rem; animation: simple-bob 2s ease-in-out infinite; }
+.simple-card { @apply rounded-3xl bg-white p-6 text-left shadow-lg ring-1 ring-white; }
+.simple-spend { min-height: 240px; }
+.simple-good { @apply bg-gradient-to-br from-emerald-100 to-lime-100; }
+.simple-watch { @apply bg-gradient-to-br from-amber-100 to-rose-100; }
+.simple-stash { @apply bg-gradient-to-br from-teal-100 to-emerald-50; }
+.simple-eyebrow { @apply mt-3 text-sm font-bold uppercase tracking-wider text-slate-600; }
+.simple-money { @apply mt-2 text-5xl font-black tracking-tight text-emerald-900; }
+.simple-meter, .simple-billbar { @apply mt-5 h-5 overflow-hidden rounded-full bg-white/70; }
+.simple-meter i { @apply block h-full rounded-full bg-emerald-500 transition-all duration-500; }
+.simple-billbar i { @apply block h-full rounded-full bg-amber-400 transition-all duration-500; }
+.simple-pill { @apply rounded-full px-4 py-2 text-sm font-bold text-emerald-900; }
+.simple-pill-active { @apply rounded-full bg-emerald-600 px-4 py-2 text-sm font-bold text-white shadow; }
+.simple-refund { @apply rounded-full px-3 py-2 text-sm font-bold transition-transform hover:scale-105; }
+.simple-refund-on { @apply bg-emerald-500 text-white; }
+.simple-refund-off { @apply bg-slate-200 text-slate-600; }
