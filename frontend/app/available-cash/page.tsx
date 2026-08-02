@@ -4,11 +4,14 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
 import { Protected } from '@/components/protected';
 import { loadViewState, saveViewState } from '@/lib/persistent-view';
+import { useSimpleMode } from '@/lib/simple-mode';
+import { SimpleAvailableCash } from '@/components/simple-available-cash';
 
 const today = new Date().toLocaleDateString('en-CA');
 const shiftDate = (value: string, days: number) => { const date = new Date(`${value}T12:00:00`); date.setDate(date.getDate() + days); return date.toLocaleDateString('en-CA'); };
 
 export default function AvailableCashPlanner() {
+  const simpleMode=useSimpleMode();
   const [period, setPeriod] = useState<'paycheck' | 'monthly'>('paycheck');
   const [anchorDate, setAnchorDate] = useState(today), [savingsRate, setSavingsRate] = useState(30);
   const [data, setData] = useState<any>(), [error, setError] = useState(''), [ready, setReady] = useState(false), [viewVersion,setViewVersion] = useState(0);
@@ -21,6 +24,7 @@ export default function AvailableCashPlanner() {
   const nmp = data ? (period === 'paycheck' ? Number(data.nmp_paycheck) : Number(data.net_monthly_pay)) : 0;
   const netAfterSavings = nmp * (1 - savingsRate / 100); const freeSpending = netAfterSavings - Number(data?.total_period_expenses || 0);
   const navigate = (direction: -1 | 1) => { if (!data) return; setAnchorDate(shiftDate(direction < 0 ? data.period_start : data.period_end, direction)); };
+  if (simpleMode) return <Protected>{error && <p className="m-4 rounded bg-red-50 p-3 text-sm text-red-700">{error}</p>}{!data ? <p className="p-8">Loading your simple money view…</p> : <SimpleAvailableCash data={data} period={period} setPeriod={setPeriod} anchorDate={anchorDate} setAnchorDate={setAnchorDate} savingsRate={savingsRate} setSavingsRate={setSavingsRate} toggleRefund={toggleRefund}/>}</Protected>;
   return <Protected><header><p className="label">Planning</p><h1 className="text-3xl font-bold">Available Cash Planner</h1><p className="mt-1 text-slate-500">Plan available spending without changing your saved savings configuration.</p></header>
     <section className="card mt-6"><div className="flex flex-wrap items-center justify-between gap-4"><div className="flex rounded-lg border p-0.5 text-sm"><button type="button" onClick={() => setPeriod('paycheck')} className={`rounded-md px-3 py-2 ${period === 'paycheck' ? 'bg-navy text-white' : 'text-slate-600'}`}>Paycheck view</button><button type="button" onClick={() => setPeriod('monthly')} className={`rounded-md px-3 py-2 ${period === 'monthly' ? 'bg-navy text-white' : 'text-slate-600'}`}>Monthly view</button></div><div className="flex items-center gap-2"><button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => navigate(-1)}>Previous</button><input aria-label="Planner history date" type="date" className="rounded border p-2 text-sm" value={anchorDate} onChange={(event) => setAnchorDate(event.target.value)}/><button type="button" className="rounded border px-3 py-2 text-sm" onClick={() => navigate(1)}>Next</button></div></div>{data && <p className="mt-3 text-sm text-slate-500">{data.period_label}: {data.period_start} through {data.period_end}</p>}</section>
     {error && <p className="mt-4 rounded bg-red-50 p-3 text-sm text-red-700">{error}</p>}{!data ? <p className="mt-8">Loading planner…</p> : <><section className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4"><div className="card"><p className="label">Net {period === 'paycheck' ? 'pay' : 'monthly pay'}</p><p className="metric mt-2">{money(nmp)}</p></div><div className="card"><p className="label">After {savingsRate}% savings</p><p className="metric mt-2">{money(netAfterSavings)}</p></div><div className="card"><p className="label">Period expenses</p><p className="metric mt-2">{money(data.total_period_expenses)}</p></div><div className={`card ${freeSpending >= 0 ? 'ring-1 ring-emerald-200' : 'ring-1 ring-rose-200'}`}><p className="label">Free spending</p><p className={`metric mt-2 ${freeSpending >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>{money(freeSpending)}</p></div></section>

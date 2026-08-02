@@ -10,7 +10,7 @@ class Audit:
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class User(Audit, Base):
-    __tablename__='users'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); email: Mapped[str]=mapped_column(String(320),unique=True,index=True); password_hash: Mapped[str]=mapped_column(String(255)); display_name: Mapped[str]=mapped_column(String(100)); role: Mapped[str]=mapped_column(String(20),default='USER'); theme_preference: Mapped[str]=mapped_column(String(30),default='system'); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
+    __tablename__='users'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); email: Mapped[str]=mapped_column(String(320),unique=True,index=True); password_hash: Mapped[str]=mapped_column(String(255)); display_name: Mapped[str]=mapped_column(String(100)); role: Mapped[str]=mapped_column(String(20),default='USER'); theme_preference: Mapped[str]=mapped_column(String(30),default='system'); simple_mode_enabled: Mapped[bool]=mapped_column(Boolean,default=False); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
 class Household(Audit, Base):
     __tablename__='households'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); name: Mapped[str]=mapped_column(String(120)); currency: Mapped[str]=mapped_column(String(3),default='USD'); checking_account_ceiling: Mapped[float]=mapped_column(Numeric(14,2),default=0)
 class HouseholdMember(Audit, Base):

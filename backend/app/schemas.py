@@ -11,6 +11,7 @@ class UserUpdate(BaseModel): display_name: str = Field(min_length=1,max_length=1
 class PasswordUpdate(BaseModel): current_password: str; new_password: str = Field(min_length=10,max_length=128)
 class AdminPasswordUpdate(BaseModel): new_password: str = Field(min_length=10,max_length=128)
 class ThemeUpdate(BaseModel): theme_preference: str
+class SimpleModeUpdate(BaseModel): simple_mode_enabled: bool
 class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool

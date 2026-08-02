@@ -83,7 +83,7 @@ def login(body:Login, db:Session=Depends(get_db)):
     if not user or not verify_password(body.password,user.password_hash): raise HTTPException(401,'Invalid email or password')
     return {'access_token':create_token(str(user.id))}
 @app.get('/api/v1/auth/me')
-def me(user=Depends(current_user)): return {'id':str(user.id),'email':user.email,'display_name':user.display_name,'role':user.role,'theme_preference':user.theme_preference}
+def me(user=Depends(current_user)): return {'id':str(user.id),'email':user.email,'display_name':user.display_name,'role':user.role,'theme_preference':user.theme_preference,'simple_mode_enabled':user.simple_mode_enabled}
 @app.patch('/api/v1/auth/me')
 def update_me(body:UserUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     other=db.scalar(select(User).where(User.email==body.email,User.id!=user.id))
@@ -98,9 +98,12 @@ def update_own_password(body:PasswordUpdate,user=Depends(current_user),db:Sessio
 def update_theme(body:ThemeUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     if body.theme_preference not in {'system','emerald','midnight'}: raise HTTPException(400,'Invalid theme preference')
     user.theme_preference=body.theme_preference; db.commit(); return {'theme_preference':user.theme_preference}
+@app.patch('/api/v1/users/me/simple-mode')
+def update_simple_mode(body:SimpleModeUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    user.simple_mode_enabled=body.simple_mode_enabled; db.commit(); return {'simple_mode_enabled':user.simple_mode_enabled}
 @app.get('/api/v1/admin/users')
 def admin_users(user=Depends(require_admin),db:Session=Depends(get_db)):
-    return [{'id':str(item.id),'display_name':item.display_name,'email':item.email,'role':item.role,'theme_preference':item.theme_preference,'is_active':item.is_active,'created_at':item.created_at.isoformat()} for item in db.scalars(select(User).order_by(User.created_at)).all()]
+    return [{'id':str(item.id),'display_name':item.display_name,'email':item.email,'role':item.role,'theme_preference':item.theme_preference,'simple_mode_enabled':item.simple_mode_enabled,'is_active':item.is_active,'created_at':item.created_at.isoformat()} for item in db.scalars(select(User).order_by(User.created_at)).all()]
 @app.patch('/api/v1/admin/users/{user_id}/password')
 def admin_update_password(user_id:UUID,body:AdminPasswordUpdate,user=Depends(require_admin),db:Session=Depends(get_db)):
     target=db.get(User,user_id)
