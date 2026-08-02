@@ -16,6 +16,7 @@ class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
+class TransactionDateUpdate(BaseModel): date: date
 class TransactionTagsUpdate(BaseModel): tag_ids: list[UUID]=[]
 class CategoryIn(BaseModel):
     name: str=Field(min_length=1,max_length=100)

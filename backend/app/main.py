@@ -261,6 +261,11 @@ def update_transaction_category(transaction_id:UUID,body:TransactionCategoryUpda
     if not t or t.household_id!=h: raise HTTPException(404,'Transaction not found')
     if body.category_id and not db.scalar(select(Category.id).where(Category.id==body.category_id,Category.household_id==h)): raise HTTPException(400,'Invalid category')
     t.category_id=body.category_id; db.commit(); return serialize(t)
+@app.patch('/api/v1/transactions/{transaction_id}/date')
+def update_transaction_date(transaction_id:UUID,body:TransactionDateUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
+    t.date=body.date;db.commit();return serialize(t)
 @app.put('/api/v1/transactions/{transaction_id}/tags')
 def update_transaction_tags(transaction_id:UUID,body:TransactionTagsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); t=db.get(Transaction,transaction_id)

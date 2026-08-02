@@ -3,9 +3,9 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import available_cash_planner, delete_category, metrics, reports
+from app.main import available_cash_planner, delete_category, metrics, reports, update_transaction_date
 from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, Transaction, User
-from app.schemas import CategoryDelete
+from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
 def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
@@ -137,3 +137,13 @@ def test_category_delete_reassigns_transactions_without_deleting_them():
     delete_category(old.id,CategoryDelete(replacement_category_id=new.id),user,db)
     assert db.get(Category,old.id) is None
     assert db.get(Transaction,transaction.id).category_id==new.id
+
+def test_transaction_date_override_persists():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='date@example.com',display_name='Date',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(account);db.flush();transaction=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Purchase',amount=-10);db.add(transaction);db.commit()
+    replacement=date.today()-timedelta(days=10)
+    update_transaction_date(transaction.id,TransactionDateUpdate(date=replacement),user,db)
+    assert db.get(Transaction,transaction.id).date==replacement
