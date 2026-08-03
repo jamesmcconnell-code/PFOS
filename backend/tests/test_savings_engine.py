@@ -5,7 +5,7 @@ from fastapi import HTTPException
 
 from app.database import Base
 from app.main import available_cash_planner, category_tracker, delete_category, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate, TransactionSplitsUpdate
 
 
@@ -81,7 +81,8 @@ def test_available_cash_planner_separates_refunds_prorated_expected_and_debt_ite
         Transaction(household_id=home.id,account_id=checking.id,date=date.today()-timedelta(days=120),description='Expired proration',amount=-300,is_prorated=True,proration_months=3),
     ]);db.commit()
     result=available_cash_planner('paycheck',date.today(),None,user,db)
-    assert result['nmp_paycheck']==1300
+    # A paycheck posted during the current half-month funds the following half.
+    assert result['nmp_paycheck']==300
     assert result['automated_savings_sources'][0]['description']=='Savings'
     assert result['regular_expected_prorated_expenses']==230
     assert {item['type'] for item in result['expense_input_sources']}=={'Fixed','Expected','Prorated'}
@@ -99,8 +100,8 @@ def test_monthly_planner_returns_every_paycheck_source_and_monthly_nmp():
     db=sessionmaker(bind=engine)()
     user=User(email='monthly-planner@example.com',display_name='Monthly',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0); savings=Account(household_id=home.id,name='Savings',type='savings',account_type='income',is_savings_direct_deposit=True,balance=0);db.add_all([checking,savings]);db.flush()
-    anchor=date.today().replace(day=20);first=anchor.replace(day=2);second=anchor.replace(day=17)
-    db.add_all([Transaction(household_id=home.id,account_id=checking.id,date=first,description='Paycheck one',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=second,description='Paycheck two',amount=1000),Transaction(household_id=home.id,account_id=savings.id,date=first,description='Savings one',amount=300),Transaction(household_id=home.id,account_id=savings.id,date=second,description='Savings two',amount=300)]);db.commit()
+    anchor=date.today().replace(day=20);first=anchor.replace(day=2);previous_month_end=anchor.replace(day=1)-timedelta(days=1)
+    db.add_all([Transaction(household_id=home.id,account_id=checking.id,date=previous_month_end,description='Paycheck one',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=first,description='Paycheck two',amount=1000),Transaction(household_id=home.id,account_id=savings.id,date=first,description='Savings one',amount=300),Transaction(household_id=home.id,account_id=savings.id,date=anchor.replace(day=17),description='Savings two',amount=300)]);db.commit()
     result=available_cash_planner('monthly',anchor,None,user,db)
     assert result['paycheck_amount']==2000
     assert len(result['paycheck_sources'])==2
@@ -219,7 +220,7 @@ def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     user=User(email='rolling-paycheck@example.com',display_name='Rolling',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
-    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,1),amount=100),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,3),description='Bill',amount=-300),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,16),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,17),description='Bill',amount=-200),PlannerAdjustment(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,16),amount=-50,note='Cash withdrawal')]);db.commit()
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,1),amount=100),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,3),description='Bill',amount=-300),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,17),description='Bill',amount=-200),PlannerAdjustment(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,16),amount=-50,note='Cash withdrawal')]);db.commit()
     result=planner_cash_history(home.id,'paycheck',date(2026,8,20),None,user,db)
     assert result['history'][-2]['ending_rolling_available_cash']==800
     assert result['current']['free_spending']==800
@@ -284,16 +285,28 @@ def test_split_tags_and_refund_credit_are_applied_per_allocation():
     assert planner['refund_expense_offset']==100
     assert planner['automated_savings_amount']==0
 
-def test_late_month_paycheck_is_available_in_next_paycheck_period_without_changing_date():
+def test_paychecks_map_to_the_following_planner_period_without_changing_dates():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     user=User(email='pay-availability@example.com',display_name='Pay availability',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
-    paycheck=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='Payroll',amount=825);db.add(paycheck);db.commit()
-    planner=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
-    assert planner['paycheck_amount']==825
-    assert planner['paycheck_sources'][0]['date']=='2026-07-31'
-    assert planner['paycheck_sources'][0]['available_period_start']=='2026-08-01'
-    assert db.get(Transaction,paycheck.id).date==date(2026,7,31)
+    june_pay=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,6,29),description='June payroll',amount=1925.43);july_pay=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,13),description='July payroll',amount=1916.55);july_end_pay=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='July end payroll',amount=825);august_pay=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,2),description='August payroll',amount=900);db.add_all([june_pay,july_pay,july_end_pay,august_pay]);db.commit()
+    first_july=available_cash_planner('paycheck',date(2026,7,2),None,user,db);second_july=available_cash_planner('paycheck',date(2026,7,20),None,user,db);first_august=available_cash_planner('paycheck',date(2026,8,2),None,user,db);second_august=available_cash_planner('paycheck',date(2026,8,20),None,user,db);monthly_july=available_cash_planner('monthly',date(2026,7,20),None,user,db)
+    assert [(item['date'],item['available_period_start']) for item in first_july['paycheck_sources']]==[('2026-06-29','2026-07-01')]
+    assert [(item['date'],item['available_period_start']) for item in second_july['paycheck_sources']]==[('2026-07-13','2026-07-16')]
+    assert [(item['date'],item['available_period_start']) for item in first_august['paycheck_sources']]==[('2026-07-31','2026-08-01')]
+    assert [(item['date'],item['available_period_start']) for item in second_august['paycheck_sources']]==[('2026-08-02','2026-08-16')]
+    assert monthly_july['paycheck_amount']==1925.43+1916.55
+    assert db.get(Transaction,june_pay.id).date==date(2026,6,29)
+    assert db.get(Transaction,july_pay.id).date==date(2026,7,13)
+
+def test_manual_paycheck_allocation_overrides_default_and_removal_restores_it():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='pay-override@example.com',display_name='Pay override',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush();paycheck=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,13),description='Payroll',amount=1000);db.add(paycheck);db.flush();allocation=PlannerIncomeAllocation(household_id=home.id,source_transaction_id=paycheck.id,period_type='paycheck',effective_period_start=date(2026,7,1),amount=500);db.add(allocation);db.commit()
+    assert available_cash_planner('paycheck',date(2026,7,2),None,user,db)['paycheck_amount']==500
+    db.delete(allocation);db.commit()
+    assert available_cash_planner('paycheck',date(2026,7,2),None,user,db)['paycheck_amount']==0
+    assert available_cash_planner('paycheck',date(2026,7,20),None,user,db)['paycheck_amount']==1000
 
 def test_only_prorated_refund_credits_are_spread_across_paycheck_periods():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()

@@ -395,10 +395,10 @@ def planner_window(period, anchor):
         start=anchor.replace(day=16);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Paycheck view',1
     raise HTTPException(400,'Period must be paycheck or monthly')
 def default_paycheck_availability_start(value: date):
-    """Late-month payroll is available to the next half-month plan."""
-    month_end=(value.replace(day=28)+timedelta(days=4)).replace(day=1)-timedelta(days=1)
-    effective=value if value.day<month_end.day-2 else month_end+timedelta(days=1)
-    return planner_period_start('paycheck',effective)
+    """Map each posted paycheck to the following bi-monthly spending period."""
+    if value.day<=15:
+        return value.replace(day=16)
+    return (value.replace(day=28)+timedelta(days=4)).replace(day=1)
 
 def add_months(value: date, months: int) -> date:
     """Return the inclusive-start date shifted by whole calendar months."""
@@ -436,7 +436,9 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     else: allocation_query=allocation_query.where(PlannerIncomeAllocation.effective_period_start>=start,PlannerIncomeAllocation.effective_period_start<end)
     manual_income_allocations=db.scalars(allocation_query).all(); manual_by_source={}
     for record in manual_income_allocations: manual_by_source[record.source_transaction_id]=manual_by_source.get(record.source_transaction_id,0)+float(record.amount)
-    income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_((Transaction.date>=start-timedelta(days=3))&(Transaction.date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
+    # A paycheck in the first half funds the second half, so evaluate the prior
+    # half-month as well as the current planner window.
+    income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_((Transaction.date>=start-timedelta(days=16))&(Transaction.date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
     income_candidates=db.scalars(income_query).all(); income_by_id={item.id:item for item in income_candidates}
     relevant_tags=designated_tags|loan_reimbursement_tags
     tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
