@@ -1,11 +1,12 @@
 from datetime import date, timedelta
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
+from fastapi import HTTPException
 
 from app.database import Base
-from app.main import available_cash_planner, delete_category, metrics, planner_cash_history, reports, update_transaction_date
+from app.main import available_cash_planner, category_tracker, delete_category, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
-from app.schemas import CategoryDelete, TransactionDateUpdate
+from app.schemas import CategoryDelete, TransactionDateUpdate, TransactionSplitsUpdate
 
 
 def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():
@@ -253,3 +254,19 @@ def test_rolling_cash_virtual_ceiling_sweeps_prioritized_goals_without_mutating_
     assert [(item['name'],item['amount']) for item in current['goal_sweeps']]==[('Emergency',300),('House',200)]
     assert float(db.get(Goal,first.id).current_amount)==0
     assert float(db.get(Account,savings.id).balance)==0
+
+def test_transaction_splits_validate_allocation_and_drive_category_and_savings_totals():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='splits@example.com',display_name='Split owner',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);groceries=Category(household_id=home.id,name='Groceries',kind='expense');household_category=Category(household_id=home.id,name='Household',kind='expense');db.add_all([checking,groceries,household_category]);db.flush()
+    transaction=Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Warehouse store',amount=-150);db.add(transaction);db.commit()
+    body=TransactionSplitsUpdate(splits=[{'amount':-100,'category_id':groceries.id,'ownership':'individual','owner_id':user.id},{'amount':-50,'category_id':household_category.id,'ownership':'joint'}])
+    result=replace_transaction_splits(transaction.id,body,user,db)
+    assert len(result['splits'])==2
+    totals=category_tracker(date.today(),date.today(),None,user,db)['categories'];by_name={row['name']:row for row in totals}
+    assert by_name['Groceries']['debits']==100
+    assert by_name['Household']['debits']==50
+    assert metrics(home.id,db)['monthly_expenses']==150
+    assert available_cash_planner('paycheck',date.today(),None,user,db)['fixed_regular_expenses']==150
+    with __import__('pytest').raises(HTTPException):
+        replace_transaction_splits(transaction.id,TransactionSplitsUpdate(splits=[{'amount':-120,'ownership':'joint'},{'amount':-20,'ownership':'joint'}]),user,db)

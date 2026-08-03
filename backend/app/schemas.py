@@ -18,6 +18,13 @@ class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
 class TransactionDateUpdate(BaseModel): date: date
 class TransactionTagsUpdate(BaseModel): tag_ids: list[UUID]=[]
+class TransactionSplitIn(BaseModel):
+    amount: float
+    category_id: UUID|None=None
+    ownership: str='joint'
+    owner_id: UUID|None=None
+class TransactionSplitsUpdate(BaseModel):
+    splits: list[TransactionSplitIn]=Field(min_length=2,max_length=100)
 class CategoryIn(BaseModel):
     name: str=Field(min_length=1,max_length=100)
     kind: str='expense'

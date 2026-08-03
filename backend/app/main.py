@@ -79,6 +79,30 @@ def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
     return {c.name:value(getattr(o,c.name)) if getattr(o,c.name) is not None else None for c in o.__table__.columns}
+def serialize_transaction_splits(transaction_id, h, db: Session):
+    categories={item.id:item.name for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
+    users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
+    return [dict(serialize(split),category_name=categories.get(split.category_id),owner_name=users.get(split.owner_id,'Joint household')) for split in db.scalars(select(TransactionSplit).where(TransactionSplit.transaction_id==transaction_id).order_by(TransactionSplit.created_at,TransactionSplit.id)).all()]
+def transaction_allocation_rows(transactions, db: Session, view_user_id: UUID|None=None):
+    """Return split allocations, or the parent transaction as its sole allocation.
+
+    Parent flags deliberately stay on every allocation; category and owner are the
+    only split-level fields in this first delivery.
+    """
+    transaction_ids=[item.id for item in transactions]
+    grouped={item.id:[] for item in transactions}
+    if transaction_ids:
+        for split in db.scalars(select(TransactionSplit).where(TransactionSplit.transaction_id.in_(transaction_ids)).order_by(TransactionSplit.created_at,TransactionSplit.id)).all(): grouped.setdefault(split.transaction_id,[]).append(split)
+    rows=[]
+    for item in transactions:
+        splits=grouped.get(item.id,[])
+        if splits:
+            for split in splits:
+                if view_user_id and split.owner_id!=view_user_id: continue
+                rows.append({'transaction':item,'amount':float(split.amount),'category_id':split.category_id,'owner_id':split.owner_id,'is_split':True,'split_id':split.id})
+        else:
+            rows.append({'transaction':item,'amount':float(item.amount),'category_id':item.category_id,'owner_id':None,'is_split':False,'split_id':None})
+    return rows
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
     row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
@@ -213,11 +237,13 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     if not set(financial_roles).issubset(valid_roles): raise HTTPException(400,'Invalid financial role filter')
     if transaction_type not in {None,'credit','debit'}: raise HTTPException(400,'Transaction type must be credit or debit')
     if start_date and end_date and start_date>end_date: raise HTTPException(400,'Start date must be on or before end date')
-    filters=[Transaction.household_id==h,Transaction.account_id.in_(visible_accounts)]
+    visibility=Transaction.account_id.in_(visible_accounts)
+    if view_user_id: visibility=or_(visibility,Transaction.id.in_(select(TransactionSplit.transaction_id).where(TransactionSplit.ownership=='individual',TransactionSplit.owner_id==view_user_id)))
+    filters=[Transaction.household_id==h,visibility]
     if search: filters.append(Transaction.description.ilike(f'%{search.strip()}%'))
     if account_id: filters.append(Transaction.account_id==account_id)
     selected_categories=category_ids+([category_id] if category_id else [])
-    if selected_categories: filters.append(Transaction.category_id.in_(selected_categories))
+    if selected_categories: filters.append(or_(Transaction.category_id.in_(selected_categories),Transaction.id.in_(select(TransactionSplit.transaction_id).where(TransactionSplit.category_id.in_(selected_categories)))))
     if financial_roles: filters.append(Transaction.account_id.in_(select(Account.id).where(Account.household_id==h,Account.account_type.in_(financial_roles))))
     if connection_ids: filters.append(Transaction.connection_id.in_(connection_ids))
     if transaction_type=='credit': filters.append(Transaction.amount>0)
@@ -234,15 +260,18 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     if page_ids:
         for transaction_id,tag_id,tag_name in db.execute(select(TransactionTag.transaction_id,Tag.id,Tag.name).join(Tag,Tag.id==TransactionTag.tag_id).where(TransactionTag.transaction_id.in_(page_ids))).all(): tags_by_transaction[transaction_id].append({'id':str(tag_id),'name':tag_name})
     for x in page_transactions:
-        row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags]);result.append(row)
+        row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags],splits=serialize_transaction_splits(x.id,h,db));result.append(row)
     return {'items':result,'page':page,'page_size':page_size,'total':total,'total_pages':max(1,(total+page_size-1)//page_size),'sort':sort}
 
 def category_tracker_filters(h, start_date, end_date, view_user_id, db):
     validate_view_member(h,view_user_id,db)
     if start_date>end_date: raise HTTPException(400,'Start date must be on or before end date')
     account_ids=select(Account.id).where(Account.household_id==h)
-    if view_user_id: account_ids=account_ids.where(Account.ownership=='individual',Account.owner_id==view_user_id)
-    return [Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start_date,Transaction.date<=end_date,Transaction.is_pending==False]
+    if view_user_id:
+        account_ids=account_ids.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+        visibility=or_(Transaction.account_id.in_(account_ids),Transaction.id.in_(select(TransactionSplit.transaction_id).where(TransactionSplit.ownership=='individual',TransactionSplit.owner_id==view_user_id)))
+    else: visibility=Transaction.account_id.in_(account_ids)
+    return [Transaction.household_id==h,visibility,Transaction.date>=start_date,Transaction.date<=end_date,Transaction.is_pending==False]
 
 @app.get('/api/v1/category-tracker')
 def category_tracker(start_date:date|None=None,end_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -250,20 +279,23 @@ def category_tracker(start_date:date|None=None,end_date:date|None=None,view_user
     ensure_groceries_category(h,db); categories=db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()
     totals={str(category.id):{'id':str(category.id),'parent_id':str(category.parent_id) if category.parent_id else None,'name':category.name,'kind':category.kind,'transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0} for category in categories}
     totals['uncategorized']={'id':None,'name':'Uncategorized','kind':'uncategorized','transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0}
-    for transaction in db.scalars(select(Transaction).where(*category_tracker_filters(h,start,end,view_user_id,db))).all():
-        row=totals.get(str(transaction.category_id),totals['uncategorized']); amount=float(transaction.amount); row['transaction_count']+=1; row['credits']+=max(amount,0); row['debits']+=abs(min(amount,0)); row['net_amount']+=amount; row['activity_total']+=abs(amount)
+    transactions=db.scalars(select(Transaction).where(*category_tracker_filters(h,start,end,view_user_id,db))).all()
+    for allocation in transaction_allocation_rows(transactions,db,view_user_id):
+        row=totals.get(str(allocation['category_id']),totals['uncategorized']); amount=allocation['amount']; row['transaction_count']+=1; row['credits']+=max(amount,0); row['debits']+=abs(min(amount,0)); row['net_amount']+=amount; row['activity_total']+=abs(amount)
     return {'start_date':str(start),'end_date':str(end),'categories':list(totals.values())}
 
 @app.get('/api/v1/category-tracker/transactions')
 def category_tracker_transactions(start_date:date,end_date:date,category_id:UUID|None=None,uncategorized:bool=False,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); filters=category_tracker_filters(h,start_date,end_date,view_user_id,db)
-    if uncategorized: filters.append(Transaction.category_id.is_(None))
-    elif category_id:
+    if not uncategorized and not category_id: raise HTTPException(400,'A category is required')
+    if category_id:
         if not db.scalar(select(Category.id).where(Category.id==category_id,Category.household_id==h)): raise HTTPException(404,'Category not found')
-        filters.append(Transaction.category_id==category_id)
-    else: raise HTTPException(400,'A category is required')
     items=db.scalars(select(Transaction).where(*filters).order_by(Transaction.date.desc(),Transaction.id).limit(1000)).all(); accounts={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}
-    return {'items':[dict(serialize(item),account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account') for item in items]}
+    result=[]
+    for allocation in transaction_allocation_rows(items,db,view_user_id):
+        if (uncategorized and allocation['category_id'] is not None) or (category_id and allocation['category_id']!=category_id): continue
+        item=allocation['transaction']; result.append(dict(serialize(item),id=str(allocation['split_id'] or item.id),parent_transaction_id=str(item.id),amount=allocation['amount'],category_id=str(allocation['category_id']) if allocation['category_id'] else None,is_split=allocation['is_split'],account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account'))
+    return {'items':result}
 @app.post('/api/v1/transactions')
 def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); a=db.get(Account,body.account_id)
@@ -281,6 +313,36 @@ def update_internal_transfer(transaction_id:UUID,body:TransactionTransferUpdate,
     t=db.get(Transaction,transaction_id)
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     t.is_internal_transfer=body.is_internal_transfer;db.commit();return serialize(t)
+@app.get('/api/v1/transactions/{transaction_id}/splits')
+def get_transaction_splits(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    return {'transaction_id':str(transaction.id),'amount':float(transaction.amount),'splits':serialize_transaction_splits(transaction.id,h,db)}
+@app.put('/api/v1/transactions/{transaction_id}/splits')
+def replace_transaction_splits(transaction_id:UUID,body:TransactionSplitsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    total=round(sum(item.amount for item in body.splits),2); parent_amount=round(float(transaction.amount),2)
+    if total!=parent_amount: raise HTTPException(400,f'Split amounts must total {parent_amount:.2f}')
+    if any((item.amount>0)!=(parent_amount>0) or item.amount==0 for item in body.splits): raise HTTPException(400,'Every split must have the same debit or credit direction as the transaction')
+    category_ids={item.category_id for item in body.splits if item.category_id}
+    valid_categories=set(db.scalars(select(Category.id).where(Category.household_id==h,Category.id.in_(category_ids))).all()) if category_ids else set()
+    if valid_categories!=category_ids: raise HTTPException(400,'Invalid split category')
+    owner_ids={item.owner_id for item in body.splits if item.owner_id}
+    valid_owners=set(db.scalars(select(HouseholdMember.user_id).where(HouseholdMember.household_id==h,HouseholdMember.user_id.in_(owner_ids))).all()) if owner_ids else set()
+    if valid_owners!=owner_ids: raise HTTPException(400,'Invalid split owner')
+    for item in body.splits:
+        if item.ownership not in {'joint','individual'}: raise HTTPException(400,'Split ownership must be joint or individual')
+        if item.ownership=='individual' and not item.owner_id: raise HTTPException(400,'Select an owner for an individual split')
+        if item.ownership=='joint' and item.owner_id: raise HTTPException(400,'Joint splits cannot have an individual owner')
+    db.execute(delete(TransactionSplit).where(TransactionSplit.transaction_id==transaction.id))
+    db.add_all([TransactionSplit(transaction_id=transaction.id,amount=item.amount,category_id=item.category_id,ownership=item.ownership,owner_id=item.owner_id) for item in body.splits]);db.commit()
+    return {'transaction_id':str(transaction.id),'amount':parent_amount,'splits':serialize_transaction_splits(transaction.id,h,db)}
+@app.delete('/api/v1/transactions/{transaction_id}/splits',status_code=204)
+def clear_transaction_splits(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
+    db.execute(delete(TransactionSplit).where(TransactionSplit.transaction_id==transaction.id));db.commit()
 @app.patch('/api/v1/transactions/{transaction_id}/category')
 def update_transaction_category(transaction_id:UUID,body:TransactionCategoryUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); t=db.get(Transaction,transaction_id)
@@ -355,12 +417,13 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
     tagged={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in designated_tags}
     loan_reimbursements={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in loan_reimbursement_tags}
-    def is_debt_payment(item,account):
-        category_name=(categories.get(item.category_id).name if item.category_id in categories else '').lower()
+    def is_debt_payment(item,account,category_id=None):
+        category_id=item.category_id if category_id is None else category_id
+        category_name=(categories.get(category_id).name if category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
     paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]
-    for item in transactions_in_period:
-        account=accounts_by_id[item.account_id]; amount=float(item.amount)
+    for allocation in transaction_allocation_rows(transactions_in_period,db,view_user_id):
+        item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         # An explicit refund classification takes precedence over the transfer
         # heuristic. A reimbursement may be received in any account role.
         if amount>0 and item.is_refund:
@@ -370,7 +433,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if item.is_internal_transfer: continue
         # Loan reimbursements always override a savings designation. They may still
         # be represented elsewhere by their account's normal cash-flow treatment.
-        automated_target=(item.account_id in designated_accounts or category_matches_rule(item.category_id,designated_categories,category_parent_ids) or item.id in tagged) and item.id not in loan_reimbursements
+        automated_target=(item.account_id in designated_accounts or category_matches_rule(category_id,designated_categories,category_parent_ids) or item.id in tagged) and item.id not in loan_reimbursements
         if amount>0:
             if automated_target:
                 automated+=amount
@@ -379,7 +442,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 paycheck+=amount
                 paycheck_sources.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount})
             continue
-        if amount>=0 or is_debt_payment(item,account) or item.is_prorated: continue
+        if amount>=0 or is_debt_payment(item,account,category_id) or item.is_prorated: continue
         value=abs(amount)
         if item.is_expected:
             expected+=value
@@ -586,6 +649,7 @@ def delete_category(category_id:UUID,body:CategoryDelete,user=Depends(current_us
     if replacement.id in category_descendants(category.id,parent_ids): raise HTTPException(400,'Select a replacement outside this category branch')
     # Keep all financial records intact: only their category pointer is reassigned.
     for transaction in db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.category_id==category.id)).all(): transaction.category_id=replacement.id
+    for split in db.scalars(select(TransactionSplit).where(TransactionSplit.category_id==category.id)).all(): split.category_id=replacement.id
     for rule in db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.category_id==category.id)).all(): rule.category_id=replacement.id
     for child in db.scalars(select(Category).where(Category.household_id==h,Category.parent_id==category.id)).all(): child.parent_id=replacement.id
     db.delete(category);db.commit();return {'deleted_category_id':str(category_id),'replacement_category_id':str(replacement.id)}
@@ -781,10 +845,11 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
             sources[account.id]={'account_id':str(account.id),'account_name':account.name,'source_name':connection_names.get(account.connection_id,'Manual'),'account_type':account.account_type,'income':0.0,'expenses':0.0,'automated_savings':0.0,'spending_cash_flow':0.0}
         return sources[account.id]
     automated=spending_net=expenses=essential=transaction_income=0.0
-    for item in transactions:
+    for allocation in transaction_allocation_rows(transactions,db):
+        item=allocation['transaction']
         if item.is_internal_transfer: continue
-        account=accounts_by_id[item.account_id]; amount=float(item.amount)
-        automated_target=(item.account_id in designated_accounts or category_matches_rule(item.category_id,designated_categories,category_parent_ids) or item.id in tagged_transactions) and item.id not in loan_reimbursements
+        account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
+        automated_target=(item.account_id in designated_accounts or category_matches_rule(category_id,designated_categories,category_parent_ids) or item.id in tagged_transactions) and item.id not in loan_reimbursements
         if amount>0 and automated_target:
             automated+=amount; transaction_income+=amount
             source=source_row(account); source['income']+=amount; source['automated_savings']+=amount
