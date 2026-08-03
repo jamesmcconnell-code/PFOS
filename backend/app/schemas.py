@@ -22,6 +22,7 @@ class CategoryIn(BaseModel):
     name: str=Field(min_length=1,max_length=100)
     kind: str='expense'
     is_essential_default: bool=False
+    parent_id: UUID|None=None
 class CategoryRename(BaseModel): name: str=Field(min_length=1,max_length=100)
 class CategoryDelete(BaseModel): replacement_category_id: UUID
 class TransactionPlannerFlagsUpdate(BaseModel):

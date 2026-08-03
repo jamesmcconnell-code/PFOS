@@ -61,6 +61,20 @@ def ensure_loan_reimbursement_tag(household_id, db: Session):
             db.rollback()
             tag=db.scalar(select(Tag).where(Tag.household_id==household_id,func.lower(Tag.name)=='loan reimbursement'))
     return tag
+def category_matches_rule(category_id, rule_category_ids, parent_ids):
+    """A child inherits every category-level rule from its ancestor chain."""
+    current=category_id; seen=set()
+    while current and current not in seen:
+        if current in rule_category_ids: return True
+        seen.add(current); current=parent_ids.get(current)
+    return False
+def category_descendants(category_id, parent_ids):
+    descendants=set(); pending=[category_id]
+    while pending:
+        parent=pending.pop()
+        children=[child for child,child_parent in parent_ids.items() if child_parent==parent and child not in descendants]
+        descendants.update(children); pending.extend(children)
+    return descendants
 def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
@@ -234,7 +248,7 @@ def category_tracker_filters(h, start_date, end_date, view_user_id, db):
 def category_tracker(start_date:date|None=None,end_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); today=date.today(); end=end_date or today; start=start_date or end.replace(day=1)
     ensure_groceries_category(h,db); categories=db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()
-    totals={str(category.id):{'id':str(category.id),'name':category.name,'kind':category.kind,'transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0} for category in categories}
+    totals={str(category.id):{'id':str(category.id),'parent_id':str(category.parent_id) if category.parent_id else None,'name':category.name,'kind':category.kind,'transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0} for category in categories}
     totals['uncategorized']={'id':None,'name':'Uncategorized','kind':'uncategorized','transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0}
     for transaction in db.scalars(select(Transaction).where(*category_tracker_filters(h,start,end,view_user_id,db))).all():
         row=totals.get(str(transaction.category_id),totals['uncategorized']); amount=float(transaction.amount); row['transaction_count']+=1; row['credits']+=max(amount,0); row['debits']+=abs(min(amount,0)); row['net_amount']+=amount; row['activity_total']+=abs(amount)
@@ -319,7 +333,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     account_q=select(Account).where(Account.household_id==h,Account.is_active==True)
     if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     accounts=db.scalars(account_q).all(); account_ids=[account.id for account in accounts]; accounts_by_id={account.id:account for account in accounts}
-    categories={category.id:category for category in db.scalars(select(Category).where(Category.household_id==h)).all()}
+    categories={category.id:category for category in db.scalars(select(Category).where(Category.household_id==h)).all()}; category_parent_ids={category.id:category.parent_id for category in categories.values()}
     transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start,Transaction.date<end,Transaction.is_pending==False)).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
@@ -343,7 +357,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if item.is_internal_transfer: continue
         # Loan reimbursements always override a savings designation. They may still
         # be represented elsewhere by their account's normal cash-flow treatment.
-        automated_target=(item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged) and item.id not in loan_reimbursements
+        automated_target=(item.account_id in designated_accounts or category_matches_rule(item.category_id,designated_categories,category_parent_ids) or item.id in tagged) and item.id not in loan_reimbursements
         if amount>0:
             if automated_target:
                 automated+=amount
@@ -387,10 +401,13 @@ def categories(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); ensure_groceries_category(h,db); return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()]
 @app.post('/api/v1/categories')
 def add_category(body:CategoryIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); name=body.name.strip()
+    h=household(user,db); name=body.name.strip(); parent=db.get(Category,body.parent_id) if body.parent_id else None
     if body.kind not in {'income','expense','transfer','other'}: raise HTTPException(400,'Invalid category kind')
-    if db.scalar(select(Category.id).where(Category.household_id==h,func.lower(Category.name)==name.lower())): raise HTTPException(409,'A category with this name already exists')
-    c=Category(household_id=h,name=name,kind=body.kind,is_essential_default=body.is_essential_default);db.add(c);db.commit();return serialize(c)
+    if body.parent_id and (not parent or parent.household_id!=h): raise HTTPException(400,'Invalid parent category')
+    duplicate_filters=[Category.household_id==h,func.lower(Category.name)==name.lower(),Category.parent_id==parent.id] if parent else [Category.household_id==h,func.lower(Category.name)==name.lower(),Category.parent_id.is_(None)]
+    if db.scalar(select(Category.id).where(*duplicate_filters)): raise HTTPException(409,'A category with this name already exists at this level')
+    # Children inherit parent metadata at creation and parent-level savings rules dynamically.
+    c=Category(household_id=h,parent_id=parent.id if parent else None,name=name,kind=parent.kind if parent else body.kind,is_essential_default=parent.is_essential_default if parent else body.is_essential_default);db.add(c);db.commit();return serialize(c)
 @app.patch('/api/v1/categories/{category_id}')
 def rename_category(category_id:UUID,body:CategoryRename,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); category=db.get(Category,category_id); name=body.name.strip()
@@ -402,9 +419,12 @@ def delete_category(category_id:UUID,body:CategoryDelete,user=Depends(current_us
     h=household(user,db); category=db.get(Category,category_id); replacement=db.get(Category,body.replacement_category_id)
     if not category or category.household_id!=h: raise HTTPException(404,'Category not found')
     if not replacement or replacement.household_id!=h or replacement.id==category.id: raise HTTPException(400,'Select a different replacement category')
+    parent_ids={item.id:item.parent_id for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
+    if replacement.id in category_descendants(category.id,parent_ids): raise HTTPException(400,'Select a replacement outside this category branch')
     # Keep all financial records intact: only their category pointer is reassigned.
     for transaction in db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.category_id==category.id)).all(): transaction.category_id=replacement.id
     for rule in db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.category_id==category.id)).all(): rule.category_id=replacement.id
+    for child in db.scalars(select(Category).where(Category.household_id==h,Category.parent_id==category.id)).all(): child.parent_id=replacement.id
     db.delete(category);db.commit();return {'deleted_category_id':str(category_id),'replacement_category_id':str(replacement.id)}
 @app.get('/api/v1/tags')
 def tags(user=Depends(current_user),db:Session=Depends(get_db)):
@@ -578,6 +598,7 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
     accounts_by_id={account.id:account for account in accounts}
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}
     designated_categories={rule.category_id for rule in rules if rule.category_id}
+    category_parent_ids={category.id:category.parent_id for category in db.scalars(select(Category).where(Category.household_id==accounts[0].household_id)).all()} if accounts else {}
     designated_tags={rule.tag_id for rule in rules if rule.tag_id}
     loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==accounts[0].household_id,func.lower(Tag.name)=='loan reimbursement')).all()) if accounts else set()
     relevant_tags=designated_tags|loan_reimbursement_tags
@@ -594,7 +615,7 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
     for item in transactions:
         if item.is_internal_transfer: continue
         account=accounts_by_id[item.account_id]; amount=float(item.amount)
-        automated_target=(item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged_transactions) and item.id not in loan_reimbursements
+        automated_target=(item.account_id in designated_accounts or category_matches_rule(item.category_id,designated_categories,category_parent_ids) or item.id in tagged_transactions) and item.id not in loan_reimbursements
         if amount>0 and automated_target:
             automated+=amount; transaction_income+=amount
             source=source_row(account); source['income']+=amount; source['automated_savings']+=amount

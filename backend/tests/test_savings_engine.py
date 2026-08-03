@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.main import available_cash_planner, delete_category, metrics, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, Tag, Transaction, TransactionTag, User
+from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
@@ -130,6 +130,17 @@ def test_one_month_proration_uses_half_of_a_monthly_charge_per_paycheck():
     result=available_cash_planner('paycheck',date.today(),None,user,db)
     assert result['prorated_expenses']==60
     assert result['expense_input_sources'][0]['period_amount']==60
+
+def test_subcategory_inherits_its_parents_savings_rule_at_any_depth():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='category-tree@example.com',display_name='Tree',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    account=Account(household_id=home.id,name='Checking',type='checking',account_type='income',balance=0);parent=Category(household_id=home.id,name='Fixed expense',kind='income');child=Category(household_id=home.id,parent_id=parent.id,name='Phone Bill',kind='income');db.add_all([account,parent]);db.flush();child.parent_id=parent.id;db.add(child);db.flush()
+    db.add(SavingsRule(household_id=home.id,category_id=parent.id))
+    transaction=Transaction(household_id=home.id,account_id=account.id,category_id=child.id,date=date.today(),description='Phone reimbursement',amount=125);db.add(transaction);db.commit()
+    assert available_cash_planner('paycheck',date.today(),None,user,db)['automated_savings_amount']==125
+    assert metrics(home.id,db)['automated_savings']==125
 
 def test_reports_scopes_data_and_creates_balance_snapshots():
     engine=create_engine('sqlite://')
