@@ -324,6 +324,18 @@ def add_months(value: date, months: int) -> date:
     """Return the inclusive-start date shifted by whole calendar months."""
     month_index=value.month-1+months; year=value.year+month_index//12; month=month_index%12+1
     return date(year,month,min(value.day,calendar.monthrange(year,month)[1]))
+def normalized_description(value: str|None): return ' '.join((value or '').lower().split())
+def planner_expense_rule_matches(rule, item):
+    """Prefer source identity; use account/category plus a bounded amount fallback."""
+    if float(item.amount)>=0 or item.is_internal_transfer or item.account_id!=rule.account_id: return False
+    if rule.category_id and item.category_id!=rule.category_id: return False
+    if rule.source_description and normalized_description(item.description)==normalized_description(rule.source_description): return True
+    expected=float(rule.monthly_projected_amount)*max(1,int(rule.proration_months or 1))
+    return not rule.source_description and abs(abs(float(item.amount))-expected)<=max(20.0,expected*.25)
+def serialize_planner_expense_rule(rule, db: Session):
+    row=serialize(rule); account=db.get(Account,rule.account_id); category=db.get(Category,rule.category_id) if rule.category_id else None
+    row.update(account_name=account.name if account else 'Unknown account',category_name=category.name if category else None)
+    return row
 
 @app.get('/api/v1/available-cash-planner')
 def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -336,6 +348,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     categories={category.id:category for category in db.scalars(select(Category).where(Category.household_id==h)).all()}; category_parent_ids={category.id:category.parent_id for category in categories.values()}
     transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start,Transaction.date<end,Transaction.is_pending==False)).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
+    expense_rules=db.scalars(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h,RecurringPlannerExpenseRule.is_active==True,RecurringPlannerExpenseRule.account_id.in_(account_ids))).all() if account_ids else []
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
     loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement')).all())
     relevant_tags=designated_tags|loan_reimbursement_tags
@@ -389,12 +402,70 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(24 if period=='paycheck' else 12); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
     for item in active_prorated:
         account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
+    anticipated_expenses=0.0; anticipated_expense_sources=[]; reconciled_anticipated_expenses=[]
+    # A rule is projected only when no source or matching actual charge is already
+    # providing this period's allocation. This keeps imported actuals authoritative.
+    actual_candidates=[item for item in transactions_in_period if item.date<=anchor and float(item.amount)<0 and not item.is_internal_transfer]
+    for rule in expense_rules:
+        actual=next((item for item in active_prorated if planner_expense_rule_matches(rule,item)),None)
+        actual=actual or next((item for item in actual_candidates if planner_expense_rule_matches(rule,item)),None)
+        if actual:
+            actual_monthly=abs(float(actual.amount))/max(1,int(actual.proration_months or 1))
+            reconciled_anticipated_expenses.append({'rule_id':str(rule.id),'display_name':rule.display_name,'actual_transaction_id':str(actual.id),'actual_amount':actual_monthly,'projected_amount':float(rule.monthly_projected_amount),'variance':actual_monthly-float(rule.monthly_projected_amount),'status':'actual'})
+            continue
+        period_amount=float(rule.monthly_projected_amount)/(2 if period=='paycheck' else 1)
+        anticipated_expenses+=period_amount
+        anticipated_expense_sources.append({'id':str(rule.id),'rule_id':str(rule.id),'display_name':rule.display_name,'account_name':accounts_by_id[rule.account_id].name,'expected_day_of_month':rule.expected_day_of_month,'monthly_amount':float(rule.monthly_projected_amount),'period_amount':period_amount,'proration_months':rule.proration_months,'status':'anticipated'})
     # Refunds are expense credits, rather than income. This keeps NMP limited to
     # paycheck and automated-savings inflows while transparently reducing costs.
     raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
     regular_expected_prorated=fixed_regular+expected+prorated_expenses; debt_total=sum(item['amount'] for item in debt_items)
-    gross_total_expenses=regular_expected_prorated+debt_total; total_expenses=gross_total_expenses-refunds_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    gross_total_expenses=regular_expected_prorated+debt_total; combined_expenses=gross_total_expenses+anticipated_expenses; total_expenses=combined_expenses-refunds_total
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'actual_expense_total':gross_total_expenses,'anticipated_expense_total':anticipated_expenses,'combined_period_expense_total':combined_expenses,'anticipated_expense_sources':anticipated_expense_sources,'reconciled_anticipated_expenses':reconciled_anticipated_expenses,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+
+def validate_planner_expense_rule(h, values, db: Session):
+    account=db.get(Account,values['account_id'])
+    if not account or account.household_id!=h: raise HTTPException(400,'Invalid rule account')
+    category_id=values.get('category_id')
+    if category_id and not db.scalar(select(Category.id).where(Category.id==category_id,Category.household_id==h)): raise HTTPException(400,'Invalid rule category')
+    owner_id=values.get('owner_id')
+    if owner_id and not db.scalar(select(HouseholdMember.id).where(HouseholdMember.household_id==h,HouseholdMember.user_id==owner_id)): raise HTTPException(400,'Invalid rule owner')
+    values['owner_id']=owner_id if owner_id is not None else account.owner_id
+    return values
+
+@app.get('/api/v1/planner-expense-rules')
+def planner_expense_rules(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db)
+    return [serialize_planner_expense_rule(rule,db) for rule in db.scalars(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h).order_by(RecurringPlannerExpenseRule.display_name)).all()]
+@app.post('/api/v1/planner-expense-rules')
+def add_planner_expense_rule(body:PlannerExpenseRuleIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); values=validate_planner_expense_rule(h,body.model_dump(),db); rule=RecurringPlannerExpenseRule(household_id=h,cadence='monthly',**values);db.add(rule);db.commit();return serialize_planner_expense_rule(rule,db)
+@app.post('/api/v1/planner-expense-rules/from-transaction/{transaction_id}')
+def create_planner_expense_rule_from_transaction(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    if float(transaction.amount)>=0 or not transaction.is_expected or not transaction.is_prorated: raise HTTPException(400,'Only negative Expected + Prorated transactions can create anticipated expense rules')
+    account=db.get(Account,transaction.account_id); duration=max(1,int(transaction.proration_months or 1)); monthly_amount=abs(float(transaction.amount))/duration
+    rule=db.scalar(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h,RecurringPlannerExpenseRule.source_transaction_id==transaction.id))
+    values={'account_id':transaction.account_id,'category_id':transaction.category_id,'owner_id':account.owner_id,'display_name':transaction.description[:120],'source_description':transaction.description,'monthly_projected_amount':monthly_amount,'expected_day_of_month':transaction.date.day,'cadence':'monthly','is_active':True,'proration_months':duration}
+    if rule:
+        for field,value in values.items(): setattr(rule,field,value)
+    else:
+        rule=RecurringPlannerExpenseRule(household_id=h,source_transaction_id=transaction.id,**values);db.add(rule)
+    db.commit();return serialize_planner_expense_rule(rule,db)
+@app.patch('/api/v1/planner-expense-rules/{rule_id}')
+def update_planner_expense_rule(rule_id:UUID,body:PlannerExpenseRuleUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); rule=db.get(RecurringPlannerExpenseRule,rule_id)
+    if not rule or rule.household_id!=h: raise HTTPException(404,'Anticipated expense rule not found')
+    changes=body.model_dump(exclude_unset=True); validation={**{'account_id':rule.account_id,'category_id':rule.category_id,'owner_id':rule.owner_id},**changes};validate_planner_expense_rule(h,validation,db)
+    for field,value in changes.items(): setattr(rule,field,value)
+    if 'owner_id' not in changes: rule.owner_id=validation['owner_id']
+    db.commit();return serialize_planner_expense_rule(rule,db)
+@app.delete('/api/v1/planner-expense-rules/{rule_id}',status_code=204)
+def delete_planner_expense_rule(rule_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    rule=db.get(RecurringPlannerExpenseRule,rule_id)
+    if not rule or rule.household_id!=household(user,db): raise HTTPException(404,'Anticipated expense rule not found')
+    db.delete(rule);db.commit()
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):

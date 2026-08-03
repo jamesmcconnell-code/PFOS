@@ -33,6 +33,23 @@ class TransactionPlannerFlagsUpdate(BaseModel):
     is_prorated: bool|None=None
     proration_months: int|None=Field(default=None,ge=1,le=120)
 class SavingsRuleIn(BaseModel): target_type: str; target_id: UUID
+class PlannerExpenseRuleIn(BaseModel):
+    account_id: UUID
+    display_name: str=Field(min_length=1,max_length=120)
+    monthly_projected_amount: float=Field(gt=0)
+    expected_day_of_month: int=Field(ge=1,le=31)
+    category_id: UUID|None=None
+    owner_id: UUID|None=None
+    proration_months: int=Field(default=1,ge=1,le=120)
+    is_active: bool=True
+class PlannerExpenseRuleUpdate(BaseModel):
+    display_name: str|None=Field(default=None,min_length=1,max_length=120)
+    monthly_projected_amount: float|None=Field(default=None,gt=0)
+    expected_day_of_month: int|None=Field(default=None,ge=1,le=31)
+    category_id: UUID|None=None
+    owner_id: UUID|None=None
+    proration_months: int|None=Field(default=None,ge=1,le=120)
+    is_active: bool|None=None
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date
 class GoalUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)

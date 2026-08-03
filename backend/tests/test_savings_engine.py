@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.main import available_cash_planner, delete_category, metrics, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
@@ -141,6 +141,36 @@ def test_subcategory_inherits_its_parents_savings_rule_at_any_depth():
     transaction=Transaction(household_id=home.id,account_id=account.id,category_id=child.id,date=date.today(),description='Phone reimbursement',amount=125);db.add(transaction);db.commit()
     assert available_cash_planner('paycheck',date.today(),None,user,db)['automated_savings_amount']==125
     assert metrics(home.id,db)['automated_savings']==125
+
+def test_anticipated_monthly_expense_projects_before_posting_and_splits_paychecks():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='anticipated@example.com',display_name='Anticipated',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(account);db.flush()
+    source=Transaction(household_id=home.id,account_id=account.id,date=date(2026,7,1),description='Phone Bill',amount=-120,is_expected=True,is_prorated=True,proration_months=1);db.add(source);db.flush()
+    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    paycheck=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
+    monthly=available_cash_planner('monthly',date(2026,8,2),None,user,db)
+    assert paycheck['actual_expense_total']==0
+    assert paycheck['anticipated_expense_total']==60
+    assert paycheck['total_period_expenses']==60
+    assert paycheck['anticipated_expense_sources'][0]['status']=='anticipated'
+    assert monthly['anticipated_expense_total']==120
+
+def test_actual_recurring_expense_reconciles_and_replaces_projection():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='reconciled@example.com',display_name='Reconciled',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(account);db.flush()
+    source=Transaction(household_id=home.id,account_id=account.id,date=date(2026,7,1),description='Phone Bill',amount=-120,is_expected=True,is_prorated=True,proration_months=1);actual=Transaction(household_id=home.id,account_id=account.id,date=date(2026,8,2),description='Phone Bill',amount=-140,is_expected=True,is_prorated=True,proration_months=1);db.add_all([source,actual]);db.flush()
+    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    result=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
+    assert result['anticipated_expense_total']==0
+    assert result['actual_expense_total']==70
+    assert result['total_period_expenses']==70
+    assert result['reconciled_anticipated_expenses'][0]['variance']==20
 
 def test_reports_scopes_data_and_creates_balance_snapshots():
     engine=create_engine('sqlite://')
