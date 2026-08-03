@@ -447,6 +447,18 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         category_name=(categories.get(category_id).name if category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
     paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]
+    # Only refunds explicitly marked Prorated are spread across the calendar
+    # month. Ordinary refund credits keep their actual posting-period behavior.
+    month_start=anchor.replace(day=1); month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
+    month_refunds=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False,Transaction.is_prorated==True)).all() if account_ids else []
+    prorated_refund_ids=set()
+    for allocation in transaction_allocation_rows(month_refunds,db,view_user_id):
+        item=allocation['transaction']; amount=allocation['amount']
+        if amount<=0 or not allocation['is_refund']:
+            continue
+        allocation_id=str(allocation['split_id'] or item.id); prorated_refund_ids.add(allocation_id); period_amount=amount/(2 if period=='paycheck' else 1)
+        account=accounts_by_id[item.account_id]; refunds.append({'id':allocation_id,'parent_transaction_id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':period_amount,'original_amount':amount,'refund_included':allocation['refund_included'],'is_split':allocation['is_split'],'is_prorated':True})
+        if allocation['refund_included']: refunds_total+=period_amount
     for source in income_candidates:
         account=accounts_by_id[source.account_id]
         if account.account_type!='spending' or source.is_internal_transfer or source.is_refund: continue
@@ -460,8 +472,10 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         # An explicit refund classification takes precedence over the transfer
         # heuristic. A reimbursement may be received in any account role.
         if amount>0 and allocation['is_refund']:
-            refunds.append({'id':str(allocation['split_id'] or item.id),'parent_transaction_id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':allocation['refund_included'],'is_split':allocation['is_split']})
-            if allocation['refund_included']: refunds_total+=amount
+            allocation_id=str(allocation['split_id'] or item.id)
+            if allocation_id not in prorated_refund_ids:
+                refunds.append({'id':allocation_id,'parent_transaction_id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':allocation['refund_included'],'is_split':allocation['is_split'],'is_prorated':False})
+                if allocation['refund_included']: refunds_total+=amount
             continue
         if item.is_internal_transfer: continue
         # Loan reimbursements always override a savings designation. They may still

@@ -294,3 +294,13 @@ def test_late_month_paycheck_is_available_in_next_paycheck_period_without_changi
     assert planner['paycheck_sources'][0]['date']=='2026-07-31'
     assert planner['paycheck_sources'][0]['available_period_start']=='2026-08-01'
     assert db.get(Transaction,paycheck.id).date==date(2026,7,31)
+
+def test_only_prorated_refund_credits_are_spread_across_paycheck_periods():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='prorated-refund@example.com',display_name='Prorated refund',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    db.add_all([Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,16),description='Prorated refund',amount=100,is_refund=True,is_prorated=True),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,16),description='Ordinary refund',amount=60,is_refund=True)]);db.commit()
+    first=available_cash_planner('paycheck',date(2026,8,2),None,user,db);second=available_cash_planner('paycheck',date(2026,8,20),None,user,db);monthly=available_cash_planner('monthly',date(2026,8,20),None,user,db)
+    assert first['refund_expense_offset']==50
+    assert second['refund_expense_offset']==110
+    assert monthly['refund_expense_offset']==160
