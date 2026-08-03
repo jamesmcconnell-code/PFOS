@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.main import available_cash_planner, delete_category, metrics, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, Transaction, User
+from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
@@ -105,6 +105,31 @@ def test_monthly_planner_returns_every_paycheck_source_and_monthly_nmp():
     assert len(result['paycheck_sources'])==2
     assert result['automated_savings_amount']==600
     assert result['net_monthly_pay']==2600
+
+def test_loan_reimbursement_tag_excludes_a_designated_credit_from_automated_savings():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='loan-tag@example.com',display_name='Loan tag',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    savings=Account(household_id=home.id,name='Savings',type='savings',account_type='income',is_savings_direct_deposit=True,balance=0);db.add(savings);db.flush()
+    loan_tag=Tag(household_id=home.id,name='Loan reimbursement');db.add(loan_tag);db.flush()
+    transaction=Transaction(household_id=home.id,account_id=savings.id,date=date.today(),description='Loan repayment',amount=500);db.add(transaction);db.flush();db.add(TransactionTag(transaction_id=transaction.id,tag_id=loan_tag.id));db.commit()
+    planner=available_cash_planner('paycheck',date.today(),None,user,db)
+    monthly=metrics(home.id,db)
+    assert planner['automated_savings_amount']==0
+    assert planner['automated_savings_sources']==[]
+    assert monthly['automated_savings']==0
+
+def test_one_month_proration_uses_half_of_a_monthly_charge_per_paycheck():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='half-proration@example.com',display_name='Half',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    db.add(Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Monthly membership',amount=-120,is_prorated=True,proration_months=1));db.commit()
+    result=available_cash_planner('paycheck',date.today(),None,user,db)
+    assert result['prorated_expenses']==60
+    assert result['expense_input_sources'][0]['period_amount']==60
 
 def test_reports_scopes_data_and_creates_balance_snapshots():
     engine=create_engine('sqlite://')

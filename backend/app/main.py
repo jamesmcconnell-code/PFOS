@@ -50,6 +50,17 @@ def ensure_groceries_category(household_id, db: Session):
             db.rollback()
             category=db.scalar(select(Category).where(Category.household_id==household_id,func.lower(Category.name)=='groceries'))
     return category
+def ensure_loan_reimbursement_tag(household_id, db: Session):
+    """Provide the household-wide tag used to exclude loan reimbursements from savings."""
+    tag=db.scalar(select(Tag).where(Tag.household_id==household_id,func.lower(Tag.name)=='loan reimbursement'))
+    if not tag:
+        try:
+            tag=Tag(household_id=household_id,name='Loan reimbursement')
+            db.add(tag); db.commit(); db.refresh(tag)
+        except IntegrityError:
+            db.rollback()
+            tag=db.scalar(select(Tag).where(Tag.household_id==household_id,func.lower(Tag.name)=='loan reimbursement'))
+    return tag
 def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
@@ -178,6 +189,7 @@ def delete_account(account_id:UUID,user=Depends(current_user),db:Session=Depends
 def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID|None=None,category_ids:list[UUID]=Query(default=[]),financial_roles:list[str]=Query(default=[]),connection_ids:list[UUID]=Query(default=[]),transaction_type:str|None=None,start_date:date|None=None,end_date:date|None=None,sort:str='date_desc',page:int=1,page_size:int=25,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db)
     ensure_groceries_category(h,db)
+    ensure_loan_reimbursement_tag(h,db)
     visible_accounts=select(Account.id).where(Account.household_id==h)
     validate_view_member(h,view_user_id,db)
     if view_user_id: visible_accounts=visible_accounts.where(Account.ownership=='individual',Account.owner_id==view_user_id)
@@ -311,7 +323,11 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start,Transaction.date<end,Transaction.is_pending==False)).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
-    tagged={transaction_id for transaction_id,tag_id in db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(designated_tags))).all()} if transactions_in_period and designated_tags else set()
+    loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement')).all())
+    relevant_tags=designated_tags|loan_reimbursement_tags
+    tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
+    tagged={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in designated_tags}
+    loan_reimbursements={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in loan_reimbursement_tags}
     def is_debt_payment(item,account):
         category_name=(categories.get(item.category_id).name if item.category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
@@ -325,7 +341,9 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
             if item.refund_included: refunds_total+=amount
             continue
         if item.is_internal_transfer: continue
-        automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged
+        # Loan reimbursements always override a savings designation. They may still
+        # be represented elsewhere by their account's normal cash-flow treatment.
+        automated_target=(item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged) and item.id not in loan_reimbursements
         if amount>0:
             if automated_target:
                 automated+=amount
@@ -389,7 +407,8 @@ def delete_category(category_id:UUID,body:CategoryDelete,user=Depends(current_us
     for rule in db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.category_id==category.id)).all(): rule.category_id=replacement.id
     db.delete(category);db.commit();return {'deleted_category_id':str(category_id),'replacement_category_id':str(replacement.id)}
 @app.get('/api/v1/tags')
-def tags(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(Tag).where(Tag.household_id==household(user,db))).all()]
+def tags(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); ensure_loan_reimbursement_tag(h,db); return [serialize(x) for x in db.scalars(select(Tag).where(Tag.household_id==h).order_by(Tag.name)).all()]
 @app.post('/api/v1/tags')
 def add_tag(name:str,user=Depends(current_user),db:Session=Depends(get_db)):
     x=Tag(household_id=household(user,db),name=name);db.add(x);db.commit();return serialize(x)
@@ -560,7 +579,11 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}
     designated_categories={rule.category_id for rule in rules if rule.category_id}
     designated_tags={rule.tag_id for rule in rules if rule.tag_id}
-    tagged_transactions={transaction_id for transaction_id,tag_id in db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions]),TransactionTag.tag_id.in_(designated_tags))).all()} if transactions and designated_tags else set()
+    loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==accounts[0].household_id,func.lower(Tag.name)=='loan reimbursement')).all()) if accounts else set()
+    relevant_tags=designated_tags|loan_reimbursement_tags
+    tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions and relevant_tags else []
+    tagged_transactions={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in designated_tags}
+    loan_reimbursements={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in loan_reimbursement_tags}
     connection_names=dict(db.execute(select(DataConnection.id,DataConnection.name).where(DataConnection.id.in_([account.connection_id for account in accounts if account.connection_id]))).all())
     sources={}
     def source_row(account):
@@ -571,7 +594,7 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
     for item in transactions:
         if item.is_internal_transfer: continue
         account=accounts_by_id[item.account_id]; amount=float(item.amount)
-        automated_target=item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged_transactions
+        automated_target=(item.account_id in designated_accounts or item.category_id in designated_categories or item.id in tagged_transactions) and item.id not in loan_reimbursements
         if amount>0 and automated_target:
             automated+=amount; transaction_income+=amount
             source=source_row(account); source['income']+=amount; source['automated_savings']+=amount

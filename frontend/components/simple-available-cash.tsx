@@ -4,7 +4,7 @@ import { money } from '@/lib/api';
 
 type Props={data:any;period:'paycheck'|'monthly';setPeriod:(value:'paycheck'|'monthly')=>void;anchorDate:string;setAnchorDate:(value:string)=>void;savingsRate:number;setSavingsRate:(value:number)=>void;toggleRefund:(refund:any,checked:boolean)=>void};
 export function SimpleAvailableCash({data,period,setPeriod,anchorDate,setAnchorDate,savingsRate,setSavingsRate,toggleRefund}:Props) {
-  const income=period==='paycheck'?Number(data.nmp_paycheck):Number(data.net_monthly_pay);
+  const income=Number(data.paycheck_amount);
   const netAfterSavings=income*(1-savingsRate/100), free=netAfterSavings-Number(data.total_period_expenses);
   const spokenFor=Math.min(100,Math.max(0,Number(data.total_period_expenses)/Math.max(income,1)*100));
   const presets=[['Save a little',15],['Balanced',30],['Super saver',45]] as const;
