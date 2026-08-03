@@ -5,9 +5,9 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date, update_transaction_planner_effective_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
-from app.schemas import CategoryDelete, ManualTransactionIn, TransactionDateUpdate, TransactionSplitsUpdate
+from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, TransactionDateUpdate, TransactionSplitsUpdate
 
 
 def test_manual_transaction_creation_persists_metadata_tags_and_account_balance():
@@ -249,6 +249,24 @@ def test_transaction_date_override_persists():
     replacement=date.today()-timedelta(days=10)
     update_transaction_date(transaction.id,TransactionDateUpdate(date=replacement),user,db)
     assert db.get(Transaction,transaction.id).date==replacement
+
+def test_planner_expense_effective_date_moves_prorated_expense_without_changing_history():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='effective-date@example.com',display_name='Planner Date',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    july_charge=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,1),description='Mountain-n-Plain WEB PMTS',amount=-120,is_prorated=True,proration_months=1)
+    month_end_charge=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='Mountain-n-Plain WEB PMTS',amount=-120,is_prorated=True,proration_months=1)
+    db.add_all([july_charge,month_end_charge]);db.commit()
+    update_transaction_planner_effective_date(month_end_charge.id,PlannerExpenseEffectiveDateUpdate(planner_effective_date=date(2026,8,1)),user,db)
+    july=available_cash_planner('monthly',date(2026,7,31),None,user,db)
+    august=available_cash_planner('monthly',date(2026,8,31),None,user,db)
+    assert july['prorated_expenses']==120
+    assert [item['date'] for item in july['expense_input_sources'] if item['type']=='Prorated']==['2026-07-01']
+    assert august['prorated_expenses']==120
+    august_item=next(item for item in august['expense_input_sources'] if item['type']=='Prorated')
+    assert august_item['date']=='2026-07-31'
+    assert august_item['planner_effective_date']=='2026-08-01'
+    assert db.get(Transaction,month_end_charge.id).date==date(2026,7,31)
 
 def test_starting_carryover_can_be_removed_only_from_its_active_scope():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()

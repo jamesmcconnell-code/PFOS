@@ -5,7 +5,7 @@ from uuid import UUID
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, func, or_, delete
+from sqlalchemy import select, func, or_, and_, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from .database import get_db
@@ -372,6 +372,13 @@ def update_transaction_date(transaction_id:UUID,body:TransactionDateUpdate,user=
     t=db.get(Transaction,transaction_id)
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     t.date=body.date;db.commit();return serialize(t)
+@app.patch('/api/v1/transactions/{transaction_id}/planner-effective-date')
+def update_transaction_planner_effective_date(transaction_id:UUID,body:PlannerExpenseEffectiveDateUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    t=db.get(Transaction,transaction_id)
+    if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
+    if float(t.amount)>=0 or t.is_internal_transfer: raise HTTPException(400,'Only non-transfer debit transactions can have a planner expense date')
+    t.planner_effective_date=body.planner_effective_date
+    db.commit();return serialize(t)
 @app.put('/api/v1/transactions/{transaction_id}/tags')
 def update_transaction_tags(transaction_id:UUID,body:TransactionTagsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); t=db.get(Transaction,transaction_id)
@@ -409,6 +416,9 @@ def add_months(value: date, months: int) -> date:
     """Return the inclusive-start date shifted by whole calendar months."""
     month_index=value.month-1+months; year=value.year+month_index//12; month=month_index%12+1
     return date(year,month,min(value.day,calendar.monthrange(year,month)[1]))
+def planner_expense_effective_date(item: Transaction) -> date:
+    """Use the optional planner assignment without changing transaction history."""
+    return item.planner_effective_date or item.date
 def normalized_description(value: str|None): return ' '.join((value or '').lower().split())
 def planner_expense_rule_matches(rule, item):
     """Prefer source identity; use account/category plus a bounded amount fallback."""
@@ -431,7 +441,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     accounts=db.scalars(account_q).all(); account_ids=[account.id for account in accounts]; accounts_by_id={account.id:account for account in accounts}
     categories={category.id:category for category in db.scalars(select(Category).where(Category.household_id==h)).all()}; category_parent_ids={category.id:category.parent_id for category in categories.values()}
-    transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=start,Transaction.date<end,Transaction.is_pending==False)).all() if account_ids else []
+    transactions_in_period=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_pending==False,or_(and_(Transaction.date>=start,Transaction.date<end),and_(Transaction.planner_effective_date>=start,Transaction.planner_effective_date<end)))).all() if account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
     expense_rules=db.scalars(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h,RecurringPlannerExpenseRule.is_active==True,RecurringPlannerExpenseRule.account_id.in_(account_ids))).all() if account_ids else []
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
@@ -498,32 +508,35 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 pass
             continue
         if amount>=0 or is_debt_payment(item,account,category_id) or item.is_prorated: continue
+        effective_date=planner_expense_effective_date(item)
+        if not (start<=effective_date<end): continue
         value=abs(amount)
         if item.is_expected:
             expected+=value
-            expense_input_sources.append({'id':str(item.id),'type':'Expected','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
+            expense_input_sources.append({'id':str(item.id),'type':'Expected','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
         elif account.account_type=='debt':
             # Debt purchases are an as-of value: within the active paycheck or
             # month, include only activity dated on or before the selected date.
-            if item.date<=anchor:
-                debt_items.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':value})
+            if effective_date<=anchor:
+                debt_items.append({'id':str(item.id),'date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value})
         elif account.account_type=='spending':
             fixed_regular+=value
-            expense_input_sources.append({'id':str(item.id),'type':'Fixed','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
-    prorated_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_prorated==True,Transaction.is_pending==False,Transaction.date<=anchor).order_by(Transaction.date.desc())).all() if account_ids else []
+            expense_input_sources.append({'id':str(item.id),'type':'Fixed','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
+    prorated_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_prorated==True,Transaction.is_pending==False,or_(Transaction.date<=anchor,Transaction.planner_effective_date<=anchor)).order_by(Transaction.date.desc())).all() if account_ids else []
     active_prorated=[]
     for item in prorated_candidates:
         account=accounts_by_id[item.account_id]; duration=max(1,int(item.proration_months or 12))
         # A purchase contributes from its purchase date up to, but not including,
         # the matching duration anniversary (3, 6, 12 months, or another choice).
-        if float(item.amount)<0 and not is_debt_payment(item,account) and anchor<add_months(item.date,duration): active_prorated.append(item)
+        effective_date=planner_expense_effective_date(item)
+        if float(item.amount)<0 and not is_debt_payment(item,account) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(item)
     prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(24 if period=='paycheck' else 12); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
     for item in active_prorated:
-        account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
+        account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); effective_date=planner_expense_effective_date(item); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
     anticipated_expenses=0.0; anticipated_expense_sources=[]; reconciled_anticipated_expenses=[]
     # A rule is projected only when no source or matching actual charge is already
     # providing this period's allocation. This keeps imported actuals authoritative.
-    actual_candidates=[item for item in transactions_in_period if item.date<=anchor and float(item.amount)<0 and not item.is_internal_transfer]
+    actual_candidates=[item for item in transactions_in_period if start<=planner_expense_effective_date(item)<end and planner_expense_effective_date(item)<=anchor and float(item.amount)<0 and not item.is_internal_transfer]
     for rule in expense_rules:
         actual=next((item for item in active_prorated if planner_expense_rule_matches(rule,item)),None)
         actual=actual or next((item for item in actual_candidates if planner_expense_rule_matches(rule,item)),None)

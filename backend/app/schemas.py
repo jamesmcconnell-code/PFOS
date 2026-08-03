@@ -35,6 +35,7 @@ class ManualTransactionIn(BaseModel):
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
 class TransactionDateUpdate(BaseModel): date: date
+class PlannerExpenseEffectiveDateUpdate(BaseModel): planner_effective_date: date|None=None
 class TransactionTagsUpdate(BaseModel): tag_ids: list[UUID]=[]
 class TransactionSplitIn(BaseModel):
     amount: float
