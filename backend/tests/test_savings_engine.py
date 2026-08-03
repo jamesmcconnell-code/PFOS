@@ -3,8 +3,8 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import available_cash_planner, delete_category, metrics, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.main import available_cash_planner, delete_category, metrics, planner_cash_history, reports, update_transaction_date
+from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, PlannerAdjustment, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
@@ -213,3 +213,28 @@ def test_transaction_date_override_persists():
     replacement=date.today()-timedelta(days=10)
     update_transaction_date(transaction.id,TransactionDateUpdate(date=replacement),user,db)
     assert db.get(Transaction,transaction.id).date==replacement
+
+def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='rolling-paycheck@example.com',display_name='Rolling',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,1),amount=100),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,3),description='Bill',amount=-300),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,16),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,17),description='Bill',amount=-200),PlannerAdjustment(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,16),amount=-50,note='Cash withdrawal')]);db.commit()
+    result=planner_cash_history(home.id,'paycheck',date(2026,8,20),None,user,db)
+    assert result['history'][-2]['ending_rolling_available_cash']==800
+    assert result['current']['free_spending']==800
+    assert result['current']['manual_adjustments']==-50
+    assert result['current']['ending_rolling_available_cash']==1550
+
+def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolation():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='rolling-james@example.com',display_name='James',password_hash='x');bailey=User(email='rolling-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
+    joint=Account(household_id=home.id,name='Joint checking',type='checking',account_type='spending',balance=0);individual=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add_all([joint,individual]);db.flush()
+    source=Transaction(household_id=home.id,account_id=joint.id,date=date(2026,7,1),description='Phone',amount=-120,is_expected=True,is_prorated=True,proration_months=1)
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=100),PlannerAdjustment(household_id=home.id,owner_id=bailey.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=500),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,3),description='Refund',amount=50,is_refund=True),source]);db.flush();db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=joint.id,display_name='Phone',source_description='Phone',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    joint_result=planner_cash_history(home.id,'monthly',date(2026,8,2),None,james,db)
+    assert joint_result['current']['anticipated_expenses']==120
+    assert joint_result['current']['total_period_expenses']==70
+    assert joint_result['current']['ending_rolling_available_cash']==1030
+    bailey_result=planner_cash_history(home.id,'monthly',date(2026,8,2),bailey.id,james,db)
+    assert bailey_result['current']['manual_adjustments']==500
+    assert joint_result['current']['manual_adjustments']==0

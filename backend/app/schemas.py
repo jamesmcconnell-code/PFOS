@@ -50,6 +50,20 @@ class PlannerExpenseRuleUpdate(BaseModel):
     owner_id: UUID|None=None
     proration_months: int|None=Field(default=None,ge=1,le=120)
     is_active: bool|None=None
+class PlannerStartingCarryoverIn(BaseModel):
+    period_type: str
+    effective_period_start: date
+    amount: float
+    note: str|None=Field(default=None,max_length=500)
+class PlannerAdjustmentIn(BaseModel):
+    period_type: str
+    effective_period_start: date
+    amount: float
+    note: str|None=Field(default=None,max_length=500)
+class PlannerAdjustmentUpdate(BaseModel):
+    effective_period_start: date|None=None
+    amount: float|None=None
+    note: str|None=Field(default=None,max_length=500)
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date
 class GoalUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)

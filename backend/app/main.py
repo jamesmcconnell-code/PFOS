@@ -467,6 +467,79 @@ def delete_planner_expense_rule(rule_id:UUID,user=Depends(current_user),db:Sessi
     if not rule or rule.household_id!=household(user,db): raise HTTPException(404,'Anticipated expense rule not found')
     db.delete(rule);db.commit()
 
+def planner_period_start(period_type: str, value: date):
+    if period_type=='monthly': return value.replace(day=1)
+    if period_type=='paycheck': return value.replace(day=1 if value.day<=15 else 16)
+    raise HTTPException(400,'Period type must be paycheck or monthly')
+def next_planner_period_start(period_type: str, value: date):
+    if period_type=='monthly': return (value.replace(day=28)+timedelta(days=4)).replace(day=1)
+    return value.replace(day=16) if value.day==1 else (value.replace(day=28)+timedelta(days=4)).replace(day=1)
+def planner_scope_filter(model, view_user_id): return model.owner_id==view_user_id if view_user_id else model.owner_id.is_(None)
+def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session, limit=12):
+    """Derive running planner cash from source transactions plus the small ledger."""
+    validate_view_member(h,view_user_id,db); target=planner_period_start(period_type,anchor)
+    account_query=select(Account.id).where(Account.household_id==h,Account.is_active==True)
+    if view_user_id: account_query=account_query.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+    account_ids=list(db.scalars(account_query).all())
+    scope_openings=db.scalars(select(PlannerStartingCarryover).where(PlannerStartingCarryover.household_id==h,PlannerStartingCarryover.period_type==period_type,planner_scope_filter(PlannerStartingCarryover,view_user_id),PlannerStartingCarryover.effective_period_start<=target).order_by(PlannerStartingCarryover.effective_period_start)).all()
+    scope_adjustments=db.scalars(select(PlannerAdjustment).where(PlannerAdjustment.household_id==h,PlannerAdjustment.period_type==period_type,planner_scope_filter(PlannerAdjustment,view_user_id),PlannerAdjustment.effective_period_start<=target).order_by(PlannerAdjustment.effective_period_start,PlannerAdjustment.created_at)).all()
+    candidates=[target,*[item.effective_period_start for item in scope_openings],*[item.effective_period_start for item in scope_adjustments]]
+    if account_ids:
+        first_transaction=db.scalar(select(func.min(Transaction.date)).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_pending==False))
+        if first_transaction: candidates.append(planner_period_start(period_type,first_transaction))
+    cursor=min(candidates); openings={item.effective_period_start:item for item in scope_openings}; adjustments={}
+    for item in scope_adjustments: adjustments.setdefault(item.effective_period_start,[]).append(item)
+    running=0.0; history=[]
+    while cursor<=target:
+        opening=openings.get(cursor)
+        if opening: running=float(opening.amount)
+        next_cursor=next_planner_period_start(period_type,cursor); evaluation_anchor=anchor if cursor==target else next_cursor-timedelta(days=1)
+        planner=available_cash_planner(period_type,evaluation_anchor,view_user_id,user,db)
+        free=float(planner['paycheck_amount'])-float(planner['total_period_expenses'])
+        period_adjustments=adjustments.get(cursor,[]); adjustment_total=sum(float(item.amount) for item in period_adjustments)
+        previous=running; running=previous+free+adjustment_total
+        history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_rolling_available_cash':running})
+        cursor=next_cursor
+    return {'period_type':period_type,'anchor_date':str(anchor),'scope_user_id':str(view_user_id) if view_user_id else None,'history':history[-limit:],'current':history[-1] if history else None}
+
+@app.get('/api/v1/available-cash-planner/history')
+def available_cash_planner_history(period:str='paycheck',anchor_date:date|None=None,limit:int=12,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    if limit<1 or limit>60: raise HTTPException(400,'History limit must be between 1 and 60')
+    h=household(user,db); return planner_cash_history(h,period,anchor_date or date.today(),view_user_id,user,db,limit)
+@app.get('/api/v1/planner-carryovers')
+def planner_carryovers(period_type:str|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); query=select(PlannerStartingCarryover).where(PlannerStartingCarryover.household_id==h,planner_scope_filter(PlannerStartingCarryover,view_user_id))
+    if period_type: query=query.where(PlannerStartingCarryover.period_type==period_type)
+    return [serialize(item) for item in db.scalars(query.order_by(PlannerStartingCarryover.effective_period_start.desc())).all()]
+@app.put('/api/v1/planner-carryovers')
+def set_planner_carryover(body:PlannerStartingCarryoverIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start)
+    row=db.scalar(select(PlannerStartingCarryover).where(PlannerStartingCarryover.household_id==h,PlannerStartingCarryover.period_type==body.period_type,PlannerStartingCarryover.effective_period_start==start,planner_scope_filter(PlannerStartingCarryover,view_user_id)))
+    if row: row.amount,row.note=body.amount,body.note
+    else: row=PlannerStartingCarryover(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row)
+    db.commit();return serialize(row)
+@app.get('/api/v1/planner-adjustments')
+def planner_adjustments(period_type:str|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); query=select(PlannerAdjustment).where(PlannerAdjustment.household_id==h,planner_scope_filter(PlannerAdjustment,view_user_id))
+    if period_type: query=query.where(PlannerAdjustment.period_type==period_type)
+    return [serialize(item) for item in db.scalars(query.order_by(PlannerAdjustment.effective_period_start.desc(),PlannerAdjustment.created_at.desc())).all()]
+@app.post('/api/v1/planner-adjustments')
+def add_planner_adjustment(body:PlannerAdjustmentIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start); row=PlannerAdjustment(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize(row)
+@app.patch('/api/v1/planner-adjustments/{adjustment_id}')
+def update_planner_adjustment(adjustment_id:UUID,body:PlannerAdjustmentUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerAdjustment,adjustment_id)
+    if not row or row.household_id!=h or (row.owner_id!=view_user_id): raise HTTPException(404,'Planner adjustment not found')
+    changes=body.model_dump(exclude_unset=True)
+    if 'effective_period_start' in changes: changes['effective_period_start']=planner_period_start(row.period_type,changes['effective_period_start'])
+    for field,value in changes.items(): setattr(row,field,value)
+    db.commit();return serialize(row)
+@app.delete('/api/v1/planner-adjustments/{adjustment_id}',status_code=204)
+def delete_planner_adjustment(adjustment_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerAdjustment,adjustment_id)
+    if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Planner adjustment not found')
+    db.delete(row);db.commit()
+
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); ensure_groceries_category(h,db); return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()]
