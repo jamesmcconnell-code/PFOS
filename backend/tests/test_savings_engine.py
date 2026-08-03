@@ -271,3 +271,15 @@ def test_transaction_splits_validate_allocation_and_drive_category_and_savings_t
     assert available_cash_planner('paycheck',date.today(),None,user,db)['fixed_regular_expenses']==150
     with __import__('pytest').raises(HTTPException):
         replace_transaction_splits(transaction.id,TransactionSplitsUpdate(splits=[{'amount':-120,'ownership':'joint'},{'amount':-20,'ownership':'joint'}]),user,db)
+
+def test_split_tags_and_refund_credit_are_applied_per_allocation():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='split-tags@example.com',display_name='Split tags',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    savings=Account(household_id=home.id,name='Savings',type='savings',account_type='income',is_savings_direct_deposit=True,balance=0);loan=Tag(household_id=home.id,name='Loan reimbursement');db.add_all([savings,loan]);db.flush()
+    transaction=Transaction(household_id=home.id,account_id=savings.id,date=date.today(),description='Two credits',amount=200);db.add(transaction);db.commit()
+    result=replace_transaction_splits(transaction.id,TransactionSplitsUpdate(splits=[{'amount':100,'ownership':'joint','is_refund':True},{'amount':100,'ownership':'joint','tag_ids':[loan.id]}]),user,db)
+    assert result['splits'][0]['is_refund'] is True
+    assert result['splits'][1]['tags'][0]['name']=='Loan reimbursement'
+    planner=available_cash_planner('paycheck',date.today(),None,user,db)
+    assert planner['refund_expense_offset']==100
+    assert planner['automated_savings_amount']==0

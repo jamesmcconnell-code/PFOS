@@ -82,7 +82,10 @@ def serialize(o):
 def serialize_transaction_splits(transaction_id, h, db: Session):
     categories={item.id:item.name for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
     users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
-    return [dict(serialize(split),category_name=categories.get(split.category_id),owner_name=users.get(split.owner_id,'Joint household')) for split in db.scalars(select(TransactionSplit).where(TransactionSplit.transaction_id==transaction_id).order_by(TransactionSplit.created_at,TransactionSplit.id)).all()]
+    splits=db.scalars(select(TransactionSplit).where(TransactionSplit.transaction_id==transaction_id).order_by(TransactionSplit.created_at,TransactionSplit.id)).all(); tag_rows={split.id:[] for split in splits}
+    if splits:
+        for split_id,tag_id,tag_name in db.execute(select(TransactionSplitTag.split_id,Tag.id,Tag.name).join(Tag,Tag.id==TransactionSplitTag.tag_id).where(TransactionSplitTag.split_id.in_([split.id for split in splits]))).all(): tag_rows[split_id].append({'id':str(tag_id),'name':tag_name})
+    return [dict(serialize(split),category_name=categories.get(split.category_id),owner_name=users.get(split.owner_id,'Joint household'),tags=tag_rows[split.id],tag_ids=[tag['id'] for tag in tag_rows[split.id]]) for split in splits]
 def transaction_allocation_rows(transactions, db: Session, view_user_id: UUID|None=None):
     """Return split allocations, or the parent transaction as its sole allocation.
 
@@ -90,18 +93,19 @@ def transaction_allocation_rows(transactions, db: Session, view_user_id: UUID|No
     only split-level fields in this first delivery.
     """
     transaction_ids=[item.id for item in transactions]
-    grouped={item.id:[] for item in transactions}
+    grouped={item.id:[] for item in transactions}; split_tags={}
     if transaction_ids:
         for split in db.scalars(select(TransactionSplit).where(TransactionSplit.transaction_id.in_(transaction_ids)).order_by(TransactionSplit.created_at,TransactionSplit.id)).all(): grouped.setdefault(split.transaction_id,[]).append(split)
+        for split_id,tag_id in db.execute(select(TransactionSplitTag.split_id,TransactionSplitTag.tag_id).where(TransactionSplitTag.split_id.in_(select(TransactionSplit.id).where(TransactionSplit.transaction_id.in_(transaction_ids))))).all(): split_tags.setdefault(split_id,set()).add(tag_id)
     rows=[]
     for item in transactions:
         splits=grouped.get(item.id,[])
         if splits:
             for split in splits:
                 if view_user_id and split.owner_id!=view_user_id: continue
-                rows.append({'transaction':item,'amount':float(split.amount),'category_id':split.category_id,'owner_id':split.owner_id,'is_split':True,'split_id':split.id})
+                rows.append({'transaction':item,'amount':float(split.amount),'category_id':split.category_id,'owner_id':split.owner_id,'is_refund':split.is_refund,'refund_included':split.refund_included,'tag_ids':split_tags.get(split.id,set()),'is_split':True,'split_id':split.id})
         else:
-            rows.append({'transaction':item,'amount':float(item.amount),'category_id':item.category_id,'owner_id':None,'is_split':False,'split_id':None})
+            rows.append({'transaction':item,'amount':float(item.amount),'category_id':item.category_id,'owner_id':None,'is_refund':item.is_refund,'refund_included':item.refund_included,'tag_ids':set(),'is_split':False,'split_id':None})
     return rows
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
@@ -331,12 +335,21 @@ def replace_transaction_splits(transaction_id:UUID,body:TransactionSplitsUpdate,
     owner_ids={item.owner_id for item in body.splits if item.owner_id}
     valid_owners=set(db.scalars(select(HouseholdMember.user_id).where(HouseholdMember.household_id==h,HouseholdMember.user_id.in_(owner_ids))).all()) if owner_ids else set()
     if valid_owners!=owner_ids: raise HTTPException(400,'Invalid split owner')
+    tag_ids={tag_id for item in body.splits for tag_id in item.tag_ids}
+    valid_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,Tag.id.in_(tag_ids))).all()) if tag_ids else set()
+    if valid_tags!=tag_ids: raise HTTPException(400,'Invalid split tag')
     for item in body.splits:
         if item.ownership not in {'joint','individual'}: raise HTTPException(400,'Split ownership must be joint or individual')
         if item.ownership=='individual' and not item.owner_id: raise HTTPException(400,'Select an owner for an individual split')
         if item.ownership=='joint' and item.owner_id: raise HTTPException(400,'Joint splits cannot have an individual owner')
+        if item.is_refund and item.amount<=0: raise HTTPException(400,'Only positive split allocations can be refund credits')
     db.execute(delete(TransactionSplit).where(TransactionSplit.transaction_id==transaction.id))
-    db.add_all([TransactionSplit(transaction_id=transaction.id,amount=item.amount,category_id=item.category_id,ownership=item.ownership,owner_id=item.owner_id) for item in body.splits]);db.commit()
+    created=[]
+    for item in body.splits:
+        split=TransactionSplit(transaction_id=transaction.id,amount=item.amount,category_id=item.category_id,ownership=item.ownership,owner_id=item.owner_id,is_refund=item.is_refund,refund_included=item.refund_included);db.add(split);created.append((split,item.tag_ids))
+    db.flush()
+    for split,split_tag_ids in created: db.add_all([TransactionSplitTag(split_id=split.id,tag_id=tag_id) for tag_id in dict.fromkeys(split_tag_ids)])
+    db.commit()
     return {'transaction_id':str(transaction.id),'amount':parent_amount,'splits':serialize_transaction_splits(transaction.id,h,db)}
 @app.delete('/api/v1/transactions/{transaction_id}/splits',status_code=204)
 def clear_transaction_splits(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -426,14 +439,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         # An explicit refund classification takes precedence over the transfer
         # heuristic. A reimbursement may be received in any account role.
-        if amount>0 and item.is_refund:
-            refunds.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':item.refund_included})
-            if item.refund_included: refunds_total+=amount
+        if amount>0 and allocation['is_refund']:
+            refunds.append({'id':str(allocation['split_id'] or item.id),'parent_transaction_id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount,'refund_included':allocation['refund_included'],'is_split':allocation['is_split']})
+            if allocation['refund_included']: refunds_total+=amount
             continue
         if item.is_internal_transfer: continue
         # Loan reimbursements always override a savings designation. They may still
         # be represented elsewhere by their account's normal cash-flow treatment.
-        automated_target=(item.account_id in designated_accounts or category_matches_rule(category_id,designated_categories,category_parent_ids) or item.id in tagged) and item.id not in loan_reimbursements
+        automated_target=(item.account_id in designated_accounts or category_matches_rule(category_id,designated_categories,category_parent_ids) or item.id in tagged) and item.id not in loan_reimbursements and not (allocation['tag_ids']&loan_reimbursement_tags)
         if amount>0:
             if automated_target:
                 automated+=amount

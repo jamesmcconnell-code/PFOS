@@ -23,6 +23,9 @@ class TransactionSplitIn(BaseModel):
     category_id: UUID|None=None
     ownership: str='joint'
     owner_id: UUID|None=None
+    tag_ids: list[UUID]=[]
+    is_refund: bool=False
+    refund_included: bool=True
 class TransactionSplitsUpdate(BaseModel):
     splits: list[TransactionSplitIn]=Field(min_length=2,max_length=100)
 class CategoryIn(BaseModel):
