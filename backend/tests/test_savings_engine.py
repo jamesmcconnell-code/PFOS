@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.main import available_cash_planner, delete_category, metrics, planner_cash_history, reports, update_transaction_date
-from app.models import Account, AccountBalanceSnapshot, Category, Household, HouseholdMember, PlannerAdjustment, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, TransactionDateUpdate
 
 
@@ -238,3 +238,18 @@ def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolati
     bailey_result=planner_cash_history(home.id,'monthly',date(2026,8,2),bailey.id,james,db)
     assert bailey_result['current']['manual_adjustments']==500
     assert joint_result['current']['manual_adjustments']==0
+
+def test_rolling_cash_virtual_ceiling_sweeps_prioritized_goals_without_mutating_them():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='goal-sweep@example.com',display_name='Goal sweep',password_hash='x');home=Household(name='Test household',checking_account_ceiling=500);db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);savings=Account(household_id=home.id,name='House savings',type='savings',account_type='income',balance=0);db.add_all([checking,savings]);db.flush()
+    first=Goal(household_id=home.id,funding_account_id=savings.id,name='Emergency',type='custom',target_amount=300,current_amount=0,target_date=date(2027,1,1),priority_order=0);second=Goal(household_id=home.id,funding_account_id=savings.id,name='House',type='custom',target_amount=500,current_amount=0,target_date=date(2027,2,1),priority_order=1)
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,1),amount=1000),first,second]);db.commit()
+    result=planner_cash_history(home.id,'paycheck',date(2026,8,2),None,user,db)
+    current=result['current']
+    assert current['ending_before_goal_sweeps']==1000
+    assert current['goal_sweep_total']==500
+    assert current['ending_rolling_available_cash']==500
+    assert [(item['name'],item['amount']) for item in current['goal_sweeps']]==[('Emergency',300),('House',200)]
+    assert float(db.get(Goal,first.id).current_amount)==0
+    assert float(db.get(Account,savings.id).balance)==0

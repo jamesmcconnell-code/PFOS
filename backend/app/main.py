@@ -489,6 +489,18 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
         if first_transaction: candidates.append(planner_period_start(period_type,first_transaction))
     cursor=min(candidates); openings={item.effective_period_start:item for item in scope_openings}; adjustments={}
     for item in scope_adjustments: adjustments.setdefault(item.effective_period_start,[]).append(item)
+    # Goal sweeps are virtual planner allocations only. They never create a
+    # contribution, change an account balance, or mutate a goal's saved amount.
+    # The state below is rebuilt on every request so changed transactions and
+    # priorities immediately produce a fresh, auditable forecast.
+    ceiling=float(db.get(Household,h).checking_account_ceiling or 0)
+    goal_state=[]
+    if view_user_id is None and ceiling>0:
+        for goal in db.scalars(select(Goal).where(Goal.household_id==h).order_by(Goal.priority_order,Goal.created_at)).all():
+            remaining=max(0,float(goal.target_amount)-float(goal.current_amount))
+            if remaining>0 and not goal.is_complete:
+                account=db.get(Account,goal.funding_account_id) if goal.funding_account_id else None
+                goal_state.append({'id':str(goal.id),'name':goal.name,'remaining':remaining,'funding_account_id':str(goal.funding_account_id) if goal.funding_account_id else None,'funding_account_name':account.name if account else None})
     running=0.0; history=[]
     while cursor<=target:
         opening=openings.get(cursor)
@@ -497,8 +509,15 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
         planner=available_cash_planner(period_type,evaluation_anchor,view_user_id,user,db)
         free=float(planner['paycheck_amount'])-float(planner['total_period_expenses'])
         period_adjustments=adjustments.get(cursor,[]); adjustment_total=sum(float(item.amount) for item in period_adjustments)
-        previous=running; running=previous+free+adjustment_total
-        history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_rolling_available_cash':running})
+        previous=running; running=previous+free+adjustment_total; ending_before_goal_sweeps=running; goal_sweeps=[]
+        excess=max(0,running-ceiling) if goal_state else 0
+        for goal in goal_state:
+            if excess<=0: break
+            allocation=min(excess,goal['remaining'])
+            if allocation<=0: continue
+            goal['remaining']-=allocation; excess-=allocation; running-=allocation
+            goal_sweeps.append({**{key:value for key,value in goal.items() if key!='remaining'},'amount':allocation,'status':'forecast'})
+        history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_before_goal_sweeps':ending_before_goal_sweeps,'goal_sweep_total':sum(item['amount'] for item in goal_sweeps),'goal_sweeps':goal_sweeps,'ending_rolling_available_cash':running})
         cursor=next_cursor
     return {'period_type':period_type,'anchor_date':str(anchor),'scope_user_id':str(view_user_id) if view_user_id else None,'history':history[-limit:],'current':history[-1] if history else None}
 
@@ -615,16 +634,22 @@ def _months_remaining(target_date):
 def goals(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); result=[]
     for g in db.scalars(select(Goal).where(Goal.household_id==h).order_by(Goal.priority_order,Goal.created_at)).all():
-        current=float(g.current_amount);target=float(g.target_amount);months=_months_remaining(g.target_date);remaining=max(0,target-current);row=serialize(g);row.update(saved_amount=current,progress=round(current/target*100,1) if target else 0,remaining_amount=remaining,months_remaining=months,required_monthly_contribution=round(remaining/months,2) if months else None);result.append(row)
+        current=float(g.current_amount);target=float(g.target_amount);months=_months_remaining(g.target_date);remaining=max(0,target-current);account=db.get(Account,g.funding_account_id) if g.funding_account_id else None;row=serialize(g);row.update(saved_amount=current,progress=round(current/target*100,1) if target else 0,remaining_amount=remaining,months_remaining=months,required_monthly_contribution=round(remaining/months,2) if months else None,funding_account_name=account.name if account else None);result.append(row)
     return result
+@app.get('/api/v1/goals/sweep-forecast')
+def goal_sweep_forecast(user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); result=planner_cash_history(h,'paycheck',date.today(),None,user,db,60); current=result['current'] or {}; return {'checking_account_ceiling':float(db.get(Household,h).checking_account_ceiling or 0),'period_start':current.get('period_start'),'rolling_before_goal_sweeps':current.get('ending_before_goal_sweeps',0),'virtual_goal_sweep_total':current.get('goal_sweep_total',0),'rolling_after_goal_sweeps':current.get('ending_rolling_available_cash',0),'allocations':current.get('goal_sweeps',[]),'planner_only':True}
 @app.post('/api/v1/goals')
 def add_goal(body:GoalIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db);last_priority=db.scalar(select(func.max(Goal.priority_order)).where(Goal.household_id==h));priority=(int(last_priority) if last_priority is not None else -1)+1;g=Goal(household_id=h,priority_order=priority,**body.model_dump());db.add(g);db.commit();return serialize(g)
+    h=household(user,db)
+    if body.funding_account_id and not db.scalar(select(Account.id).where(Account.id==body.funding_account_id,Account.household_id==h)): raise HTTPException(400,'Invalid goal savings account')
+    last_priority=db.scalar(select(func.max(Goal.priority_order)).where(Goal.household_id==h));priority=(int(last_priority) if last_priority is not None else -1)+1;g=Goal(household_id=h,priority_order=priority,**body.model_dump());db.add(g);db.commit();return serialize(g)
 @app.patch('/api/v1/goals/{goal_id}')
 def update_goal(goal_id:UUID,body:GoalUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     g=db.get(Goal,goal_id)
     if not g or g.household_id!=household(user,db): raise HTTPException(404,'Goal not found')
-    g.name,g.target_amount,g.current_amount,g.target_date=body.name,body.target_amount,body.current_amount,body.target_date
+    if body.funding_account_id and not db.scalar(select(Account.id).where(Account.id==body.funding_account_id,Account.household_id==g.household_id)): raise HTTPException(400,'Invalid goal savings account')
+    g.name,g.target_amount,g.current_amount,g.target_date,g.funding_account_id=body.name,body.target_amount,body.current_amount,body.target_date,body.funding_account_id
     db.commit();return serialize(g)
 @app.put('/api/v1/goals/reorder')
 def reorder_goals(body:GoalPriorityUpdate,user=Depends(current_user),db:Session=Depends(get_db)):

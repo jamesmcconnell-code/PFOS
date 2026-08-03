@@ -64,12 +64,13 @@ class PlannerAdjustmentUpdate(BaseModel):
     effective_period_start: date|None=None
     amount: float|None=None
     note: str|None=Field(default=None,max_length=500)
-class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date
+class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date; funding_account_id: UUID|None=None
 class GoalUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     target_amount: float = Field(gt=0)
     current_amount: float = Field(ge=0)
     target_date: date
+    funding_account_id: UUID|None=None
 class GoalPriorityUpdate(BaseModel): goal_ids: list[UUID]
 class FinancialSettingsUpdate(BaseModel): checking_account_ceiling: float=Field(ge=0)
 class IncomeIn(BaseModel): name: str; monthly_amount: float; owner_id: UUID|None=None
