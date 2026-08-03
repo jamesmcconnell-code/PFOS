@@ -655,6 +655,11 @@ def set_planner_carryover(body:PlannerStartingCarryoverIn,view_user_id:UUID|None
     if row: row.amount,row.note=body.amount,body.note
     else: row=PlannerStartingCarryover(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row)
     db.commit();return serialize(row)
+@app.delete('/api/v1/planner-carryovers/{carryover_id}',status_code=204)
+def delete_planner_carryover(carryover_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerStartingCarryover,carryover_id)
+    if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Starting carryover not found')
+    db.delete(row);db.commit()
 @app.get('/api/v1/planner-adjustments')
 def planner_adjustments(period_type:str|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); query=select(PlannerAdjustment).where(PlannerAdjustment.household_id==h,planner_scope_filter(PlannerAdjustment,view_user_id))

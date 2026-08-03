@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, ManualTransactionIn, TransactionDateUpdate, TransactionSplitsUpdate
 
@@ -249,6 +249,19 @@ def test_transaction_date_override_persists():
     replacement=date.today()-timedelta(days=10)
     update_transaction_date(transaction.id,TransactionDateUpdate(date=replacement),user,db)
     assert db.get(Transaction,transaction.id).date==replacement
+
+def test_starting_carryover_can_be_removed_only_from_its_active_scope():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='carryover-james@example.com',display_name='James',password_hash='x');bailey=User(email='carryover-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
+    joint=PlannerStartingCarryover(household_id=home.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=100)
+    bailey_opening=PlannerStartingCarryover(household_id=home.id,owner_id=bailey.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=200)
+    db.add_all([joint,bailey_opening]);db.commit()
+    delete_planner_carryover(joint.id,None,james,db)
+    assert db.get(PlannerStartingCarryover,joint.id) is None
+    assert db.get(PlannerStartingCarryover,bailey_opening.id) is not None
+    with __import__('pytest').raises(HTTPException): delete_planner_carryover(bailey_opening.id,None,james,db)
+    delete_planner_carryover(bailey_opening.id,bailey.id,james,db)
+    assert db.get(PlannerStartingCarryover,bailey_opening.id) is None
 
 def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
