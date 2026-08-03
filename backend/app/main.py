@@ -826,7 +826,7 @@ def connection_syncs(connection_id:UUID,user=Depends(current_user),db:Session=De
     if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
     return [serialize(run) for run in db.scalars(select(ConnectionSync).where(ConnectionSync.connection_id==x.id).order_by(ConnectionSync.created_at.desc())).all()]
 
-def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
+def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0, view_user_id=None):
     """Apply the savings engine to one calendar month's transactions."""
     accounts_by_id={account.id:account for account in accounts}
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}
@@ -845,7 +845,7 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0):
             sources[account.id]={'account_id':str(account.id),'account_name':account.name,'source_name':connection_names.get(account.connection_id,'Manual'),'account_type':account.account_type,'income':0.0,'expenses':0.0,'automated_savings':0.0,'spending_cash_flow':0.0}
         return sources[account.id]
     automated=spending_net=expenses=essential=transaction_income=0.0
-    for allocation in transaction_allocation_rows(transactions,db):
+    for allocation in transaction_allocation_rows(transactions,db,view_user_id):
         item=allocation['transaction']
         if item.is_internal_transfer: continue
         account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
@@ -878,9 +878,13 @@ def metrics(h,db,view_user_id=None,period='calendar_month'):
     elif period=='calendar_month':
         month_start=date.today().replace(day=1);month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
     else: raise HTTPException(400,'Period must be calendar_month or rolling_30_days')
-    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False)).all() if account_ids else []
+    visibility=Transaction.account_id.in_(account_ids)
+    if view_user_id: visibility=or_(visibility,Transaction.id.in_(select(TransactionSplit.transaction_id).where(TransactionSplit.ownership=='individual',TransactionSplit.owner_id==view_user_id)))
+    tx=db.scalars(select(Transaction).where(Transaction.household_id==h,visibility,Transaction.date>=month_start,Transaction.date<month_end,Transaction.is_pending==False)).all() if account_ids or view_user_id else []
+    calculation_account_ids=set(account_ids)|{item.account_id for item in tx}
+    calculation_accounts=db.scalars(select(Account).where(Account.id.in_(calculation_account_ids))).all() if calculation_account_ids else []
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
-    monthly=monthly_breakdown(accounts,tx,rules,db,manual_income)
+    monthly=monthly_breakdown(calculation_accounts,tx,rules,db,manual_income,view_user_id)
     designated_accounts={x.id for x in accounts if x.is_savings_direct_deposit}|{x.account_id for x in rules if x.account_id}
     spending_balance=sum(float(x.balance) for x in accounts if x.account_type=='spending' and x.id not in designated_accounts);ceiling=float(db.get(Household,h).checking_account_ceiling)
     return {'net_worth':assets-debt,'cash_available':sum(float(x.balance) for x in accounts if x.account_type in ('spending','income')),'debt_total':debt,**monthly,'period':period,'period_start':str(month_start),'period_end':str(month_end-timedelta(days=1)),'checking_account_ceiling':ceiling,'spending_balance':spending_balance,'sweep_surplus':max(0,spending_balance-ceiling)}

@@ -267,6 +267,7 @@ def test_transaction_splits_validate_allocation_and_drive_category_and_savings_t
     assert by_name['Groceries']['debits']==100
     assert by_name['Household']['debits']==50
     assert metrics(home.id,db)['monthly_expenses']==150
+    assert metrics(home.id,db,view_user_id=user.id)['monthly_expenses']==100
     assert available_cash_planner('paycheck',date.today(),None,user,db)['fixed_regular_expenses']==150
     with __import__('pytest').raises(HTTPException):
         replace_transaction_splits(transaction.id,TransactionSplitsUpdate(splits=[{'amount':-120,'ownership':'joint'},{'amount':-20,'ownership':'joint'}]),user,db)
