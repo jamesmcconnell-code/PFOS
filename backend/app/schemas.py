@@ -74,6 +74,16 @@ class PlannerAdjustmentUpdate(BaseModel):
     effective_period_start: date|None=None
     amount: float|None=None
     note: str|None=Field(default=None,max_length=500)
+class PlannerIncomeAllocationIn(BaseModel):
+    source_transaction_id: UUID
+    period_type: str
+    effective_period_start: date
+    amount: float=Field(gt=0)
+    note: str|None=Field(default=None,max_length=500)
+class PlannerIncomeAllocationUpdate(BaseModel):
+    effective_period_start: date|None=None
+    amount: float|None=Field(default=None,gt=0)
+    note: str|None=Field(default=None,max_length=500)
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date; funding_account_id: UUID|None=None
 class GoalUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)

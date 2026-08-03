@@ -394,6 +394,11 @@ def planner_window(period, anchor):
         if anchor.day<=15: return anchor.replace(day=1),anchor.replace(day=16),'Paycheck view',1
         start=anchor.replace(day=16);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Paycheck view',1
     raise HTTPException(400,'Period must be paycheck or monthly')
+def default_paycheck_availability_start(value: date):
+    """Late-month payroll is available to the next half-month plan."""
+    month_end=(value.replace(day=28)+timedelta(days=4)).replace(day=1)-timedelta(days=1)
+    effective=value if value.day<month_end.day-2 else month_end+timedelta(days=1)
+    return planner_period_start('paycheck',effective)
 
 def add_months(value: date, months: int) -> date:
     """Return the inclusive-start date shifted by whole calendar months."""
@@ -426,6 +431,13 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     expense_rules=db.scalars(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h,RecurringPlannerExpenseRule.is_active==True,RecurringPlannerExpenseRule.account_id.in_(account_ids))).all() if account_ids else []
     designated_accounts={account.id for account in accounts if account.is_savings_direct_deposit}|{rule.account_id for rule in rules if rule.account_id}; designated_categories={rule.category_id for rule in rules if rule.category_id}; designated_tags={rule.tag_id for rule in rules if rule.tag_id}
     loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement')).all())
+    allocation_query=select(PlannerIncomeAllocation).where(PlannerIncomeAllocation.household_id==h,planner_scope_filter(PlannerIncomeAllocation,view_user_id))
+    if period=='paycheck': allocation_query=allocation_query.where(PlannerIncomeAllocation.period_type=='paycheck',PlannerIncomeAllocation.effective_period_start==start)
+    else: allocation_query=allocation_query.where(PlannerIncomeAllocation.effective_period_start>=start,PlannerIncomeAllocation.effective_period_start<end)
+    manual_income_allocations=db.scalars(allocation_query).all(); manual_by_source={}
+    for record in manual_income_allocations: manual_by_source[record.source_transaction_id]=manual_by_source.get(record.source_transaction_id,0)+float(record.amount)
+    income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_((Transaction.date>=start-timedelta(days=3))&(Transaction.date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
+    income_candidates=db.scalars(income_query).all(); income_by_id={item.id:item for item in income_candidates}
     relevant_tags=designated_tags|loan_reimbursement_tags
     tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
     tagged={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in designated_tags}
@@ -435,6 +447,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         category_name=(categories.get(category_id).name if category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
     paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]
+    for source in income_candidates:
+        account=accounts_by_id[source.account_id]
+        if account.account_type!='spending' or source.is_internal_transfer or source.is_refund: continue
+        allocated=manual_by_source.get(source.id)
+        effective_start=planner_period_start('monthly',default_paycheck_availability_start(source.date)) if period=='monthly' else default_paycheck_availability_start(source.date)
+        amount=allocated if allocated is not None else float(source.amount)
+        if (allocated is None and effective_start!=start) or amount<=0: continue
+        paycheck+=amount; paycheck_sources.append({'id':str(source.id),'date':str(source.date),'available_period_start':str(start),'description':source.description,'account_name':account.name,'amount':amount,'allocation_type':'manual' if allocated is not None else ('late_payroll_default' if source.date!=start else 'posted_period'),'note':next((record.note for record in manual_income_allocations if record.source_transaction_id==source.id),None)})
     for allocation in transaction_allocation_rows(transactions_in_period,db,view_user_id):
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         # An explicit refund classification takes precedence over the transfer
@@ -452,8 +472,9 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 automated+=amount
                 automated_savings_sources.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount})
             elif account.account_type=='spending':
-                paycheck+=amount
-                paycheck_sources.append({'id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':amount})
+                # Paycheck availability is determined above from planner
+                # allocations/default payroll timing, not the posting date.
+                pass
             continue
         if amount>=0 or is_debt_payment(item,account,category_id) or item.is_prorated: continue
         value=abs(amount)
@@ -633,6 +654,48 @@ def update_planner_adjustment(adjustment_id:UUID,body:PlannerAdjustmentUpdate,vi
 def delete_planner_adjustment(adjustment_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerAdjustment,adjustment_id)
     if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Planner adjustment not found')
+    db.delete(row);db.commit()
+def serialize_income_allocation(row, db: Session):
+    data=serialize(row); transaction=db.get(Transaction,row.source_transaction_id); account=db.get(Account,transaction.account_id) if transaction else None
+    data.update(source_description=transaction.description if transaction else 'Deleted transaction',source_transaction_date=str(transaction.date) if transaction else None,source_transaction_amount=float(transaction.amount) if transaction else None,account_name=account.name if account else None)
+    return data
+def validate_income_allocation(h, body, view_user_id, db: Session, exclude_id=None):
+    if body.period_type not in {'paycheck','monthly'}: raise HTTPException(400,'Period type must be paycheck or monthly')
+    transaction=db.get(Transaction,body.source_transaction_id)
+    if not transaction or transaction.household_id!=h or float(transaction.amount)<=0: raise HTTPException(400,'Select a positive household transaction')
+    account=db.get(Account,transaction.account_id)
+    if not account or account.account_type!='spending' or transaction.is_internal_transfer or transaction.is_refund: raise HTTPException(400,'Only non-transfer spending-account credits can be assigned as paychecks')
+    if view_user_id and account.ownership=='individual' and account.owner_id!=view_user_id: raise HTTPException(400,'Transaction is outside the selected user view')
+    allocated=float(db.scalar(select(func.coalesce(func.sum(PlannerIncomeAllocation.amount),0)).where(PlannerIncomeAllocation.source_transaction_id==transaction.id,PlannerIncomeAllocation.id!=exclude_id)) or 0)
+    if allocated+float(body.amount)>float(transaction.amount)+.005: raise HTTPException(400,'Paycheck allocations cannot exceed the source transaction amount')
+    return transaction
+@app.get('/api/v1/planner-income-allocations')
+def planner_income_allocations(period_type:str|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); query=select(PlannerIncomeAllocation).where(PlannerIncomeAllocation.household_id==h,planner_scope_filter(PlannerIncomeAllocation,view_user_id))
+    if period_type: query=query.where(PlannerIncomeAllocation.period_type==period_type)
+    return [serialize_income_allocation(row,db) for row in db.scalars(query.order_by(PlannerIncomeAllocation.effective_period_start.desc(),PlannerIncomeAllocation.created_at.desc())).all()]
+@app.get('/api/v1/planner-income-allocations/candidates')
+def planner_income_candidates(anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); anchor=anchor_date or date.today(); account_q=select(Account).where(Account.household_id==h,Account.account_type=='spending',Account.is_active==True)
+    if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
+    accounts={item.id:item for item in db.scalars(account_q).all()}; items=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(accounts),Transaction.amount>0,Transaction.is_internal_transfer==False,Transaction.is_refund==False,Transaction.is_pending==False,Transaction.date>=anchor-timedelta(days=90),Transaction.date<=anchor+timedelta(days=31)).order_by(Transaction.date.desc())).all() if accounts else []
+    return [{'id':str(item.id),'date':str(item.date),'description':item.description,'amount':float(item.amount),'account_name':accounts[item.account_id].name,'default_paycheck_period_start':str(default_paycheck_availability_start(item.date))} for item in items]
+@app.post('/api/v1/planner-income-allocations')
+def add_planner_income_allocation(body:PlannerIncomeAllocationIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); validate_income_allocation(h,body,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start); row=PlannerIncomeAllocation(household_id=h,owner_id=view_user_id,source_transaction_id=body.source_transaction_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize_income_allocation(row,db)
+@app.patch('/api/v1/planner-income-allocations/{allocation_id}')
+def update_planner_income_allocation(allocation_id:UUID,body:PlannerIncomeAllocationUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerIncomeAllocation,allocation_id)
+    if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Paycheck allocation not found')
+    if body.amount is not None:
+        candidate=PlannerIncomeAllocationIn(source_transaction_id=row.source_transaction_id,period_type=row.period_type,effective_period_start=row.effective_period_start,amount=body.amount,note=body.note if body.note is not None else row.note);validate_income_allocation(h,candidate,view_user_id,db,row.id);row.amount=body.amount
+    if body.effective_period_start: row.effective_period_start=planner_period_start(row.period_type,body.effective_period_start)
+    if 'note' in body.model_fields_set: row.note=body.note
+    db.commit();return serialize_income_allocation(row,db)
+@app.delete('/api/v1/planner-income-allocations/{allocation_id}',status_code=204)
+def delete_planner_income_allocation(allocation_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerIncomeAllocation,allocation_id)
+    if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Paycheck allocation not found')
     db.delete(row);db.commit()
 
 @app.get('/api/v1/categories')

@@ -283,3 +283,14 @@ def test_split_tags_and_refund_credit_are_applied_per_allocation():
     planner=available_cash_planner('paycheck',date.today(),None,user,db)
     assert planner['refund_expense_offset']==100
     assert planner['automated_savings_amount']==0
+
+def test_late_month_paycheck_is_available_in_next_paycheck_period_without_changing_date():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='pay-availability@example.com',display_name='Pay availability',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    paycheck=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='Payroll',amount=825);db.add(paycheck);db.commit()
+    planner=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
+    assert planner['paycheck_amount']==825
+    assert planner['paycheck_sources'][0]['date']=='2026-07-31'
+    assert planner['paycheck_sources'][0]['available_period_start']=='2026-08-01'
+    assert db.get(Transaction,paycheck.id).date==date(2026,7,31)
