@@ -301,11 +301,16 @@ def category_tracker_transactions(start_date:date,end_date:date,category_id:UUID
         item=allocation['transaction']; result.append(dict(serialize(item),id=str(allocation['split_id'] or item.id),parent_transaction_id=str(item.id),amount=allocation['amount'],category_id=str(allocation['category_id']) if allocation['category_id'] else None,is_split=allocation['is_split'],account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account'))
     return {'items':result}
 @app.post('/api/v1/transactions')
-def add_transaction(body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
+def add_transaction(body:ManualTransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); a=db.get(Account,body.account_id)
     if not a or a.household_id!=h: raise HTTPException(400,'Invalid account')
-    data=body.model_dump(); data['fingerprint']=hashlib.sha256(f'{body.account_id}|{body.date}|{body.amount}|{body.description.lower()}'.encode()).hexdigest()
-    t=Transaction(household_id=h,**data); db.add(t); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return serialize(t)
+    if body.owner_id and not db.scalar(select(HouseholdMember.id).where(HouseholdMember.household_id==h,HouseholdMember.user_id==body.owner_id)): raise HTTPException(400,'Invalid transaction owner')
+    if body.category_id and not db.scalar(select(Category.id).where(Category.household_id==h,Category.id==body.category_id)): raise HTTPException(400,'Invalid category')
+    tag_ids=list(dict.fromkeys(body.tag_ids)); valid_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,Tag.id.in_(tag_ids))).all()) if tag_ids else set()
+    if len(valid_tags)!=len(tag_ids): raise HTTPException(400,'Invalid tag')
+    if body.is_refund and body.amount<=0: raise HTTPException(400,'Only positive transactions can be refund credits')
+    data=body.model_dump(exclude={'tag_ids'}); data['fingerprint']=hashlib.sha256(f'{body.account_id}|{body.date}|{body.amount}|{body.description.lower()}'.encode()).hexdigest()
+    t=Transaction(household_id=h,**data); db.add(t); db.flush(); db.add_all([TransactionTag(transaction_id=t.id,tag_id=tag_id) for tag_id in tag_ids]); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return dict(serialize(t),tags=[{'id':str(tag_id),'name':db.get(Tag,tag_id).name} for tag_id in tag_ids],tag_ids=[str(tag_id) for tag_id in tag_ids],splits=[])
 @app.patch('/api/v1/transactions/{transaction_id}')
 def update_transaction(transaction_id:UUID,body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     t=db.get(Transaction,transaction_id)

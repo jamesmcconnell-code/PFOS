@@ -1,12 +1,46 @@
 from datetime import date, timedelta
+from uuid import UUID
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import available_cash_planner, category_tracker, delete_category, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
-from app.schemas import CategoryDelete, TransactionDateUpdate, TransactionSplitsUpdate
+from app.schemas import CategoryDelete, ManualTransactionIn, TransactionDateUpdate, TransactionSplitsUpdate
+
+
+def test_manual_transaction_creation_persists_metadata_tags_and_account_balance():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='manual@example.com',display_name='Manual User',password_hash='x')
+    home=Household(name='Test household')
+    db.add_all([user,home]);db.flush()
+    db.add(HouseholdMember(household_id=home.id,user_id=user.id))
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=100)
+    groceries=Category(household_id=home.id,name='Groceries',kind='expense')
+    tag=Tag(household_id=home.id,name='Manual entry')
+    db.add_all([checking,groceries,tag]);db.commit()
+
+    result=add_transaction(ManualTransactionIn(
+        account_id=checking.id,date=date(2026,8,3),description='Farmers market',amount=-42.75,
+        category_id=groceries.id,owner_id=user.id,source_category='Cash',notes='Weekly produce',
+        is_essential=True,is_expected=True,is_prorated=True,proration_months=1,tag_ids=[tag.id],
+    ),user,db)
+
+    created=db.get(Transaction,UUID(result['id']))
+    assert created.description=='Farmers market'
+    assert float(created.amount)==-42.75
+    assert created.category_id==groceries.id
+    assert created.owner_id==user.id
+    assert created.source_category=='Cash'
+    assert created.notes=='Weekly produce'
+    assert created.is_essential and created.is_expected and created.is_prorated
+    assert created.proration_months==1
+    assert float(db.get(Account,checking.id).balance)==57.25
+    assert result['tag_ids']==[str(tag.id)]
+    assert db.scalar(select(TransactionTag).where(TransactionTag.transaction_id==created.id,TransactionTag.tag_id==tag.id))
 
 
 def test_monthly_savings_uses_designated_credits_and_spending_net_cash_flow():

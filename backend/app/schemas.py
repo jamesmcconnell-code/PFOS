@@ -14,6 +14,24 @@ class ThemeUpdate(BaseModel): theme_preference: str
 class SimpleModeUpdate(BaseModel): simple_mode_enabled: bool
 class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
+class ManualTransactionIn(BaseModel):
+    account_id: UUID
+    date: date
+    description: str=Field(min_length=1,max_length=255)
+    amount: float
+    category_id: UUID|None=None
+    owner_id: UUID|None=None
+    source_category: str|None=Field(default=None,max_length=100)
+    notes: str|None=Field(default=None,max_length=2000)
+    is_essential: bool=False
+    is_recurring: bool=False
+    is_internal_transfer: bool=False
+    is_refund: bool=False
+    refund_included: bool=True
+    is_expected: bool=False
+    is_prorated: bool=False
+    proration_months: int=Field(default=12,ge=1,le=120)
+    tag_ids: list[UUID]=[]
 class TransactionTransferUpdate(BaseModel): is_internal_transfer: bool
 class TransactionCategoryUpdate(BaseModel): category_id: UUID|None=None
 class TransactionDateUpdate(BaseModel): date: date
