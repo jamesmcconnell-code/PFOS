@@ -1,0 +1,6 @@
+from alembic import op
+import sqlalchemy as sa
+revision='0026_recurring_income_rules';down_revision='0025_anticipated_rule_start';branch_labels=None;depends_on=None
+def upgrade():
+ op.create_table('recurring_planner_income_rules',sa.Column('id',sa.Uuid(),primary_key=True),sa.Column('household_id',sa.Uuid(),sa.ForeignKey('households.id',ondelete='CASCADE'),nullable=False),sa.Column('owner_id',sa.Uuid(),sa.ForeignKey('users.id',ondelete='SET NULL')),sa.Column('source_transaction_id',sa.Uuid(),sa.ForeignKey('transactions.id',ondelete='SET NULL')),sa.Column('account_id',sa.Uuid(),sa.ForeignKey('accounts.id',ondelete='CASCADE'),nullable=False),sa.Column('display_name',sa.String(120),nullable=False),sa.Column('source_description',sa.String(255)),sa.Column('expected_amount',sa.Numeric(14,2),nullable=False),sa.Column('cadence',sa.String(20),nullable=False),sa.Column('availability_day',sa.Integer(),nullable=False),sa.Column('effective_start_date',sa.Date(),nullable=False),sa.Column('is_active',sa.Boolean(),nullable=False),sa.Column('created_at',sa.DateTime(),nullable=False),sa.Column('updated_at',sa.DateTime(),nullable=False))
+def downgrade(): op.drop_table('recurring_planner_income_rules')

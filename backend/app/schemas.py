@@ -105,6 +105,10 @@ class PlannerIncomeAllocationUpdate(BaseModel):
     effective_period_start: date|None=None
     amount: float|None=Field(default=None,gt=0)
     note: str|None=Field(default=None,max_length=500)
+class PlannerIncomeRuleIn(BaseModel):
+    account_id: UUID; display_name: str=Field(min_length=1,max_length=120); expected_amount: float=Field(gt=0); cadence: str='twice_monthly'; availability_day: int=Field(default=1,ge=1,le=31); effective_start_date: date=Field(default_factory=date.today); source_description: str|None=None; owner_id: UUID|None=None; is_active: bool=True
+class PlannerIncomeRuleUpdate(BaseModel):
+    display_name: str|None=None; expected_amount: float|None=Field(default=None,gt=0); cadence: str|None=None; availability_day: int|None=Field(default=None,ge=1,le=31); effective_start_date: date|None=None; source_description: str|None=None; is_active: bool|None=None
 class GoalIn(BaseModel): name: str; type: str = 'custom'; target_amount: float=Field(gt=0); current_amount: float=Field(default=0,ge=0); target_date: date; funding_account_id: UUID|None=None
 class GoalUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
