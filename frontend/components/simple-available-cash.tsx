@@ -4,7 +4,7 @@ import { money } from '@/lib/api';
 
 type Props={data:any;rolling?:any;period:'paycheck'|'monthly';setPeriod:(value:'paycheck'|'monthly')=>void;anchorDate:string;setAnchorDate:(value:string)=>void;savingsRate:number;setSavingsRate:(value:number)=>void;toggleRefund:(refund:any,checked:boolean)=>void};
 export function SimpleAvailableCash({data,rolling,period,setPeriod,anchorDate,setAnchorDate,savingsRate,setSavingsRate,toggleRefund}:Props) {
-  const income=Number(data.paycheck_amount),actualAutomatedSavings=Number(data.automated_savings_amount),projectedAutomatedSavings=actualAutomatedSavings/.3*(savingsRate/100),free=income-Number(data.total_period_expenses),anticipated=Number(data.anticipated_expense_total||0);
+  const income=Number(data.paycheck_amount),actualAutomatedSavings=Number(data.automated_savings_amount),projectedAutomatedSavings=actualAutomatedSavings/.3*(savingsRate/100),free=income-Number(data.total_period_expenses),anticipated=Number(data.anticipated_expense_total||0),anticipatedPaychecks=data.anticipated_paychecks||[];
   const spokenFor=Math.min(100,Math.max(0,Number(data.total_period_expenses)/Math.max(income,1)*100));
   const presets=[['Save a little',15],['Balanced',30],['Super saver',45]] as const;
   return <div className="simple-mode mx-auto max-w-5xl"><header className="simple-hero"><span className="simple-sparkle">✦</span><p className="font-bold text-emerald-800">Your happy money snapshot</p><h1>Let’s make today feel easy.</h1><p>Simple numbers. Same smart PFOS math.</p></header>
