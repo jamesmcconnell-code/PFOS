@@ -268,6 +268,16 @@ def test_planner_expense_effective_date_moves_prorated_expense_without_changing_
     assert august_item['planner_effective_date']=='2026-08-01'
     assert db.get(Transaction,month_end_charge.id).date==date(2026,7,31)
 
+def test_planner_effective_date_moves_automated_savings_credit_without_changing_history():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='credit-effective-date@example.com',display_name='Planner Credit',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    savings=Account(household_id=home.id,name='Savings',type='savings',account_type='income',is_savings_direct_deposit=True,balance=0);db.add(savings);db.flush()
+    credit=Transaction(household_id=home.id,account_id=savings.id,date=date(2026,7,31),description='Savings deposit',amount=300);db.add(credit);db.commit()
+    update_transaction_planner_effective_date(credit.id,PlannerExpenseEffectiveDateUpdate(planner_effective_date=date(2026,8,1)),user,db)
+    assert available_cash_planner('monthly',date(2026,7,31),None,user,db)['automated_savings_amount']==0
+    assert available_cash_planner('monthly',date(2026,8,31),None,user,db)['automated_savings_amount']==300
+    assert db.get(Transaction,credit.id).date==date(2026,7,31)
+
 def test_starting_carryover_can_be_removed_only_from_its_active_scope():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     james=User(email='carryover-james@example.com',display_name='James',password_hash='x');bailey=User(email='carryover-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
