@@ -488,18 +488,25 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         paycheck+=amount; paycheck_sources.append({'id':str(source.id),'date':str(source.date),'available_period_start':str(start),'description':source.description,'account_name':account.name,'amount':amount,'allocation_type':'manual' if allocated is not None else ('late_payroll_default' if source.date!=start else 'posted_period'),'note':next((record.note for record in manual_income_allocations if record.source_transaction_id==source.id),None)})
     anticipated_paychecks=[]; reconciled_paychecks=[]
     income_rule_query=select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.is_active==True,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id))
+    used_income_ids=set()
     for rule in db.scalars(income_rule_query).all():
         if rule.effective_start_date>=end: continue
-        if rule.cadence=='twice_monthly' and start.day not in {1,16}: continue
-        if rule.cadence=='monthly' and start.day!=1: continue
-        if rule.cadence=='biweekly' and (start-rule.effective_start_date).days%14: continue
-        actual=next((item for item in income_candidates if item.account_id==rule.account_id and not item.is_internal_transfer and not item.is_refund and (not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)) and planner_period_start(period,item.planner_effective_date or default_paycheck_availability_start(item.date))==start),None)
-        if actual:
-            variance=float(actual.amount)-float(rule.expected_amount); reconciled_paychecks.append({'rule_id':str(rule.id),'actual_transaction_id':str(actual.id),'expected_amount':float(rule.expected_amount),'actual_amount':float(actual.amount),'variance':variance,'status':'actual'})
-            for source in paycheck_sources:
-                if source['id']==str(actual.id): source.update(allocation_type='reconciled_actual',expected_amount=float(rule.expected_amount),variance=variance)
-            continue
-        amount=float(rule.expected_amount); row={'id':f'anticipated-{rule.id}-{start}','description':rule.display_name,'date':None,'available_period_start':str(start),'account_name':'Anticipated','amount':amount,'allocation_type':'anticipated','status':'anticipated'};paycheck+=amount;paycheck_sources.append(row);anticipated_paychecks.append({'rule_id':str(rule.id),**row})
+        if rule.cadence=='twice_monthly': occurrences=[candidate for candidate in [start,start.replace(day=16)] if start<=candidate<end and candidate>=rule.effective_start_date]
+        elif rule.cadence=='monthly': occurrences=[start] if start.day==1 and start>=rule.effective_start_date else []
+        else:
+            occurrences=[]; cursor=rule.effective_start_date
+            while cursor<end:
+                if cursor>=start: occurrences.append(cursor)
+                cursor+=timedelta(days=14)
+        for occurrence in occurrences:
+            actual=next((item for item in income_candidates if item.id not in used_income_ids and item.account_id==rule.account_id and not item.is_internal_transfer and not item.is_refund and abs(float(item.amount)-float(rule.expected_amount))<=max(20,float(rule.expected_amount)*.25) and (not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)) and planner_period_start('paycheck',item.planner_effective_date or default_paycheck_availability_start(item.date))==planner_period_start('paycheck',occurrence)),None)
+            if actual:
+                used_income_ids.add(actual.id)
+                variance=float(actual.amount)-float(rule.expected_amount); reconciled_paychecks.append({'rule_id':str(rule.id),'actual_transaction_id':str(actual.id),'expected_amount':float(rule.expected_amount),'actual_amount':float(actual.amount),'variance':variance,'status':'actual'})
+                for source in paycheck_sources:
+                    if source['id']==str(actual.id): source.update(allocation_type='reconciled_actual',expected_amount=float(rule.expected_amount),variance=variance)
+                continue
+            amount=float(rule.expected_amount); row={'id':f'anticipated-{rule.id}-{occurrence}','description':rule.display_name,'date':None,'available_period_start':str(occurrence),'account_name':'Anticipated','amount':amount,'allocation_type':'anticipated','status':'anticipated'};paycheck+=amount;paycheck_sources.append(row);anticipated_paychecks.append({'rule_id':str(rule.id),**row})
     for allocation in transaction_allocation_rows(transactions_in_period,db,view_user_id):
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         effective_date=planner_effective_date(item)
@@ -787,11 +794,11 @@ def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None
     if not t or t.household_id!=h or float(t.amount)<=0 or t.is_pending or t.is_internal_transfer or t.is_refund: raise HTTPException(400,'Transaction is not an eligible paycheck credit')
     account=db.get(Account,t.account_id);loan_tag=db.scalar(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement'))
     if not account or account.account_type!='spending' or (loan_tag and db.scalar(select(TransactionTag.transaction_id).where(TransactionTag.transaction_id==t.id,TransactionTag.tag_id==loan_tag))): raise HTTPException(400,'Transaction is not an eligible paycheck credit')
-    values={'account_id':t.account_id,'display_name':t.description[:120],'expected_amount':float(t.amount),'cadence':'twice_monthly','availability_day':1,'effective_start_date':date.today(),'source_description':t.description};validate_income_rule(h,values,view_user_id,db)
+    rule_owner=view_user_id or (account.owner_id if account.ownership=='individual' else None); values={'account_id':t.account_id,'display_name':t.description[:120],'expected_amount':float(t.amount),'cadence':'twice_monthly','availability_day':1,'effective_start_date':date.today(),'source_description':t.description};validate_income_rule(h,values,rule_owner,db)
     row=db.scalar(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.source_transaction_id==t.id))
     if row:
         for key,value in values.items():setattr(row,key,value)
-    else: row=RecurringPlannerIncomeRule(household_id=h,owner_id=view_user_id,source_transaction_id=t.id,**values);db.add(row)
+    else: row=RecurringPlannerIncomeRule(household_id=h,owner_id=rule_owner,source_transaction_id=t.id,**values);db.add(row)
     db.commit();return serialize(row)
 
 @app.get('/api/v1/categories')
