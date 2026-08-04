@@ -67,6 +67,7 @@ class PlannerExpenseRuleIn(BaseModel):
     display_name: str=Field(min_length=1,max_length=120)
     monthly_projected_amount: float=Field(gt=0)
     expected_day_of_month: int=Field(ge=1,le=31)
+    effective_start_date: date=Field(default_factory=date.today)
     category_id: UUID|None=None
     owner_id: UUID|None=None
     proration_months: int=Field(default=1,ge=1,le=120)
@@ -75,6 +76,7 @@ class PlannerExpenseRuleUpdate(BaseModel):
     display_name: str|None=Field(default=None,min_length=1,max_length=120)
     monthly_projected_amount: float|None=Field(default=None,gt=0)
     expected_day_of_month: int|None=Field(default=None,ge=1,le=31)
+    effective_start_date: date|None=None
     category_id: UUID|None=None
     owner_id: UUID|None=None
     proration_months: int|None=Field(default=None,ge=1,le=120)

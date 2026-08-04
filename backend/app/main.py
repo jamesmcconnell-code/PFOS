@@ -541,6 +541,10 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     # providing this period's allocation. This keeps imported actuals authoritative.
     actual_candidates=[item for item in transactions_in_period if start<=planner_effective_date(item)<end and planner_effective_date(item)<=anchor and float(item.amount)<0 and not item.is_internal_transfer]
     for rule in expense_rules:
+        # A rule begins forecasting only once its activation date reaches the
+        # selected period. This keeps a newly configured rule out of history.
+        effective_start=rule.effective_start_date or rule.created_at.date()
+        if end<=effective_start: continue
         actual=next((item for item in active_prorated if planner_expense_rule_matches(rule,item)),None)
         actual=actual or next((item for item in actual_candidates if planner_expense_rule_matches(rule,item)),None)
         if actual:
@@ -581,7 +585,7 @@ def create_planner_expense_rule_from_transaction(transaction_id:UUID,user=Depend
     if float(transaction.amount)>=0 or not transaction.is_expected or not transaction.is_prorated: raise HTTPException(400,'Only negative Expected + Prorated transactions can create anticipated expense rules')
     account=db.get(Account,transaction.account_id); duration=max(1,int(transaction.proration_months or 1)); monthly_amount=abs(float(transaction.amount))/duration
     rule=db.scalar(select(RecurringPlannerExpenseRule).where(RecurringPlannerExpenseRule.household_id==h,RecurringPlannerExpenseRule.source_transaction_id==transaction.id))
-    values={'account_id':transaction.account_id,'category_id':transaction.category_id,'owner_id':account.owner_id,'display_name':transaction.description[:120],'source_description':transaction.description,'monthly_projected_amount':monthly_amount,'expected_day_of_month':transaction.date.day,'cadence':'monthly','is_active':True,'proration_months':duration}
+    values={'account_id':transaction.account_id,'category_id':transaction.category_id,'owner_id':account.owner_id,'display_name':transaction.description[:120],'source_description':transaction.description,'monthly_projected_amount':monthly_amount,'expected_day_of_month':transaction.date.day,'effective_start_date':date.today(),'cadence':'monthly','is_active':True,'proration_months':duration}
     if rule:
         for field,value in values.items(): setattr(rule,field,value)
     else:

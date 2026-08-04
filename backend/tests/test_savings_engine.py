@@ -278,6 +278,14 @@ def test_planner_effective_date_moves_automated_savings_credit_without_changing_
     assert available_cash_planner('monthly',date(2026,8,31),None,user,db)['automated_savings_amount']==300
     assert db.get(Transaction,credit.id).date==date(2026,7,31)
 
+def test_anticipated_rule_does_not_project_into_periods_before_its_start_date():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='rule-start@example.com',display_name='Rule Start',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    rule=RecurringPlannerExpenseRule(household_id=home.id,account_id=checking.id,display_name='Zelle',monthly_projected_amount=50,expected_day_of_month=1,effective_start_date=date(2026,8,3),proration_months=1);db.add(rule);db.commit()
+    assert available_cash_planner('monthly',date(2026,7,31),None,user,db)['anticipated_expense_total']==0
+    assert available_cash_planner('monthly',date(2026,8,31),None,user,db)['anticipated_expense_total']==50
+
 def test_starting_carryover_can_be_removed_only_from_its_active_scope():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     james=User(email='carryover-james@example.com',display_name='James',password_hash='x');bailey=User(email='carryover-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
