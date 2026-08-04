@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date, update_transaction_planner_effective_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date, update_transaction_planner_effective_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, TransactionDateUpdate, TransactionSplitsUpdate
 
@@ -400,3 +400,37 @@ def test_only_prorated_refund_credits_are_spread_across_paycheck_periods():
     assert first['refund_expense_offset']==50
     assert second['refund_expense_offset']==110
     assert monthly['refund_expense_offset']==160
+
+def test_twice_monthly_income_rule_projects_once_per_paycheck_and_twice_per_month():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='anticipated-income-periods@example.com',display_name='Income periods',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    db.add(RecurringPlannerIncomeRule(household_id=home.id,account_id=checking.id,display_name='Payroll',source_description='Payroll',expected_amount=1916.56,cadence='twice_monthly',availability_day=1,effective_start_date=date(2026,8,1)));db.commit()
+
+    first=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
+    second=available_cash_planner('paycheck',date(2026,8,20),None,user,db)
+    monthly=available_cash_planner('monthly',date(2026,8,20),None,user,db)
+
+    assert [row['available_period_start'] for row in first['anticipated_paychecks']]==['2026-08-01']
+    assert [row['available_period_start'] for row in second['anticipated_paychecks']]==['2026-08-16']
+    assert [row['available_period_start'] for row in monthly['anticipated_paychecks']]==['2026-08-01','2026-08-16']
+    assert first['paycheck_amount']==1916.56
+    assert second['paycheck_amount']==1916.56
+    assert monthly['paycheck_amount']==3833.12
+
+def test_paycheck_rule_creation_deduplicates_by_scoped_payroll_identity():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='income-rule-dedupe@example.com',display_name='Income dedupe',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,owner_id=user.id,ownership='individual',name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    older=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,13),description='INFOSYS NOVA HOL PAYROLL',amount=1916.55)
+    newer=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='  infosys  nova hol payroll  ',amount=1916.56)
+    db.add_all([older,newer]);db.commit()
+
+    first=income_rule_from_transaction(older.id,None,user,db)
+    second=income_rule_from_transaction(newer.id,None,user,db)
+    rules=db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==home.id)).all()
+
+    assert first['id']==second['id']
+    assert len(rules)==1
+    assert float(rules[0].expected_amount)==1916.56
+    assert rules[0].source_transaction_id==newer.id

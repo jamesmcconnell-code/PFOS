@@ -491,7 +491,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     used_income_ids=set()
     for rule in db.scalars(income_rule_query).all():
         if rule.effective_start_date>=end: continue
-        if rule.cadence=='twice_monthly': occurrences=[candidate for candidate in [start,start.replace(day=16)] if start<=candidate<end and candidate>=rule.effective_start_date]
+        if rule.cadence=='twice_monthly': occurrences=[start] if period=='paycheck' else [candidate for candidate in [start,start.replace(day=16)] if candidate>=rule.effective_start_date]
         elif rule.cadence=='monthly': occurrences=[start] if start.day==1 and start>=rule.effective_start_date else []
         else:
             occurrences=[]; cursor=rule.effective_start_date
@@ -770,12 +770,24 @@ def validate_income_rule(h, values, view_user_id, db):
     if not account or account.household_id!=h or account.account_type!='spending': raise HTTPException(400,'Select a spending account')
     if view_user_id and (account.ownership!='individual' or account.owner_id!=view_user_id): raise HTTPException(400,'Account is outside selected user view')
     return account
+def matching_income_rule(h, owner_id, account_id, source_description, db):
+    """Find a recurring paycheck rule by its stable payroll identity, not an imported transaction id."""
+    target=normalized_description(source_description)
+    if not target: return None
+    rows=db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.owner_id==owner_id,RecurringPlannerIncomeRule.account_id==account_id).order_by(RecurringPlannerIncomeRule.created_at.desc())).all()
+    return next((row for row in rows if normalized_description(row.source_description or row.display_name)==target),None)
 @app.get('/api/v1/planner-income-rules')
 def planner_income_rules(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);validate_view_member(h,view_user_id,db);return [serialize(x) for x in db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id))).all()]
 @app.post('/api/v1/planner-income-rules')
 def add_planner_income_rule(body:PlannerIncomeRuleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db);validate_view_member(h,view_user_id,db);values=body.model_dump();validate_income_rule(h,values,view_user_id,db);row=RecurringPlannerIncomeRule(household_id=h,owner_id=view_user_id,**values);db.add(row);db.commit();return serialize(row)
+    h=household(user,db);validate_view_member(h,view_user_id,db);values=body.model_dump();values.pop('owner_id',None);validate_income_rule(h,values,view_user_id,db)
+    source_identity=values.get('source_description') or values['display_name']; row=matching_income_rule(h,view_user_id,values['account_id'],source_identity,db)
+    if row:
+        for key,value in values.items(): setattr(row,key,value)
+    else:
+        row=RecurringPlannerIncomeRule(household_id=h,owner_id=view_user_id,**values);db.add(row)
+    db.commit();return serialize(row)
 @app.patch('/api/v1/planner-income-rules/{rule_id}')
 def update_planner_income_rule(rule_id:UUID,body:PlannerIncomeRuleUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);row=db.get(RecurringPlannerIncomeRule,rule_id)
@@ -795,9 +807,10 @@ def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None
     account=db.get(Account,t.account_id);loan_tag=db.scalar(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement'))
     if not account or account.account_type!='spending' or (loan_tag and db.scalar(select(TransactionTag.transaction_id).where(TransactionTag.transaction_id==t.id,TransactionTag.tag_id==loan_tag))): raise HTTPException(400,'Transaction is not an eligible paycheck credit')
     rule_owner=view_user_id or (account.owner_id if account.ownership=='individual' else None); values={'account_id':t.account_id,'display_name':t.description[:120],'expected_amount':float(t.amount),'cadence':'twice_monthly','availability_day':1,'effective_start_date':date.today(),'source_description':t.description};validate_income_rule(h,values,rule_owner,db)
-    row=db.scalar(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.source_transaction_id==t.id))
+    row=matching_income_rule(h,rule_owner,t.account_id,t.description,db)
     if row:
         for key,value in values.items():setattr(row,key,value)
+        row.source_transaction_id=t.id
     else: row=RecurringPlannerIncomeRule(household_id=h,owner_id=rule_owner,source_transaction_id=t.id,**values);db.add(row)
     db.commit();return serialize(row)
 
