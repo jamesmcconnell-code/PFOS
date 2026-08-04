@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from app.database import Base
 from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date, update_transaction_planner_effective_date
-from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, TransactionDateUpdate, TransactionSplitsUpdate
 
 
