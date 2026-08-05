@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, replace_transaction_splits, reports, update_planner_income_rule, update_transaction_date, update_transaction_planner_effective_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, planner_period_start, replace_transaction_splits, reports, update_planner_income_rule, update_transaction_date, update_transaction_planner_effective_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, TransactionDateUpdate, TransactionSplitsUpdate
 
@@ -305,10 +305,10 @@ def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
     checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
     db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,1),amount=100),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,7,31),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,3),description='Bill',amount=-300),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,17),description='Bill',amount=-200),PlannerAdjustment(household_id=home.id,period_type='paycheck',effective_period_start=date(2026,8,16),amount=-50,note='Cash withdrawal')]);db.commit()
     result=planner_cash_history(home.id,'paycheck',date(2026,8,20),None,user,db)
-    assert result['history'][-2]['ending_rolling_available_cash']==800
+    assert result['history'][-2]['ending_rolling_available_cash']==100
     assert result['current']['free_spending']==800
     assert result['current']['manual_adjustments']==-50
-    assert result['current']['ending_rolling_available_cash']==1550
+    assert result['current']['ending_rolling_available_cash']==850
 
 def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolation():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
@@ -319,10 +319,23 @@ def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolati
     joint_result=planner_cash_history(home.id,'monthly',date(2026,8,2),None,james,db)
     assert joint_result['current']['anticipated_expenses']==120
     assert joint_result['current']['total_period_expenses']==70
-    assert joint_result['current']['ending_rolling_available_cash']==1030
+    assert joint_result['current']['ending_rolling_available_cash']==100
     bailey_result=planner_cash_history(home.id,'monthly',date(2026,8,2),bailey.id,james,db)
     assert bailey_result['current']['manual_adjustments']==500
     assert joint_result['current']['manual_adjustments']==0
+
+def test_open_planner_period_shows_free_spending_without_rolling_it_forward():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='open-period@example.com',display_name='Open period',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    start=planner_period_start('paycheck',date.today()); previous_start=start.replace(day=1) if start.day==16 else (start-timedelta(days=1)).replace(day=16)
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='paycheck',effective_period_start=previous_start,amount=100),Transaction(household_id=home.id,account_id=checking.id,date=previous_start-timedelta(days=1),description='Prior pay',amount=500),Transaction(household_id=home.id,account_id=checking.id,date=start-timedelta(days=1),description='Current pay',amount=500)]);db.commit()
+    result=planner_cash_history(home.id,'paycheck',date.today(),None,user,db)
+    current=result['current']
+    assert current['free_spending']==500
+    assert current['free_spending_included'] is False
+    assert current['included_free_spending']==0
+    assert current['ending_rolling_available_cash']==600
 
 def test_rolling_cash_virtual_ceiling_sweeps_prioritized_goals_without_mutating_them():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()

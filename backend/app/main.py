@@ -684,6 +684,9 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
             if remaining>0 and not goal.is_complete:
                 account=db.get(Account,goal.funding_account_id) if goal.funding_account_id else None
                 goal_state.append({'id':str(goal.id),'name':goal.name,'remaining':remaining,'funding_account_id':str(goal.funding_account_id) if goal.funding_account_id else None,'funding_account_name':account.name if account else None})
+    # The live period is still in progress: show its Free Spending as a planning
+    # figure, but do not treat the unspent remainder as carried cash yet.
+    live_period_start=planner_period_start(period_type,date.today())
     running=0.0; history=[]
     while cursor<=target:
         opening=openings.get(cursor)
@@ -691,8 +694,10 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
         next_cursor=next_planner_period_start(period_type,cursor); evaluation_anchor=anchor if cursor==target else next_cursor-timedelta(days=1)
         planner=available_cash_planner(period_type,evaluation_anchor,view_user_id,user,db)
         free=float(planner['paycheck_amount'])-float(planner['total_period_expenses'])
+        free_spending_included=cursor!=live_period_start
+        included_free_spending=free if free_spending_included else 0.0
         period_adjustments=adjustments.get(cursor,[]); adjustment_total=sum(float(item.amount) for item in period_adjustments)
-        previous=running; running=previous+free+adjustment_total; ending_before_goal_sweeps=running; goal_sweeps=[]
+        previous=running; running=previous+included_free_spending+adjustment_total; ending_before_goal_sweeps=running; goal_sweeps=[]
         excess=max(0,running-ceiling) if goal_state else 0
         for goal in goal_state:
             if excess<=0: break
@@ -700,7 +705,7 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
             if allocation<=0: continue
             goal['remaining']-=allocation; excess-=allocation; running-=allocation
             goal_sweeps.append({**{key:value for key,value in goal.items() if key!='remaining'},'amount':allocation,'status':'forecast'})
-        history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'refund_credits':float(planner['refund_expense_offset']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_before_goal_sweeps':ending_before_goal_sweeps,'goal_sweep_total':sum(item['amount'] for item in goal_sweeps),'goal_sweeps':goal_sweeps,'ending_rolling_available_cash':running})
+        history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'refund_credits':float(planner['refund_expense_offset']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'free_spending_included':free_spending_included,'included_free_spending':included_free_spending,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_before_goal_sweeps':ending_before_goal_sweeps,'goal_sweep_total':sum(item['amount'] for item in goal_sweeps),'goal_sweeps':goal_sweeps,'ending_rolling_available_cash':running})
         cursor=next_cursor
     return {'period_type':period_type,'anchor_date':str(anchor),'scope_user_id':str(view_user_id) if view_user_id else None,'history':history[-limit:],'current':history[-1] if history else None}
 
