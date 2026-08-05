@@ -420,6 +420,29 @@ def planner_effective_date(item: Transaction) -> date:
     """Use the optional planner assignment without changing transaction history."""
     return item.planner_effective_date or item.date
 def normalized_description(value: str|None): return ' '.join((value or '').lower().split())
+def next_income_rule_occurrence(rule, after: date|None=None):
+    """Return the next planner availability date without changing forecast math."""
+    cursor=max(after or date.today(),rule.effective_start_date)
+    if rule.effective_end_date and cursor>rule.effective_end_date: return None
+    if rule.cadence=='twice_monthly':
+        candidates=[cursor.replace(day=1),cursor.replace(day=16)]
+        if cursor.month==12: candidates.append(date(cursor.year+1,1,1))
+        else: candidates.append(date(cursor.year,cursor.month+1,1))
+        result=next(candidate for candidate in candidates if candidate>=cursor)
+    elif rule.cadence=='monthly':
+        result=cursor.replace(day=1) if cursor.day==1 else (cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
+    else:
+        result=rule.effective_start_date
+        while result<cursor: result+=timedelta(days=14)
+    return result if not rule.effective_end_date or result<=rule.effective_end_date else None
+def serialize_income_rule(rule, db: Session):
+    """Supply the manager with display metadata and a read-only reconciliation preview."""
+    row=serialize(rule); account=db.get(Account,rule.account_id); owner=db.get(User,rule.owner_id) if rule.owner_id else None
+    row.update(account_name=account.name if account else 'Unknown account',owner_name=owner.display_name if owner else 'Joint household',scope='individual' if owner else 'joint',next_occurrence=str(next_income_rule_occurrence(rule)) if rule.is_active and next_income_rule_occurrence(rule) else None,match_tolerance=max(20.0,float(rule.expected_amount)*.25))
+    candidates=db.scalars(select(Transaction).where(Transaction.household_id==rule.household_id,Transaction.account_id==rule.account_id,Transaction.amount>0,Transaction.is_pending==False,Transaction.is_internal_transfer==False,Transaction.is_refund==False).order_by(Transaction.date.desc())).all()
+    actual=next((item for item in candidates if not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)),None)
+    row['recent_reconciliation']=None if not actual else {'actual_transaction_id':str(actual.id),'actual_amount':float(actual.amount),'expected_amount':float(rule.expected_amount),'variance':float(actual.amount)-float(rule.expected_amount),'within_tolerance':abs(float(actual.amount)-float(rule.expected_amount))<=row['match_tolerance'],'available_period_start':str(actual.planner_effective_date or default_paycheck_availability_start(actual.date)),'posted_date':str(actual.date)}
+    return row
 def planner_expense_rule_matches(rule, item):
     """Prefer source identity; use account/category plus a bounded amount fallback."""
     if float(item.amount)>=0 or item.is_internal_transfer or item.account_id!=rule.account_id: return False
@@ -487,7 +510,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if (allocated is None and effective_start!=start) or amount<=0: continue
         paycheck+=amount; paycheck_sources.append({'id':str(source.id),'date':str(source.date),'available_period_start':str(start),'description':source.description,'account_name':account.name,'amount':amount,'allocation_type':'manual' if allocated is not None else ('late_payroll_default' if source.date!=start else 'posted_period'),'note':next((record.note for record in manual_income_allocations if record.source_transaction_id==source.id),None)})
     anticipated_paychecks=[]; reconciled_paychecks=[]
-    income_rule_query=select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.is_active==True,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id))
+    income_rule_query=select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id),or_(RecurringPlannerIncomeRule.is_active==True,RecurringPlannerIncomeRule.effective_end_date>=start),RecurringPlannerIncomeRule.effective_start_date<end,or_(RecurringPlannerIncomeRule.effective_end_date.is_(None),RecurringPlannerIncomeRule.effective_end_date>=start))
     used_income_ids=set()
     for rule in db.scalars(income_rule_query).all():
         if rule.effective_start_date>=end: continue
@@ -499,6 +522,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 if cursor>=start: occurrences.append(cursor)
                 cursor+=timedelta(days=14)
         for occurrence in occurrences:
+            if rule.effective_end_date and occurrence>rule.effective_end_date: continue
             actual=next((item for item in income_candidates if item.id not in used_income_ids and item.account_id==rule.account_id and not item.is_internal_transfer and not item.is_refund and abs(float(item.amount)-float(rule.expected_amount))<=max(20,float(rule.expected_amount)*.25) and (not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)) and planner_period_start('paycheck',item.planner_effective_date or default_paycheck_availability_start(item.date))==planner_period_start('paycheck',occurrence)),None)
             if actual:
                 used_income_ids.add(actual.id)
@@ -775,10 +799,10 @@ def matching_income_rule(h, owner_id, account_id, source_description, db):
     target=normalized_description(source_description)
     if not target: return None
     rows=db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,RecurringPlannerIncomeRule.owner_id==owner_id,RecurringPlannerIncomeRule.account_id==account_id).order_by(RecurringPlannerIncomeRule.created_at.desc())).all()
-    return next((row for row in rows if normalized_description(row.source_description or row.display_name)==target),None)
+    return next((row for row in rows if row.is_active and (not row.effective_end_date or row.effective_end_date>=date.today()) and normalized_description(row.source_description or row.display_name)==target),None)
 @app.get('/api/v1/planner-income-rules')
 def planner_income_rules(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db);validate_view_member(h,view_user_id,db);return [serialize(x) for x in db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id))).all()]
+    h=household(user,db);validate_view_member(h,view_user_id,db);query=select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id),or_(RecurringPlannerIncomeRule.is_active==False,and_(RecurringPlannerIncomeRule.is_active==True,or_(RecurringPlannerIncomeRule.effective_end_date.is_(None),RecurringPlannerIncomeRule.effective_end_date>=date.today())))).order_by(RecurringPlannerIncomeRule.created_at.desc());return [serialize_income_rule(x,db) for x in db.scalars(query).all()]
 @app.post('/api/v1/planner-income-rules')
 def add_planner_income_rule(body:PlannerIncomeRuleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);validate_view_member(h,view_user_id,db);values=body.model_dump();values.pop('owner_id',None);validate_income_rule(h,values,view_user_id,db)
@@ -787,19 +811,32 @@ def add_planner_income_rule(body:PlannerIncomeRuleIn,view_user_id:UUID|None=None
         for key,value in values.items(): setattr(row,key,value)
     else:
         row=RecurringPlannerIncomeRule(household_id=h,owner_id=view_user_id,**values);db.add(row)
-    db.commit();return serialize(row)
+    db.commit();return serialize_income_rule(row,db)
 @app.patch('/api/v1/planner-income-rules/{rule_id}')
 def update_planner_income_rule(rule_id:UUID,body:PlannerIncomeRuleUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);row=db.get(RecurringPlannerIncomeRule,rule_id)
     if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Paycheck rule not found')
-    values={**serialize(row),**body.model_dump(exclude_unset=True)};validate_income_rule(h,values,view_user_id,db)
-    for key,value in body.model_dump(exclude_unset=True).items(): setattr(row,key,value)
-    db.commit();return serialize(row)
+    changes=body.model_dump(exclude_unset=True); effective_start=changes.pop('effective_start_date',date.today())
+    if effective_start<date.today(): raise HTTPException(400,'Expected paycheck changes can begin today or in a future period')
+    if changes.get('is_active') is False:
+        row.is_active=False;row.effective_end_date=date.today()-timedelta(days=1);db.commit();return serialize_income_rule(row,db)
+    values={'account_id':row.account_id,'cadence':row.cadence,**changes,'effective_start_date':effective_start};validate_income_rule(h,values,view_user_id,db)
+    if row.effective_start_date>=effective_start:
+        for key,value in changes.items(): setattr(row,key,value)
+        row.effective_start_date=effective_start;row.effective_end_date=None;row.is_active=True;successor=row
+    else:
+        row.effective_end_date=effective_start-timedelta(days=1)
+        copied={key:getattr(row,key) for key in ('account_id','display_name','expected_amount','cadence','availability_day','source_description','source_transaction_id')}
+        copied.update(changes); copied.update(effective_start_date=effective_start,effective_end_date=None,is_active=True)
+        successor=RecurringPlannerIncomeRule(household_id=h,owner_id=view_user_id,**copied);db.add(successor)
+    db.commit();return serialize_income_rule(successor,db)
 @app.delete('/api/v1/planner-income-rules/{rule_id}',status_code=204)
 def delete_planner_income_rule(rule_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);row=db.get(RecurringPlannerIncomeRule,rule_id)
     if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Paycheck rule not found')
-    db.delete(row);db.commit()
+    if row.effective_start_date>=date.today(): db.delete(row)
+    else: row.effective_end_date=date.today()-timedelta(days=1)
+    db.commit()
 @app.post('/api/v1/planner-income-rules/from-transaction/{transaction_id}')
 def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);validate_view_member(h,view_user_id,db);t=db.get(Transaction,transaction_id)
@@ -812,7 +849,7 @@ def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None
         for key,value in values.items():setattr(row,key,value)
         row.source_transaction_id=t.id
     else: row=RecurringPlannerIncomeRule(household_id=h,owner_id=rule_owner,source_transaction_id=t.id,**values);db.add(row)
-    db.commit();return serialize(row)
+    db.commit();return serialize_income_rule(row,db)
 
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):

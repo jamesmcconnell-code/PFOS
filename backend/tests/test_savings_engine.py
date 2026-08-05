@@ -5,9 +5,9 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, replace_transaction_splits, reports, update_transaction_date, update_transaction_planner_effective_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, replace_transaction_splits, reports, update_planner_income_rule, update_transaction_date, update_transaction_planner_effective_date
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
-from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, TransactionDateUpdate, TransactionSplitsUpdate
+from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, TransactionDateUpdate, TransactionSplitsUpdate
 
 
 def test_manual_transaction_creation_persists_metadata_tags_and_account_balance():
@@ -434,3 +434,19 @@ def test_paycheck_rule_creation_deduplicates_by_scoped_payroll_identity():
     assert len(rules)==1
     assert float(rules[0].expected_amount)==1916.56
     assert rules[0].source_transaction_id==newer.id
+
+def test_paycheck_rule_edit_creates_a_future_successor_without_rewriting_history():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='income-rule-history@example.com',display_name='Income history',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    start=date.today().replace(day=1); rule=RecurringPlannerIncomeRule(household_id=home.id,account_id=checking.id,display_name='Payroll',source_description='Payroll',expected_amount=1000,cadence='twice_monthly',availability_day=1,effective_start_date=start);db.add(rule);db.commit()
+
+    successor=update_planner_income_rule(rule.id,PlannerIncomeRuleUpdate(expected_amount=1200,effective_start_date=date.today()),None,user,db)
+    rows=db.scalars(select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==home.id).order_by(RecurringPlannerIncomeRule.effective_start_date)).all()
+
+    assert len(rows)==2
+    assert rows[0].effective_end_date==date.today()-timedelta(days=1)
+    assert float(rows[0].expected_amount)==1000
+    assert rows[1].effective_start_date==date.today()
+    assert float(rows[1].expected_amount)==1200
+    assert successor['next_occurrence']
