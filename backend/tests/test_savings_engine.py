@@ -564,11 +564,95 @@ def test_biweekly_expected_paycheck_reconciles_actual_and_prorates_expenses_and_
     assert reconciled['reconciled_paychecks'][0]['variance']==50
 
 
-def test_biweekly_planner_is_individual_only_and_does_not_change_semimonthly_fallback():
+def test_joint_biweekly_display_is_available_and_semimonthly_fallback_is_unchanged():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     user=User(email='biweekly-scope@example.com',display_name='User',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.commit()
-    with pytest.raises(HTTPException):
-        available_cash_planner('biweekly',date(2026,8,8),None,user,db)
+    joint=available_cash_planner('biweekly',date(2026,8,8),None,user,db)
+    assert joint['joint_display_cadence']=='biweekly'
     fallback=available_cash_planner('paycheck',date(2026,8,8),user.id,user,db)
     assert fallback['period_start']=='2026-08-01'
     assert fallback['period_end']=='2026-08-15'
+
+
+def test_joint_planner_normalizes_expected_income_to_each_display_cadence_and_keeps_member_scope_isolated():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='joint-james@example.com',display_name='James',password_hash='x');bailey=User(email='joint-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
+    james_checking=Account(household_id=home.id,owner_id=james.id,ownership='individual',name='James checking',type='checking',account_type='spending',balance=0)
+    bailey_checking=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0)
+    db.add_all([james_checking,bailey_checking]);db.flush()
+    db.add_all([
+        PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period'),
+        RecurringPlannerIncomeRule(household_id=home.id,owner_id=james.id,account_id=james_checking.id,display_name='James payroll',source_description='James payroll',expected_amount=2000,cadence='twice_monthly',availability_day=1,effective_start_date=date(2026,1,1)),
+        RecurringPlannerIncomeRule(household_id=home.id,owner_id=bailey.id,account_id=bailey_checking.id,display_name='Bailey payroll',source_description='Bailey payroll',expected_amount=1000,cadence='biweekly',availability_day=1,effective_start_date=date(2026,1,1)),
+        Transaction(household_id=home.id,account_id=james_checking.id,date=date(2026,8,8),description='One-month bill',amount=-120,is_prorated=True,proration_months=1),
+    ]);db.commit()
+
+    semi=available_cash_planner('paycheck',date(2026,8,8),None,james,db)
+    semi_amounts={row['source_owner_name']:row['amount'] for row in semi['anticipated_paychecks']}
+    assert semi['joint_display_cadence']=='semimonthly'
+    assert semi_amounts=={'James':2000,'Bailey':pytest.approx(26000/24)}
+    assert abs(semi['prorated_expenses']-60)<.001
+    assert all(row['income_status']=='normalized_anticipated' for row in semi['anticipated_paychecks'])
+
+    biweekly=available_cash_planner('biweekly',date(2026,8,8),None,james,db)
+    biweekly_amounts={row['source_owner_name']:row['amount'] for row in biweekly['anticipated_paychecks']}
+    assert biweekly['joint_display_cadence']=='biweekly'
+    assert biweekly_amounts=={'James':pytest.approx(48000/26),'Bailey':1000}
+    assert abs(biweekly['prorated_expenses']-(120*12/26))<.001
+
+    monthly=available_cash_planner('monthly',date(2026,8,8),None,james,db)
+    monthly_amounts={row['source_owner_name']:row['amount'] for row in monthly['anticipated_paychecks']}
+    assert monthly['joint_display_cadence']=='monthly'
+    assert monthly_amounts=={'James':4000,'Bailey':pytest.approx(26000/12)}
+    assert abs(monthly['prorated_expenses']-120)<.001
+
+    bailey_only=available_cash_planner('biweekly',date(2026,8,8),bailey.id,james,db)
+    assert bailey_only['paycheck_amount']==1000
+    assert len(bailey_only['anticipated_paychecks'])==1
+
+
+def test_joint_actual_and_manual_income_replace_normalized_expectations_without_changing_source_values():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='joint-reconcile-james@example.com',display_name='James',password_hash='x');bailey=User(email='joint-reconcile-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
+    bailey_checking=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add(bailey_checking);db.flush()
+    db.add_all([
+        PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period'),
+        RecurringPlannerIncomeRule(household_id=home.id,owner_id=bailey.id,account_id=bailey_checking.id,display_name='Bailey payroll',source_description='Bailey payroll',expected_amount=1000,cadence='biweekly',availability_day=1,effective_start_date=date(2026,1,1)),
+    ]);db.commit()
+
+    actual=Transaction(household_id=home.id,account_id=bailey_checking.id,date=date(2026,8,8),description='Bailey payroll',amount=900)
+    db.add(actual);db.commit()
+    reconciled=available_cash_planner('paycheck',date(2026,8,8),None,james,db)
+    assert reconciled['paycheck_amount']==900
+    assert reconciled['anticipated_paychecks']==[]
+    assert reconciled['reconciled_paychecks'][0]['status']=='actual'
+    assert reconciled['reconciled_paychecks'][0]['expected_amount']==pytest.approx(26000/24)
+    assert reconciled['reconciled_paychecks'][0]['actual_amount']==900
+    assert float(db.get(Transaction,actual.id).amount)==900
+
+    db.delete(actual);db.flush()
+    manual_source=Transaction(household_id=home.id,account_id=bailey_checking.id,date=date(2026,8,20),description='Bailey payroll',amount=1000)
+    db.add(manual_source);db.flush()
+    db.add(PlannerIncomeAllocation(household_id=home.id,owner_id=bailey.id,source_transaction_id=manual_source.id,period_type='biweekly',effective_period_start=date(2026,8,1),amount=700));db.commit()
+    manual=available_cash_planner('paycheck',date(2026,8,8),None,james,db)
+    assert manual['paycheck_amount']==700
+    assert manual['anticipated_paychecks']==[]
+    assert manual['reconciled_paychecks'][0]['status']=='manual'
+    assert manual['reconciled_paychecks'][0]['actual_amount']==700
+    assert float(db.get(Transaction,manual_source.id).amount)==1000
+
+
+def test_joint_biweekly_rolling_history_isolated_from_member_history():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='joint-roll-james@example.com',display_name='James',password_hash='x');bailey=User(email='joint-roll-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
+    db.add(PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period'));db.commit()
+    joint_period=date.fromisoformat(available_cash_planner('biweekly',date(2026,8,8),None,james,db)['period_start'])
+    db.add_all([
+        PlannerStartingCarryover(household_id=home.id,owner_id=None,period_type='biweekly',effective_period_start=joint_period,amount=100),
+        PlannerStartingCarryover(household_id=home.id,owner_id=bailey.id,period_type='biweekly',effective_period_start=date(2026,8,7),amount=300),
+    ]);db.commit()
+
+    joint_history=planner_cash_history(home.id,'biweekly',date(2026,8,8),None,james,db)
+    bailey_history=planner_cash_history(home.id,'biweekly',date(2026,8,8),bailey.id,james,db)
+    assert joint_history['current']['ending_rolling_available_cash']==100
+    assert bailey_history['current']['ending_rolling_available_cash']==300
