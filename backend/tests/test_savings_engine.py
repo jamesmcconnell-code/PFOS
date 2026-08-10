@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 from uuid import UUID
+import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
@@ -491,3 +492,83 @@ def test_planner_pay_schedule_api_is_member_scoped_and_falls_back_to_legacy_semi
     assert db.scalar(select(func.count()).select_from(PlannerPaySchedule))==1
     with __import__('pytest').raises(HTTPException):
         update_planner_pay_schedule(PlannerPayScheduleIn(schedule_type='semimonthly'),outsider.id,james,db)
+
+
+def test_biweekly_planner_uses_individual_schedule_for_periods_and_actual_paycheck_availability():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    bailey=User(email='biweekly-availability@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([bailey,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=bailey.id));db.flush()
+    checking=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    schedule=PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period')
+    paycheck=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,8),description='Bailey payroll',amount=1200)
+    db.add_all([schedule,paycheck]);db.commit()
+
+    current=available_cash_planner('biweekly',date(2026,8,8),bailey.id,bailey,db)
+    assert current['period_start']=='2026-08-07'
+    assert current['period_end']=='2026-08-20'
+    assert current['paycheck_amount']==1200
+    assert current['paycheck_sources'][0]['available_period_start']=='2026-08-07'
+
+    schedule.paycheck_availability_policy='next_period';db.commit()
+    before=available_cash_planner('biweekly',date(2026,8,8),bailey.id,bailey,db)
+    following=available_cash_planner('biweekly',date(2026,8,21),bailey.id,bailey,db)
+    assert before['paycheck_amount']==0
+    assert following['period_start']=='2026-08-21'
+    assert following['paycheck_amount']==1200
+
+    # Selecting the legacy paycheck period type must retain its semi-monthly
+    # availability behavior even when this member also has a biweekly schedule.
+    legacy=available_cash_planner('paycheck',date(2026,8,16),bailey.id,bailey,db)
+    assert legacy['period_start']=='2026-08-16'
+    assert legacy['paycheck_amount']==1200
+
+
+def test_biweekly_manual_allocation_overrides_expected_paycheck_projection():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    bailey=User(email='biweekly-manual@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([bailey,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=bailey.id));db.flush()
+    checking=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    source=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,8),description='Bailey payroll',amount=1000)
+    rule=RecurringPlannerIncomeRule(household_id=home.id,owner_id=bailey.id,account_id=checking.id,display_name='Bailey payroll',source_description='Bailey payroll',expected_amount=1000,cadence='biweekly',availability_day=1,effective_start_date=date(2026,8,7))
+    allocation=PlannerIncomeAllocation(household_id=home.id,owner_id=bailey.id,source_transaction_id=source.id,period_type='biweekly',effective_period_start=date(2026,8,7),amount=600)
+    db.add_all([PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='next_period'),source,rule]);db.flush();allocation.source_transaction_id=source.id;db.add(allocation);db.commit()
+
+    result=available_cash_planner('biweekly',date(2026,8,8),bailey.id,bailey,db)
+    assert result['paycheck_amount']==600
+    assert result['anticipated_paychecks']==[]
+    assert result['reconciled_paychecks'][0]['status']=='manual'
+    assert result['reconciled_paychecks'][0]['actual_amount']==600
+
+
+def test_biweekly_expected_paycheck_reconciles_actual_and_prorates_expenses_and_refunds():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    bailey=User(email='biweekly-reconcile@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([bailey,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=bailey.id));db.flush()
+    checking=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    schedule=PlannerPaySchedule(household_id=home.id,owner_id=bailey.id,schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period')
+    rule=RecurringPlannerIncomeRule(household_id=home.id,owner_id=bailey.id,account_id=checking.id,display_name='Bailey payroll',source_description='Bailey payroll',expected_amount=1000,cadence='biweekly',availability_day=1,effective_start_date=date(2026,8,7))
+    debit=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,8),description='Monthly phone',amount=-120,is_prorated=True,proration_months=1)
+    refund=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,8),description='Refund',amount=120,is_refund=True,is_prorated=True)
+    db.add_all([schedule,rule,debit,refund]);db.commit()
+
+    projected=available_cash_planner('biweekly',date(2026,8,8),bailey.id,bailey,db)
+    period_share=120*12/26
+    assert projected['paycheck_amount']==1000
+    assert len(projected['anticipated_paychecks'])==1
+    assert abs(projected['prorated_expenses']-period_share)<.001
+    assert abs(projected['refund_expense_offset']-period_share)<.001
+
+    actual=Transaction(household_id=home.id,account_id=checking.id,date=date(2026,8,8),description='Bailey payroll',amount=1050)
+    db.add(actual);db.commit()
+    reconciled=available_cash_planner('biweekly',date(2026,8,8),bailey.id,bailey,db)
+    assert reconciled['anticipated_paychecks']==[]
+    assert reconciled['paycheck_amount']==1050
+    assert reconciled['reconciled_paychecks'][0]['actual_amount']==1050
+    assert reconciled['reconciled_paychecks'][0]['variance']==50
+
+
+def test_biweekly_planner_is_individual_only_and_does_not_change_semimonthly_fallback():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='biweekly-scope@example.com',display_name='User',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.commit()
+    with pytest.raises(HTTPException):
+        available_cash_planner('biweekly',date(2026,8,8),None,user,db)
+    fallback=available_cash_planner('paycheck',date(2026,8,8),user.id,user,db)
+    assert fallback['period_start']=='2026-08-01'
+    assert fallback['period_end']=='2026-08-15'

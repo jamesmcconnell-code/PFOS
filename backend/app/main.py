@@ -419,18 +419,33 @@ def update_transaction_planner_flags(transaction_id:UUID,body:TransactionPlanner
     if changes.get('is_refund') is False: t.refund_included=True
     db.commit();return serialize(t)
 
-def planner_window(period, anchor):
+def individual_biweekly_schedule(h, view_user_id, db):
+    if not view_user_id: raise HTTPException(400,'Biweekly planning is available only in an individual user view')
+    schedule=db.scalar(select(PlannerPaySchedule).where(PlannerPaySchedule.household_id==h,PlannerPaySchedule.owner_id==view_user_id,PlannerPaySchedule.is_active==True))
+    if not schedule or schedule.schedule_type!='biweekly' or not schedule.biweekly_anchor_start_date: raise HTTPException(400,'Selected user does not have an active biweekly pay schedule')
+    return schedule
+def planner_window(period, anchor, biweekly_anchor_start=None):
     if period=='monthly':
         start=anchor.replace(day=1);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Monthly view',2
     if period=='paycheck':
         if anchor.day<=15: return anchor.replace(day=1),anchor.replace(day=16),'Paycheck view',1
         start=anchor.replace(day=16);return start,(start.replace(day=28)+timedelta(days=4)).replace(day=1),'Paycheck view',1
-    raise HTTPException(400,'Period must be paycheck or monthly')
+    if period=='biweekly':
+        if not biweekly_anchor_start: raise HTTPException(400,'Biweekly planning requires an anchor start date')
+        start,end=biweekly_period_bounds(biweekly_anchor_start,anchor);return start,end,'Biweekly view',1
+    raise HTTPException(400,'Period must be paycheck, biweekly, or monthly')
 def default_paycheck_availability_start(value: date):
     """Map each posted paycheck to the following bi-monthly spending period."""
     if value.day<=15:
         return value.replace(day=16)
     return (value.replace(day=28)+timedelta(days=4)).replace(day=1)
+def paycheck_availability_start(source, period, biweekly_schedule=None):
+    """Resolve planner-only paycheck availability without changing the transaction date."""
+    value=source.planner_effective_date or source.date
+    if biweekly_schedule:
+        start,_=biweekly_period_bounds(biweekly_schedule.biweekly_anchor_start_date,value)
+        return adjacent_period_start('biweekly',start,1,biweekly_schedule.biweekly_anchor_start_date) if biweekly_schedule.paycheck_availability_policy=='next_period' else start
+    return source.planner_effective_date or default_paycheck_availability_start(source.date)
 
 def add_months(value: date, months: int) -> date:
     """Return the inclusive-start date shifted by whole calendar months."""
@@ -479,7 +494,12 @@ def serialize_planner_expense_rule(rule, db: Session):
 def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     """Server-side available-cash inputs; savings-rate what-if is intentionally client-only."""
     h=household(user,db); validate_view_member(h,view_user_id,db)
-    anchor=anchor_date or date.today(); start,end,label,multiplier=planner_window(period,anchor)
+    scope_pay_schedule=db.scalar(select(PlannerPaySchedule).where(PlannerPaySchedule.household_id==h,PlannerPaySchedule.owner_id==view_user_id,PlannerPaySchedule.is_active==True)) if view_user_id else None
+    # The legacy paycheck view remains semi-monthly. A configured biweekly
+    # schedule applies only to the new biweekly view and to calendar-month
+    # availability grouping for that individual.
+    biweekly_schedule=individual_biweekly_schedule(h,view_user_id,db) if period=='biweekly' else (scope_pay_schedule if period=='monthly' and scope_pay_schedule and scope_pay_schedule.schedule_type=='biweekly' else None)
+    anchor=anchor_date or date.today(); start,end,label,multiplier=planner_window(period,anchor,biweekly_schedule.biweekly_anchor_start_date if biweekly_schedule else None)
     account_q=select(Account).where(Account.household_id==h,Account.is_active==True)
     if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     accounts=db.scalars(account_q).all(); account_ids=[account.id for account in accounts]; accounts_by_id={account.id:account for account in accounts}
@@ -491,12 +511,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     loan_reimbursement_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement')).all())
     allocation_query=select(PlannerIncomeAllocation).where(PlannerIncomeAllocation.household_id==h,planner_scope_filter(PlannerIncomeAllocation,view_user_id))
     if period=='paycheck': allocation_query=allocation_query.where(PlannerIncomeAllocation.period_type=='paycheck',PlannerIncomeAllocation.effective_period_start==start)
+    elif period=='biweekly': allocation_query=allocation_query.where(PlannerIncomeAllocation.period_type=='biweekly',PlannerIncomeAllocation.effective_period_start==start)
     else: allocation_query=allocation_query.where(PlannerIncomeAllocation.effective_period_start>=start,PlannerIncomeAllocation.effective_period_start<end)
     manual_income_allocations=db.scalars(allocation_query).all(); manual_by_source={}
     for record in manual_income_allocations: manual_by_source[record.source_transaction_id]=manual_by_source.get(record.source_transaction_id,0)+float(record.amount)
-    # A paycheck in the first half funds the second half, so evaluate the prior
-    # half-month as well as the current planner window.
-    income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_(and_(Transaction.date>=start-timedelta(days=16),Transaction.date<end),and_(Transaction.planner_effective_date>=start-timedelta(days=16),Transaction.planner_effective_date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
+    # Semi-monthly uses a half-month lookback; biweekly uses one complete prior
+    # payroll period for sources configured to fund the following period.
+    income_lookback=14 if biweekly_schedule else 16
+    income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_(and_(Transaction.date>=start-timedelta(days=income_lookback),Transaction.date<end),and_(Transaction.planner_effective_date>=start-timedelta(days=income_lookback),Transaction.planner_effective_date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
     income_candidates=db.scalars(income_query).all(); income_by_id={item.id:item for item in income_candidates}
     relevant_tags=designated_tags|loan_reimbursement_tags
     tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
@@ -517,18 +539,18 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if not (month_start<=planner_effective_date(item)<month_end): continue
         if amount<=0 or not allocation['is_refund']:
             continue
-        allocation_id=str(allocation['split_id'] or item.id); prorated_refund_ids.add(allocation_id); period_amount=amount/(2 if period=='paycheck' else 1)
+        allocation_id=str(allocation['split_id'] or item.id); prorated_refund_ids.add(allocation_id); period_amount=amount*(12/26 if period=='biweekly' else (1/2 if period=='paycheck' else 1))
         account=accounts_by_id[item.account_id]; refunds.append({'id':allocation_id,'parent_transaction_id':str(item.id),'date':str(item.date),'description':item.description,'account_name':account.name,'amount':period_amount,'original_amount':amount,'refund_included':allocation['refund_included'],'is_split':allocation['is_split'],'is_prorated':True})
         if allocation['refund_included']: refunds_total+=period_amount
     for source in income_candidates:
         account=accounts_by_id[source.account_id]
         if account.account_type!='spending' or source.is_internal_transfer or source.is_refund: continue
         allocated=manual_by_source.get(source.id)
-        availability_date=source.planner_effective_date or default_paycheck_availability_start(source.date)
-        effective_start=planner_period_start(period,availability_date)
+        availability_date=paycheck_availability_start(source,period,biweekly_schedule)
+        effective_start=start if allocated is not None else planner_period_start(period,availability_date,biweekly_schedule.biweekly_anchor_start_date if biweekly_schedule else None)
         amount=allocated if allocated is not None else float(source.amount)
         if (allocated is None and effective_start!=start) or amount<=0: continue
-        paycheck+=amount; paycheck_sources.append({'id':str(source.id),'date':str(source.date),'available_period_start':str(start),'description':source.description,'account_name':account.name,'amount':amount,'allocation_type':'manual' if allocated is not None else ('late_payroll_default' if source.date!=start else 'posted_period'),'note':next((record.note for record in manual_income_allocations if record.source_transaction_id==source.id),None)})
+        paycheck+=amount; paycheck_sources.append({'id':str(source.id),'date':str(source.date),'available_period_start':str(effective_start),'description':source.description,'account_name':account.name,'amount':amount,'allocation_type':'manual' if allocated is not None else ('biweekly_schedule' if period=='biweekly' else ('late_payroll_default' if source.date!=start else 'posted_period')),'note':next((record.note for record in manual_income_allocations if record.source_transaction_id==source.id),None)})
     anticipated_paychecks=[]; reconciled_paychecks=[]
     income_rule_query=select(RecurringPlannerIncomeRule).where(RecurringPlannerIncomeRule.household_id==h,planner_scope_filter(RecurringPlannerIncomeRule,view_user_id),or_(RecurringPlannerIncomeRule.is_active==True,RecurringPlannerIncomeRule.effective_end_date>=start),RecurringPlannerIncomeRule.effective_start_date<end,or_(RecurringPlannerIncomeRule.effective_end_date.is_(None),RecurringPlannerIncomeRule.effective_end_date>=start))
     used_income_ids=set()
@@ -536,6 +558,16 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         if rule.effective_start_date>=end: continue
         if rule.cadence=='twice_monthly': occurrences=[start] if period=='paycheck' else [candidate for candidate in [start,start.replace(day=16)] if candidate>=rule.effective_start_date]
         elif rule.cadence=='monthly': occurrences=[start] if start.day==1 and start>=rule.effective_start_date else []
+        elif rule.cadence=='biweekly':
+            if not biweekly_schedule: occurrences=[]
+            elif period=='biweekly': occurrences=[start] if start>=rule.effective_start_date else []
+            else:
+                cursor=biweekly_period_bounds(biweekly_schedule.biweekly_anchor_start_date,start)[0]
+                if cursor<start: cursor=adjacent_period_start('biweekly',cursor,1,biweekly_schedule.biweekly_anchor_start_date)
+                occurrences=[]
+                while cursor<end:
+                    if cursor>=rule.effective_start_date: occurrences.append(cursor)
+                    cursor=adjacent_period_start('biweekly',cursor,1,biweekly_schedule.biweekly_anchor_start_date)
         else:
             occurrences=[]; cursor=rule.effective_start_date
             while cursor<end:
@@ -543,7 +575,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                 cursor+=timedelta(days=14)
         for occurrence in occurrences:
             if rule.effective_end_date and occurrence>rule.effective_end_date: continue
-            actual=next((item for item in income_candidates if item.id not in used_income_ids and item.account_id==rule.account_id and not item.is_internal_transfer and not item.is_refund and abs(float(item.amount)-float(rule.expected_amount))<=max(20,float(rule.expected_amount)*.25) and (not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)) and planner_period_start('paycheck',item.planner_effective_date or default_paycheck_availability_start(item.date))==planner_period_start('paycheck',occurrence)),None)
+            manual=next((record for record in manual_income_allocations if (source:=income_by_id.get(record.source_transaction_id)) and source.account_id==rule.account_id and not source.is_internal_transfer and not source.is_refund and abs(float(record.amount)-float(rule.expected_amount))<=max(20,float(rule.expected_amount)*.25) and (not rule.source_description or normalized_description(source.description)==normalized_description(rule.source_description))),None)
+            if manual:
+                source=income_by_id[manual.source_transaction_id]; variance=float(manual.amount)-float(rule.expected_amount)
+                reconciled_paychecks.append({'rule_id':str(rule.id),'actual_transaction_id':str(source.id),'expected_amount':float(rule.expected_amount),'actual_amount':float(manual.amount),'variance':variance,'status':'manual'})
+                for row in paycheck_sources:
+                    if row['id']==str(source.id): row.update(allocation_type='manual',expected_amount=float(rule.expected_amount),variance=variance)
+                continue
+            actual=next((item for item in income_candidates if item.id not in used_income_ids and item.account_id==rule.account_id and not item.is_internal_transfer and not item.is_refund and abs(float(item.amount)-float(rule.expected_amount))<=max(20,float(rule.expected_amount)*.25) and (not rule.source_description or normalized_description(item.description)==normalized_description(rule.source_description)) and (paycheck_availability_start(item,'biweekly',biweekly_schedule) if rule.cadence=='biweekly' and biweekly_schedule else planner_period_start('paycheck',item.planner_effective_date or default_paycheck_availability_start(item.date)))==occurrence),None)
             if actual:
                 used_income_ids.add(actual.id)
                 variance=float(actual.amount)-float(rule.expected_amount); reconciled_paychecks.append({'rule_id':str(rule.id),'actual_transaction_id':str(actual.id),'expected_amount':float(rule.expected_amount),'actual_amount':float(actual.amount),'variance':variance,'status':'actual'})
@@ -598,7 +637,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         # the matching duration anniversary (3, 6, 12 months, or another choice).
         effective_date=planner_effective_date(item)
         if float(item.amount)<0 and not is_debt_payment(item,account) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(item)
-    prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(24 if period=='paycheck' else 12); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
+    prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(26 if period=='biweekly' else (24 if period=='paycheck' else 12)); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
     for item in active_prorated:
         account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); effective_date=planner_effective_date(item); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
     anticipated_expenses=0.0; anticipated_expense_sources=[]; reconciled_anticipated_expenses=[]
@@ -616,7 +655,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
             actual_monthly=abs(float(actual.amount))/max(1,int(actual.proration_months or 1))
             reconciled_anticipated_expenses.append({'rule_id':str(rule.id),'display_name':rule.display_name,'actual_transaction_id':str(actual.id),'actual_amount':actual_monthly,'projected_amount':float(rule.monthly_projected_amount),'variance':actual_monthly-float(rule.monthly_projected_amount),'status':'actual'})
             continue
-        period_amount=float(rule.monthly_projected_amount)/(2 if period=='paycheck' else 1)
+        period_amount=float(rule.monthly_projected_amount)*(12/26 if period=='biweekly' else (1/2 if period=='paycheck' else 1))
         anticipated_expenses+=period_amount
         anticipated_expense_sources.append({'id':str(rule.id),'rule_id':str(rule.id),'display_name':rule.display_name,'account_name':accounts_by_id[rule.account_id].name,'expected_day_of_month':rule.expected_day_of_month,'monthly_amount':float(rule.monthly_projected_amount),'period_amount':period_amount,'proration_months':rule.proration_months,'status':'anticipated'})
     # Refunds are expense credits, rather than income. This keeps NMP limited to
@@ -670,17 +709,26 @@ def delete_planner_expense_rule(rule_id:UUID,user=Depends(current_user),db:Sessi
     if not rule or rule.household_id!=household(user,db): raise HTTPException(404,'Anticipated expense rule not found')
     db.delete(rule);db.commit()
 
-def planner_period_start(period_type: str, value: date):
+def planner_period_start(period_type: str, value: date, biweekly_anchor_start: date|None=None):
     if period_type=='monthly': return value.replace(day=1)
     if period_type=='paycheck': return value.replace(day=1 if value.day<=15 else 16)
-    raise HTTPException(400,'Period type must be paycheck or monthly')
-def next_planner_period_start(period_type: str, value: date):
+    if period_type=='biweekly':
+        if not biweekly_anchor_start: raise HTTPException(400,'Biweekly planning requires an anchor start date')
+        return biweekly_period_bounds(biweekly_anchor_start,value)[0]
+    raise HTTPException(400,'Period type must be paycheck, biweekly, or monthly')
+def next_planner_period_start(period_type: str, value: date, biweekly_anchor_start: date|None=None):
     if period_type=='monthly': return (value.replace(day=28)+timedelta(days=4)).replace(day=1)
-    return value.replace(day=16) if value.day==1 else (value.replace(day=28)+timedelta(days=4)).replace(day=1)
+    if period_type=='paycheck': return value.replace(day=16) if value.day==1 else (value.replace(day=28)+timedelta(days=4)).replace(day=1)
+    if period_type=='biweekly':
+        if not biweekly_anchor_start: raise HTTPException(400,'Biweekly planning requires an anchor start date')
+        return adjacent_period_start('biweekly',value,1,biweekly_anchor_start)
+    raise HTTPException(400,'Period type must be paycheck, biweekly, or monthly')
+def planner_period_anchor(h, view_user_id, period_type, db):
+    return individual_biweekly_schedule(h,view_user_id,db).biweekly_anchor_start_date if period_type=='biweekly' else None
 def planner_scope_filter(model, view_user_id): return model.owner_id==view_user_id if view_user_id else model.owner_id.is_(None)
 def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session, limit=12):
     """Derive running planner cash from source transactions plus the small ledger."""
-    validate_view_member(h,view_user_id,db); target=planner_period_start(period_type,anchor)
+    validate_view_member(h,view_user_id,db); biweekly_schedule=individual_biweekly_schedule(h,view_user_id,db) if period_type=='biweekly' else None; biweekly_anchor=biweekly_schedule.biweekly_anchor_start_date if biweekly_schedule else None; target=planner_period_start(period_type,anchor,biweekly_anchor)
     account_query=select(Account.id).where(Account.household_id==h,Account.is_active==True)
     if view_user_id: account_query=account_query.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     account_ids=list(db.scalars(account_query).all())
@@ -689,7 +737,7 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
     candidates=[target,*[item.effective_period_start for item in scope_openings],*[item.effective_period_start for item in scope_adjustments]]
     if account_ids:
         first_transaction=db.scalar(select(func.min(Transaction.date)).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_pending==False))
-        if first_transaction: candidates.append(planner_period_start(period_type,first_transaction))
+        if first_transaction: candidates.append(planner_period_start(period_type,first_transaction,biweekly_anchor))
     cursor=min(candidates); openings={item.effective_period_start:item for item in scope_openings}; adjustments={}
     for item in scope_adjustments: adjustments.setdefault(item.effective_period_start,[]).append(item)
     # Goal sweeps are virtual planner allocations only. They never create a
@@ -706,12 +754,12 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
                 goal_state.append({'id':str(goal.id),'name':goal.name,'remaining':remaining,'funding_account_id':str(goal.funding_account_id) if goal.funding_account_id else None,'funding_account_name':account.name if account else None})
     # The live period is still in progress: show its Free Spending as a planning
     # figure, but do not treat the unspent remainder as carried cash yet.
-    live_period_start=planner_period_start(period_type,date.today())
+    live_period_start=planner_period_start(period_type,date.today(),biweekly_anchor)
     running=0.0; history=[]
     while cursor<=target:
         opening=openings.get(cursor)
         if opening: running=float(opening.amount)
-        next_cursor=next_planner_period_start(period_type,cursor); evaluation_anchor=anchor if cursor==target else next_cursor-timedelta(days=1)
+        next_cursor=next_planner_period_start(period_type,cursor,biweekly_anchor); evaluation_anchor=anchor if cursor==target else next_cursor-timedelta(days=1)
         planner=available_cash_planner(period_type,evaluation_anchor,view_user_id,user,db)
         free=float(planner['paycheck_amount'])-float(planner['total_period_expenses'])
         free_spending_included=cursor!=live_period_start
@@ -740,7 +788,7 @@ def planner_carryovers(period_type:str|None=None,view_user_id:UUID|None=None,use
     return [serialize(item) for item in db.scalars(query.order_by(PlannerStartingCarryover.effective_period_start.desc())).all()]
 @app.put('/api/v1/planner-carryovers')
 def set_planner_carryover(body:PlannerStartingCarryoverIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start)
+    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start,planner_period_anchor(h,view_user_id,body.period_type,db))
     row=db.scalar(select(PlannerStartingCarryover).where(PlannerStartingCarryover.household_id==h,PlannerStartingCarryover.period_type==body.period_type,PlannerStartingCarryover.effective_period_start==start,planner_scope_filter(PlannerStartingCarryover,view_user_id)))
     if row: row.amount,row.note=body.amount,body.note
     else: row=PlannerStartingCarryover(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row)
@@ -757,13 +805,13 @@ def planner_adjustments(period_type:str|None=None,view_user_id:UUID|None=None,us
     return [serialize(item) for item in db.scalars(query.order_by(PlannerAdjustment.effective_period_start.desc(),PlannerAdjustment.created_at.desc())).all()]
 @app.post('/api/v1/planner-adjustments')
 def add_planner_adjustment(body:PlannerAdjustmentIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start); row=PlannerAdjustment(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize(row)
+    h=household(user,db); validate_view_member(h,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start,planner_period_anchor(h,view_user_id,body.period_type,db)); row=PlannerAdjustment(household_id=h,owner_id=view_user_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize(row)
 @app.patch('/api/v1/planner-adjustments/{adjustment_id}')
 def update_planner_adjustment(adjustment_id:UUID,body:PlannerAdjustmentUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerAdjustment,adjustment_id)
     if not row or row.household_id!=h or (row.owner_id!=view_user_id): raise HTTPException(404,'Planner adjustment not found')
     changes=body.model_dump(exclude_unset=True)
-    if 'effective_period_start' in changes: changes['effective_period_start']=planner_period_start(row.period_type,changes['effective_period_start'])
+    if 'effective_period_start' in changes: changes['effective_period_start']=planner_period_start(row.period_type,changes['effective_period_start'],planner_period_anchor(h,view_user_id,row.period_type,db))
     for field,value in changes.items(): setattr(row,field,value)
     db.commit();return serialize(row)
 @app.delete('/api/v1/planner-adjustments/{adjustment_id}',status_code=204)
@@ -776,7 +824,7 @@ def serialize_income_allocation(row, db: Session):
     data.update(source_description=transaction.description if transaction else 'Deleted transaction',source_transaction_date=str(transaction.date) if transaction else None,source_transaction_amount=float(transaction.amount) if transaction else None,account_name=account.name if account else None)
     return data
 def validate_income_allocation(h, body, view_user_id, db: Session, exclude_id=None):
-    if body.period_type not in {'paycheck','monthly'}: raise HTTPException(400,'Period type must be paycheck or monthly')
+    if body.period_type not in {'paycheck','biweekly','monthly'}: raise HTTPException(400,'Period type must be paycheck, biweekly, or monthly')
     transaction=db.get(Transaction,body.source_transaction_id)
     if not transaction or transaction.household_id!=h or float(transaction.amount)<=0: raise HTTPException(400,'Select a positive household transaction')
     account=db.get(Account,transaction.account_id)
@@ -798,14 +846,14 @@ def planner_income_candidates(anchor_date:date|None=None,view_user_id:UUID|None=
     return [{'id':str(item.id),'date':str(item.date),'description':item.description,'amount':float(item.amount),'account_name':accounts[item.account_id].name,'default_paycheck_period_start':str(default_paycheck_availability_start(item.date))} for item in items]
 @app.post('/api/v1/planner-income-allocations')
 def add_planner_income_allocation(body:PlannerIncomeAllocationIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
-    h=household(user,db); validate_view_member(h,view_user_id,db); validate_income_allocation(h,body,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start); row=PlannerIncomeAllocation(household_id=h,owner_id=view_user_id,source_transaction_id=body.source_transaction_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize_income_allocation(row,db)
+    h=household(user,db); validate_view_member(h,view_user_id,db); validate_income_allocation(h,body,view_user_id,db); start=planner_period_start(body.period_type,body.effective_period_start,planner_period_anchor(h,view_user_id,body.period_type,db)); row=PlannerIncomeAllocation(household_id=h,owner_id=view_user_id,source_transaction_id=body.source_transaction_id,period_type=body.period_type,effective_period_start=start,amount=body.amount,note=body.note);db.add(row);db.commit();return serialize_income_allocation(row,db)
 @app.patch('/api/v1/planner-income-allocations/{allocation_id}')
 def update_planner_income_allocation(allocation_id:UUID,body:PlannerIncomeAllocationUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); row=db.get(PlannerIncomeAllocation,allocation_id)
     if not row or row.household_id!=h or row.owner_id!=view_user_id: raise HTTPException(404,'Paycheck allocation not found')
     if body.amount is not None:
         candidate=PlannerIncomeAllocationIn(source_transaction_id=row.source_transaction_id,period_type=row.period_type,effective_period_start=row.effective_period_start,amount=body.amount,note=body.note if body.note is not None else row.note);validate_income_allocation(h,candidate,view_user_id,db,row.id);row.amount=body.amount
-    if body.effective_period_start: row.effective_period_start=planner_period_start(row.period_type,body.effective_period_start)
+    if body.effective_period_start: row.effective_period_start=planner_period_start(row.period_type,body.effective_period_start,planner_period_anchor(h,view_user_id,row.period_type,db))
     if 'note' in body.model_fields_set: row.note=body.note
     db.commit();return serialize_income_allocation(row,db)
 @app.delete('/api/v1/planner-income-allocations/{allocation_id}',status_code=204)
@@ -818,6 +866,7 @@ def validate_income_rule(h, values, view_user_id, db):
     account=db.get(Account,values['account_id'])
     if not account or account.household_id!=h or account.account_type!='spending': raise HTTPException(400,'Select a spending account')
     if view_user_id and (account.ownership!='individual' or account.owner_id!=view_user_id): raise HTTPException(400,'Account is outside selected user view')
+    if values.get('cadence')=='biweekly': individual_biweekly_schedule(h,view_user_id,db)
     return account
 def matching_income_rule(h, owner_id, account_id, source_description, db):
     """Find a recurring paycheck rule by its stable payroll identity, not an imported transaction id."""
