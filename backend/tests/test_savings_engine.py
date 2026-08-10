@@ -5,9 +5,10 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, planner_period_start, replace_transaction_splits, reports, update_planner_income_rule, update_transaction_date, update_transaction_planner_effective_date
-from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
-from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, TransactionDateUpdate, TransactionSplitsUpdate
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, planner_pay_schedule, planner_period_start, replace_transaction_splits, reports, update_planner_income_rule, update_planner_pay_schedule, update_transaction_date, update_transaction_planner_effective_date
+from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerPaySchedule, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
+from app.planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
+from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, PlannerPayScheduleIn, TransactionDateUpdate, TransactionSplitsUpdate
 
 
 def test_manual_transaction_creation_persists_metadata_tags_and_account_balance():
@@ -463,3 +464,30 @@ def test_paycheck_rule_edit_creates_a_future_successor_without_rewriting_history
     assert rows[1].effective_start_date==date.today()
     assert float(rows[1].expected_amount)==1200
     assert successor['next_occurrence']
+
+def test_planner_pay_schedule_helpers_support_semimonthly_biweekly_and_monthly_periods():
+    anchor=date(2026,8,7)
+    assert semimonthly_period_bounds(date(2026,8,15))==(date(2026,8,1),date(2026,8,16))
+    assert semimonthly_period_bounds(date(2026,8,16))==(date(2026,8,16),date(2026,9,1))
+    assert biweekly_period_bounds(anchor,date(2026,9,1))==(date(2026,8,21),date(2026,9,4))
+    assert period_bounds('monthly',date(2026,8,9))==(date(2026,8,1),date(2026,9,1))
+    assert adjacent_period_start('biweekly',anchor,1,anchor)==date(2026,8,21)
+    assert adjacent_period_start('biweekly',anchor,-1,anchor)==date(2026,7,24)
+    assert periods_per_year('semimonthly')==24
+    assert periods_per_year('biweekly')==26
+    assert periods_per_year('monthly')==12
+
+def test_planner_pay_schedule_api_is_member_scoped_and_falls_back_to_legacy_semimonthly():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    james=User(email='schedule-james@example.com',display_name='James',password_hash='x');bailey=User(email='schedule-bailey@example.com',display_name='Bailey',password_hash='x');outsider=User(email='schedule-outsider@example.com',display_name='Outsider',password_hash='x');home=Household(name='Test household');other_home=Household(name='Other household');db.add_all([james,bailey,outsider,home,other_home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id),HouseholdMember(household_id=other_home.id,user_id=outsider.id)]);db.commit()
+
+    fallback=planner_pay_schedule(None,james,db)
+    assert fallback=={'configured':False,'schedule_type':'semimonthly','biweekly_anchor_start_date':None,'paycheck_availability_policy':'next_period','is_active':True}
+    configured=update_planner_pay_schedule(PlannerPayScheduleIn(schedule_type='biweekly',biweekly_anchor_start_date=date(2026,8,7),paycheck_availability_policy='current_period'),bailey.id,james,db)
+    assert configured['configured'] is True
+    assert configured['owner_id']==str(bailey.id)
+    assert configured['schedule_type']=='biweekly'
+    assert configured['biweekly_anchor_start_date']=='2026-08-07'
+    assert db.scalar(select(func.count()).select_from(PlannerPaySchedule))==1
+    with __import__('pytest').raises(HTTPException):
+        update_planner_pay_schedule(PlannerPayScheduleIn(schedule_type='semimonthly'),outsider.id,james,db)

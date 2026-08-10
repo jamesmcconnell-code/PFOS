@@ -15,6 +15,7 @@ from .security import hash_password, verify_password, create_token, decode_token
 from .connectors import CONNECTORS, ConnectorAuthenticationError, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
 from .crypto_prices import refresh_usd_values
 from .config import settings
+from .planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
 
 app=FastAPI(title='PFOS API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -182,6 +183,25 @@ def get_financial_settings(user=Depends(current_user),db:Session=Depends(get_db)
 @app.patch('/api/v1/household/financial-settings')
 def update_financial_settings(body:FinancialSettingsUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
     h=db.get(Household,household(user,db));h.checking_account_ceiling=body.checking_account_ceiling;db.commit();return {'checking_account_ceiling':float(h.checking_account_ceiling)}
+def planner_schedule_owner(h, view_user_id, user, db):
+    owner_id=view_user_id or user.id; validate_view_member(h,owner_id,db); return owner_id
+def serialize_pay_schedule(schedule, configured: bool):
+    if not schedule: return {'configured':False,'schedule_type':'semimonthly','biweekly_anchor_start_date':None,'paycheck_availability_policy':'next_period','is_active':True}
+    return {**serialize(schedule),'configured':configured}
+def validate_pay_schedule(body):
+    if body.schedule_type not in {'semimonthly','biweekly'}: raise HTTPException(400,'Schedule type must be semimonthly or biweekly')
+    if body.paycheck_availability_policy not in {'current_period','next_period'}: raise HTTPException(400,'Paycheck availability policy must be current_period or next_period')
+    if body.schedule_type=='biweekly' and not body.biweekly_anchor_start_date: raise HTTPException(400,'Biweekly schedule requires an anchor start date')
+@app.get('/api/v1/planner-pay-schedule')
+def planner_pay_schedule(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); owner_id=planner_schedule_owner(h,view_user_id,user,db); schedule=db.scalar(select(PlannerPaySchedule).where(PlannerPaySchedule.household_id==h,PlannerPaySchedule.owner_id==owner_id)); return serialize_pay_schedule(schedule,bool(schedule))
+@app.put('/api/v1/planner-pay-schedule')
+def update_planner_pay_schedule(body:PlannerPayScheduleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); owner_id=planner_schedule_owner(h,view_user_id,user,db); validate_pay_schedule(body); schedule=db.scalar(select(PlannerPaySchedule).where(PlannerPaySchedule.household_id==h,PlannerPaySchedule.owner_id==owner_id))
+    if not schedule: schedule=PlannerPaySchedule(household_id=h,owner_id=owner_id,**body.model_dump()); db.add(schedule)
+    else:
+        for field,value in body.model_dump().items(): setattr(schedule,field,value)
+    db.commit(); return serialize_pay_schedule(schedule,True)
 @app.get('/api/v1/household/members')
 def household_members(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); members=db.scalars(select(HouseholdMember).where(HouseholdMember.household_id==h)).all(); return [{'id':str(m.user_id),'display_name':db.get(User,m.user_id).display_name,'email':db.get(User,m.user_id).email,'role':m.role} for m in members]

@@ -95,6 +95,11 @@ class PlannerAdjustmentUpdate(BaseModel):
     effective_period_start: date|None=None
     amount: float|None=None
     note: str|None=Field(default=None,max_length=500)
+class PlannerPayScheduleIn(BaseModel):
+    schedule_type: str='semimonthly'
+    biweekly_anchor_start_date: date|None=None
+    paycheck_availability_policy: str='next_period'
+    is_active: bool=True
 class PlannerIncomeAllocationIn(BaseModel):
     source_transaction_id: UUID
     period_type: str
