@@ -433,6 +433,19 @@ def test_twice_monthly_income_rule_projects_once_per_paycheck_and_twice_per_mont
     assert second['paycheck_amount']==1916.56
     assert monthly['paycheck_amount']==3833.12
 
+
+def test_semimonthly_expected_paycheck_can_target_a_single_half_month():
+    engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
+    user=User(email='first-half-expected@example.com',display_name='First half',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
+    db.add(RecurringPlannerIncomeRule(household_id=home.id,account_id=checking.id,display_name='First half payroll',source_description='First half payroll',expected_amount=1000,cadence='twice_monthly',availability_day=15,effective_start_date=date(2026,8,1)));db.commit()
+    first=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
+    second=available_cash_planner('paycheck',date(2026,8,20),None,user,db)
+    monthly=available_cash_planner('monthly',date(2026,8,20),None,user,db)
+    assert first['paycheck_amount']==1000
+    assert second['paycheck_amount']==0
+    assert monthly['paycheck_amount']==1000
+
 def test_paycheck_rule_creation_deduplicates_by_scoped_payroll_identity():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     user=User(email='income-rule-dedupe@example.com',display_name='Income dedupe',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()

@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
-type Props={open:boolean;period:'paycheck'|'monthly';anchorDate:string;onClose:()=>void;onChanged:()=>void};
+type Props={open:boolean;period:'paycheck'|'biweekly'|'monthly';anchorDate:string;onClose:()=>void;onChanged:()=>void};
 export function PlannerIncomeManager({open,period,anchorDate,onClose,onChanged}:Props){
   const [candidates,setCandidates]=useState<any[]>([]),[rows,setRows]=useState<any[]>([]),[source,setSource]=useState(''),[amount,setAmount]=useState(''),[effective,setEffective]=useState(anchorDate),[note,setNote]=useState(''),[error,setError]=useState('');
   const load=async()=>{try{const [nextCandidates,nextRows]=await Promise.all([api(`/planner-income-allocations/candidates?anchor_date=${anchorDate}`),api(`/planner-income-allocations?period_type=${period}`)]);setCandidates(nextCandidates);setRows(nextRows);setError('');}catch(caught){setError(caught instanceof Error?caught.message:'Could not load paycheck assignments');}};

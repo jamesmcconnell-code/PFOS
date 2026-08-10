@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
 
-type Props={open:boolean;period:'paycheck'|'monthly';anchorDate:string;onClose:()=>void;onChanged:()=>void};
+type Props={open:boolean;period:'paycheck'|'biweekly'|'monthly';anchorDate:string;onClose:()=>void;onChanged:()=>void};
 const emptyAdjustment={effective_period_start:'',amount:'',note:''};
 
 export function RollingCashManager({open,period,anchorDate,onClose,onChanged}:Props){

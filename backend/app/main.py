@@ -484,9 +484,9 @@ def next_income_rule_occurrence(rule, after: date|None=None):
     cursor=max(after or date.today(),rule.effective_start_date)
     if rule.effective_end_date and cursor>rule.effective_end_date: return None
     if rule.cadence=='twice_monthly':
-        candidates=[cursor.replace(day=1),cursor.replace(day=16)]
-        if cursor.month==12: candidates.append(date(cursor.year+1,1,1))
-        else: candidates.append(date(cursor.year,cursor.month+1,1))
+        days=[1] if rule.availability_day==15 else [16] if rule.availability_day==16 else [1,16]
+        next_month=(cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
+        candidates=sorted([cursor.replace(day=day) for day in days]+[next_month.replace(day=day) for day in days])
         result=next(candidate for candidate in candidates if candidate>=cursor)
     elif rule.cadence=='monthly':
         result=cursor.replace(day=1) if cursor.day==1 else (cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
@@ -603,7 +603,8 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
             if owner_id:
                 source_scope.update(source_owner_id=str(owner_id),source_owner_name=users_by_id[owner_id].display_name if owner_id in users_by_id else 'Unknown user')
             rule_period_type='paycheck' if rule.cadence=='twice_monthly' else rule.cadence
-            annualized_expected=float(rule.expected_amount)*periods_per_year(rule_period_type)
+            source_periods=12 if rule.cadence=='twice_monthly' and rule.availability_day in {15,16} else periods_per_year(rule_period_type)
+            annualized_expected=float(rule.expected_amount)*source_periods
             normalized_expected=annualized_expected/periods_per_year(period)
             source_scope.update(source_schedule_cadence='semimonthly' if rule.cadence=='twice_monthly' else rule.cadence,rule_cadence=rule.cadence,joint_display_cadence=joint_display_cadence(period))
             def joint_rule_matches(source, amount):
@@ -631,7 +632,9 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         rule_schedule=biweekly_schedule if rule.cadence=='biweekly' else None
         rule_scope=income_source_scope(rule_account,users_by_id,rule_schedule) if rule_account else {'source_owner_id':str(rule.owner_id) if rule.owner_id else None,'source_owner_name':users_by_id[rule.owner_id].display_name if rule.owner_id in users_by_id else 'Joint household','source_schedule_cadence':'biweekly' if rule.cadence=='biweekly' else 'semimonthly'}
         rule_scope.update(rule_cadence=rule.cadence,joint_display_cadence=None)
-        if rule.cadence=='twice_monthly': occurrences=[start] if period=='paycheck' else [candidate for candidate in [start,start.replace(day=16)] if candidate>=rule.effective_start_date]
+        if rule.cadence=='twice_monthly':
+            days=[1] if rule.availability_day==15 else [16] if rule.availability_day==16 else [1,16]
+            occurrences=[candidate for candidate in [start.replace(day=day) for day in days] if start<=candidate<end and candidate>=rule.effective_start_date]
         elif rule.cadence=='monthly': occurrences=[start] if start.day==1 and start>=rule.effective_start_date else []
         elif rule.cadence=='biweekly':
             if not biweekly_schedule: occurrences=[]
