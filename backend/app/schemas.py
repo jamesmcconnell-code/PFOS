@@ -47,6 +47,35 @@ class TransactionSplitIn(BaseModel):
     refund_included: bool=True
 class TransactionSplitsUpdate(BaseModel):
     splits: list[TransactionSplitIn]=Field(min_length=2,max_length=100)
+class HouseholdSettlementPurchaseLinkIn(BaseModel):
+    original_transaction_id: UUID
+    original_split_id: UUID|None=None
+    allocated_amount: float=Field(gt=0)
+    note: str|None=Field(default=None,max_length=2000)
+class HouseholdSettlementIn(BaseModel):
+    payer_transaction_id: UUID
+    recipient_transaction_id: UUID|None=None
+    source_split_id: UUID|None=None
+    payer_user_id: UUID
+    recipient_user_id: UUID
+    settlement_amount: float=Field(gt=0)
+    category_id: UUID|None=None
+    note: str|None=Field(default=None,max_length=2000)
+    settlement_group_id: UUID|None=None
+    purchase_links: list[HouseholdSettlementPurchaseLinkIn]=Field(default_factory=list,max_length=100)
+class HouseholdSettlementUpdate(BaseModel):
+    payer_transaction_id: UUID|None=None
+    recipient_transaction_id: UUID|None=None
+    source_split_id: UUID|None=None
+    payer_user_id: UUID|None=None
+    recipient_user_id: UUID|None=None
+    settlement_amount: float|None=Field(default=None,gt=0)
+    category_id: UUID|None=None
+    note: str|None=Field(default=None,max_length=2000)
+    settlement_group_id: UUID|None=None
+    purchase_links: list[HouseholdSettlementPurchaseLinkIn]|None=Field(default=None,max_length=100)
+class HouseholdSettlementReverseIn(BaseModel):
+    reversal_note: str|None=Field(default=None,max_length=2000)
 class CategoryIn(BaseModel):
     name: str=Field(min_length=1,max_length=100)
     kind: str='expense'

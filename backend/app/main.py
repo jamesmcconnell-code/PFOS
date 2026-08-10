@@ -419,6 +419,141 @@ def update_transaction_planner_flags(transaction_id:UUID,body:TransactionPlanner
     if changes.get('is_refund') is False: t.refund_included=True
     db.commit();return serialize(t)
 
+def active_household_member_ids(h, db: Session):
+    return set(db.scalars(select(HouseholdMember.user_id).join(User,User.id==HouseholdMember.user_id).where(HouseholdMember.household_id==h,User.is_active==True)).all())
+def _settlement_links_from_values(values):
+    return values.get('purchase_links') or []
+def validate_household_settlement(h, values, db: Session, exclude_settlement_id: UUID|None=None):
+    """Validate a settlement treatment without changing its imported sources."""
+    payer_transaction=db.get(Transaction,values['payer_transaction_id'])
+    if not payer_transaction or payer_transaction.household_id!=h or float(payer_transaction.amount)>=0:
+        raise HTTPException(400,'Payer source must be a negative household transaction')
+    if values['payer_user_id']==values['recipient_user_id']:
+        raise HTTPException(400,'Payer and recipient must be different household members')
+    members=active_household_member_ids(h,db)
+    if values['payer_user_id'] not in members or values['recipient_user_id'] not in members:
+        raise HTTPException(400,'Payer and recipient must be active household members')
+    payer_account=db.get(Account,payer_transaction.account_id)
+    if payer_account and payer_account.ownership=='individual' and payer_account.owner_id and payer_account.owner_id!=values['payer_user_id']:
+        raise HTTPException(400,'Payer must match the owner of an individual source account')
+    source_split=None
+    if values.get('source_split_id'):
+        source_split=db.get(TransactionSplit,values['source_split_id'])
+        if not source_split or source_split.transaction_id!=payer_transaction.id or float(source_split.amount)>=0:
+            raise HTTPException(400,'Source split must be a negative split on the payer transaction')
+    elif db.scalar(select(TransactionSplit.id).where(TransactionSplit.transaction_id==payer_transaction.id)):
+        raise HTTPException(400,'Select a source split when the payer transaction has splits')
+    recipient_transaction=None
+    if values.get('recipient_transaction_id'):
+        recipient_transaction=db.get(Transaction,values['recipient_transaction_id'])
+        if not recipient_transaction or recipient_transaction.household_id!=h or float(recipient_transaction.amount)<=0:
+            raise HTTPException(400,'Recipient source must be a positive household transaction')
+        recipient_account=db.get(Account,recipient_transaction.account_id)
+        if recipient_account and recipient_account.ownership=='individual' and recipient_account.owner_id and recipient_account.owner_id!=values['recipient_user_id']:
+            raise HTTPException(400,'Recipient must match the owner of an individual recipient account')
+    if values.get('category_id') and not db.scalar(select(Category.id).where(Category.id==values['category_id'],Category.household_id==h)):
+        raise HTTPException(400,'Invalid settlement category')
+    amount=round(float(values['settlement_amount']),2)
+    if amount<=0: raise HTTPException(400,'Settlement amount must be greater than zero')
+    source_limit=abs(float(source_split.amount if source_split else payer_transaction.amount))
+    existing_query=select(HouseholdSettlement).where(HouseholdSettlement.household_id==h,HouseholdSettlement.payer_transaction_id==payer_transaction.id,HouseholdSettlement.status=='active')
+    existing_query=existing_query.where(HouseholdSettlement.source_split_id==source_split.id) if source_split else existing_query.where(HouseholdSettlement.source_split_id.is_(None))
+    if exclude_settlement_id: existing_query=existing_query.where(HouseholdSettlement.id!=exclude_settlement_id)
+    used=round(sum(float(item.settlement_amount) for item in db.scalars(existing_query).all()),2)
+    if round(used+amount,2)>round(source_limit,2):
+        raise HTTPException(400,'Active settlements cannot exceed the selected payer transaction amount')
+    if recipient_transaction:
+        recipient_query=select(HouseholdSettlement).where(HouseholdSettlement.household_id==h,HouseholdSettlement.recipient_transaction_id==recipient_transaction.id,HouseholdSettlement.status=='active')
+        if exclude_settlement_id: recipient_query=recipient_query.where(HouseholdSettlement.id!=exclude_settlement_id)
+        received=round(sum(float(item.settlement_amount) for item in db.scalars(recipient_query).all()),2)
+        if round(received+amount,2)>round(float(recipient_transaction.amount),2):
+            raise HTTPException(400,'Active settlements cannot exceed the selected recipient transaction amount')
+    links=_settlement_links_from_values(values)
+    if round(sum(float(item['allocated_amount'] if isinstance(item,dict) else item.allocated_amount) for item in links),2)>amount:
+        raise HTTPException(400,'Linked purchase allocations cannot exceed the settlement amount')
+    seen_links=set()
+    for item in links:
+        original_id=item['original_transaction_id'] if isinstance(item,dict) else item.original_transaction_id
+        original_split_id=item.get('original_split_id') if isinstance(item,dict) else item.original_split_id
+        allocated_amount=float(item['allocated_amount'] if isinstance(item,dict) else item.allocated_amount)
+        key=(original_id,original_split_id)
+        if key in seen_links: raise HTTPException(400,'Each original purchase can be linked only once per settlement')
+        seen_links.add(key)
+        original=db.get(Transaction,original_id)
+        if not original or original.household_id!=h or float(original.amount)>=0:
+            raise HTTPException(400,'Linked original purchases must be negative household transactions')
+        if original_split_id:
+            original_split=db.get(TransactionSplit,original_split_id)
+            if not original_split or original_split.transaction_id!=original.id or float(original_split.amount)>=0:
+                raise HTTPException(400,'Linked original split must be a negative split on its transaction')
+            if allocated_amount>abs(float(original_split.amount)):
+                raise HTTPException(400,'Linked allocation cannot exceed its original split amount')
+        elif allocated_amount>abs(float(original.amount)):
+            raise HTTPException(400,'Linked allocation cannot exceed its original transaction amount')
+    return payer_transaction,recipient_transaction,source_split
+def serialize_household_settlement(settlement, h, db: Session):
+    users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
+    category=db.get(Category,settlement.category_id) if settlement.category_id else None
+    payer_transaction=db.get(Transaction,settlement.payer_transaction_id)
+    recipient_transaction=db.get(Transaction,settlement.recipient_transaction_id) if settlement.recipient_transaction_id else None
+    links=[]
+    for link in db.scalars(select(HouseholdSettlementPurchaseLink).where(HouseholdSettlementPurchaseLink.settlement_id==settlement.id).order_by(HouseholdSettlementPurchaseLink.created_at,HouseholdSettlementPurchaseLink.id)).all():
+        original=db.get(Transaction,link.original_transaction_id)
+        links.append({**serialize(link),'original_transaction_description':original.description if original else 'Deleted transaction','original_transaction_date':str(original.date) if original else None})
+    return {**serialize(settlement),'payer_name':users.get(settlement.payer_user_id,'Unknown user'),'recipient_name':users.get(settlement.recipient_user_id,'Unknown user'),'category_name':category.name if category else None,'payer_transaction_description':payer_transaction.description if payer_transaction else 'Deleted transaction','payer_transaction_date':str(payer_transaction.date) if payer_transaction else None,'recipient_transaction_description':recipient_transaction.description if recipient_transaction else None,'recipient_transaction_date':str(recipient_transaction.date) if recipient_transaction else None,'purchase_links':links}
+def add_household_settlement_links(settlement_id, links, db: Session):
+    for item in links:
+        values=item if isinstance(item,dict) else item.model_dump()
+        db.add(HouseholdSettlementPurchaseLink(settlement_id=settlement_id,**values))
+
+@app.get('/api/v1/household-settlements')
+def household_settlements(status:str|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db)
+    if status not in {None,'active','reversed'}: raise HTTPException(400,'Status must be active or reversed')
+    query=select(HouseholdSettlement).where(HouseholdSettlement.household_id==h)
+    if status: query=query.where(HouseholdSettlement.status==status)
+    items=db.scalars(query.order_by(HouseholdSettlement.created_at.desc(),HouseholdSettlement.id)).all()
+    return {'items':[serialize_household_settlement(item,h,db) for item in items]}
+@app.get('/api/v1/transactions/{transaction_id}/household-settlement')
+def transaction_household_settlement(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    items=db.scalars(select(HouseholdSettlement).where(HouseholdSettlement.household_id==h,or_(HouseholdSettlement.payer_transaction_id==transaction_id,HouseholdSettlement.recipient_transaction_id==transaction_id)).order_by(HouseholdSettlement.created_at.desc(),HouseholdSettlement.id)).all()
+    return {'items':[serialize_household_settlement(item,h,db) for item in items]}
+@app.post('/api/v1/household-settlements',status_code=201)
+def create_household_settlement(body:HouseholdSettlementIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); values=body.model_dump(); links=values.pop('purchase_links')
+    validate_household_settlement(h,{**values,'purchase_links':links},db)
+    settlement=HouseholdSettlement(household_id=h,status='active',**values);db.add(settlement);db.flush();add_household_settlement_links(settlement.id,links,db);db.commit()
+    return serialize_household_settlement(settlement,h,db)
+@app.patch('/api/v1/household-settlements/{settlement_id}')
+def update_household_settlement(settlement_id:UUID,body:HouseholdSettlementUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); settlement=db.get(HouseholdSettlement,settlement_id)
+    if not settlement or settlement.household_id!=h: raise HTTPException(404,'Household settlement not found')
+    if settlement.status!='active': raise HTTPException(409,'Reversed settlements cannot be edited')
+    changes=body.model_dump(exclude_unset=True); links=changes.pop('purchase_links',None)
+    fields=('payer_transaction_id','recipient_transaction_id','source_split_id','payer_user_id','recipient_user_id','settlement_amount','category_id','note','settlement_group_id')
+    values={field:getattr(settlement,field) for field in fields};values.update(changes)
+    current_links=[{'original_transaction_id':item.original_transaction_id,'original_split_id':item.original_split_id,'allocated_amount':float(item.allocated_amount),'note':item.note} for item in db.scalars(select(HouseholdSettlementPurchaseLink).where(HouseholdSettlementPurchaseLink.settlement_id==settlement.id)).all()]
+    validate_household_settlement(h,{**values,'purchase_links':current_links if links is None else links},db,settlement.id)
+    for field,value in values.items(): setattr(settlement,field,value)
+    if links is not None:
+        db.execute(delete(HouseholdSettlementPurchaseLink).where(HouseholdSettlementPurchaseLink.settlement_id==settlement.id));add_household_settlement_links(settlement.id,links,db)
+    db.commit();return serialize_household_settlement(settlement,h,db)
+@app.post('/api/v1/household-settlements/{settlement_id}/reverse')
+def reverse_household_settlement(settlement_id:UUID,body:HouseholdSettlementReverseIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); settlement=db.get(HouseholdSettlement,settlement_id)
+    if not settlement or settlement.household_id!=h: raise HTTPException(404,'Household settlement not found')
+    if settlement.status=='reversed': return serialize_household_settlement(settlement,h,db)
+    settlement.status='reversed';settlement.reversal_note=body.reversal_note;settlement.reversed_at=datetime.utcnow();db.commit()
+    return serialize_household_settlement(settlement,h,db)
+@app.delete('/api/v1/household-settlements/{settlement_id}',status_code=204)
+def delete_household_settlement(settlement_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); settlement=db.get(HouseholdSettlement,settlement_id)
+    if not settlement or settlement.household_id!=h: raise HTTPException(404,'Household settlement not found')
+    if settlement.status=='active': raise HTTPException(409,'Reverse an active settlement before deleting it')
+    db.delete(settlement);db.commit()
+
 def individual_biweekly_schedule(h, view_user_id, db):
     if not view_user_id: raise HTTPException(400,'Biweekly planning is available only in an individual user view')
     schedule=db.scalar(select(PlannerPaySchedule).where(PlannerPaySchedule.household_id==h,PlannerPaySchedule.owner_id==view_user_id,PlannerPaySchedule.is_active==True))

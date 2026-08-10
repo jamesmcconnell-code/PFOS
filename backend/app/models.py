@@ -27,6 +27,35 @@ class Transaction(Audit, Base):
     __tablename__='transactions'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE')); connection_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('data_connections.id',ondelete='SET NULL'),nullable=True); external_id: Mapped[str|None]=mapped_column(String(255),nullable=True); source_category: Mapped[str|None]=mapped_column(String(100),nullable=True); is_pending: Mapped[bool]=mapped_column(Boolean,default=False); category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True); owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True); date: Mapped[date]=mapped_column(Date); planner_effective_date: Mapped[date|None]=mapped_column(Date,nullable=True); description: Mapped[str]=mapped_column(String(255)); amount: Mapped[float]=mapped_column(Numeric(14,2)); notes: Mapped[str|None]=mapped_column(Text,nullable=True); is_essential: Mapped[bool]=mapped_column(Boolean,default=False); is_recurring: Mapped[bool]=mapped_column(Boolean,default=False); is_internal_transfer: Mapped[bool]=mapped_column(Boolean,default=False); is_refund: Mapped[bool]=mapped_column(Boolean,default=False); refund_included: Mapped[bool]=mapped_column(Boolean,default=True); is_expected: Mapped[bool]=mapped_column(Boolean,default=False); is_prorated: Mapped[bool]=mapped_column(Boolean,default=False); proration_months: Mapped[int]=mapped_column(default=12); fingerprint: Mapped[str|None]=mapped_column(String(64),nullable=True,index=True); __table_args__=(UniqueConstraint('connection_id','external_id',name='uq_transaction_connection_external'),)
 class TransactionSplit(Audit, Base):
     __tablename__='transaction_splits'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE')); member_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('household_members.id',ondelete='SET NULL'),nullable=True); owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True); ownership: Mapped[str]=mapped_column(String(20),default='joint'); category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True); is_refund: Mapped[bool]=mapped_column(Boolean,default=False); refund_included: Mapped[bool]=mapped_column(Boolean,default=True); amount: Mapped[float]=mapped_column(Numeric(14,2))
+class HouseholdSettlement(Audit, Base):
+    """Planner/reporting treatment for a confirmed repayment between members.
+
+    This intentionally records a treatment around imported transactions rather
+    than changing their amounts, categories, transfer flag, or bank history.
+    """
+    __tablename__='household_settlements'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE'),index=True)
+    payer_transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE'),index=True)
+    recipient_transaction_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('transactions.id',ondelete='SET NULL'),nullable=True,index=True)
+    source_split_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('transaction_splits.id',ondelete='SET NULL'),nullable=True,index=True)
+    payer_user_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    recipient_user_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('users.id',ondelete='CASCADE'),index=True)
+    settlement_amount: Mapped[float]=mapped_column(Numeric(14,2))
+    category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True)
+    note: Mapped[str|None]=mapped_column(Text,nullable=True)
+    settlement_group_id: Mapped[uuid.UUID|None]=mapped_column(nullable=True,index=True)
+    status: Mapped[str]=mapped_column(String(20),default='active',index=True)
+    reversal_note: Mapped[str|None]=mapped_column(Text,nullable=True)
+    reversed_at: Mapped[datetime|None]=mapped_column(DateTime,nullable=True)
+class HouseholdSettlementPurchaseLink(Audit, Base):
+    __tablename__='household_settlement_purchase_links'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    settlement_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('household_settlements.id',ondelete='CASCADE'),index=True)
+    original_transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE'),index=True)
+    original_split_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('transaction_splits.id',ondelete='SET NULL'),nullable=True,index=True)
+    allocated_amount: Mapped[float]=mapped_column(Numeric(14,2))
+    note: Mapped[str|None]=mapped_column(Text,nullable=True)
 class Tag(Audit, Base):
     __tablename__='tags'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(50))
 class TransactionTag(Base):
