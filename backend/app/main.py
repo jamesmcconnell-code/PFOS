@@ -108,6 +108,65 @@ def transaction_allocation_rows(transactions, db: Session, view_user_id: UUID|No
         else:
             rows.append({'transaction':item,'amount':float(item.amount),'category_id':item.category_id,'owner_id':None,'is_refund':item.is_refund,'refund_included':item.refund_included,'tag_ids':set(),'is_split':False,'split_id':None})
     return rows
+def scope_aware_transaction_allocations(transactions, db: Session, view_user_id: UUID|None=None):
+    """Expand raw allocations with explicit HouseholdSettlement view treatment.
+
+    Imported transaction data remains immutable.  A payer debit is represented as
+    a distinct settlement expense only in that payer's individual scope; a linked
+    recipient credit is informational only; and both legs are excluded jointly.
+    Normal residual amounts continue through the existing split allocation rules.
+    """
+    items=list(transactions)
+    raw_rows=transaction_allocation_rows(items,db,None)
+    transaction_ids={item.id for item in items}
+    if not transaction_ids:
+        return []
+    settlements=db.scalars(select(HouseholdSettlement).where(HouseholdSettlement.household_id==items[0].household_id,HouseholdSettlement.status=='active',or_(HouseholdSettlement.payer_transaction_id.in_(transaction_ids),HouseholdSettlement.recipient_transaction_id.in_(transaction_ids))).order_by(HouseholdSettlement.created_at,HouseholdSettlement.id)).all()
+    payer_by_allocation={}; recipient_by_transaction={}
+    for settlement in settlements:
+        payer_by_allocation.setdefault((settlement.payer_transaction_id,settlement.source_split_id),[]).append(settlement)
+        if settlement.recipient_transaction_id:
+            recipient_by_transaction.setdefault(settlement.recipient_transaction_id,[]).append([settlement,float(settlement.settlement_amount)])
+    def belongs_to_view(row):
+        return view_user_id is None or not row['is_split'] or row['owner_id']==view_user_id
+    def output(row, amount, treatment='normal', settlement=None, include_in_totals=True, category_id=None):
+        if abs(amount)<0.005: return None
+        return {**row,'amount':round(amount,2),'category_id':category_id if category_id is not None else row['category_id'],'scope_treatment':treatment,'include_in_totals':include_in_totals,'settlement_id':str(settlement.id) if settlement else None,'settlement_amount':float(settlement.settlement_amount) if settlement else None,'settlement_payer_user_id':str(settlement.payer_user_id) if settlement else None,'settlement_recipient_user_id':str(settlement.recipient_user_id) if settlement else None,'settlement_note':settlement.note if settlement else None}
+    rows=[]
+    for row in raw_rows:
+        item=row['transaction']; amount=float(row['amount']); visible=belongs_to_view(row)
+        payer_settlements=payer_by_allocation.get((item.id,row['split_id']),[])
+        if payer_settlements:
+            remaining=amount
+            for settlement in payer_settlements:
+                portion=-min(abs(remaining),float(settlement.settlement_amount))
+                remaining-=portion
+                treatment='household_settlement_expense' if view_user_id==settlement.payer_user_id else 'household_settlement_excluded'
+                derived=output(row,portion,treatment,settlement,view_user_id==settlement.payer_user_id,settlement.category_id or row['category_id'])
+                if derived: rows.append(derived)
+            normal=output(row,remaining)
+            if normal and visible: rows.append(normal)
+            continue
+        recipient_settlements=recipient_by_transaction.get(item.id,[])
+        if recipient_settlements and amount>0:
+            remaining=amount
+            for claim in recipient_settlements:
+                settlement,unassigned=claim
+                if unassigned<=0 or remaining<=0: continue
+                portion=min(remaining,unassigned);claim[1]-=portion;remaining-=portion
+                treatment='settlement_received' if view_user_id==settlement.recipient_user_id else 'household_settlement_excluded'
+                derived=output(row,portion,treatment,settlement,False,settlement.category_id or row['category_id'])
+                if derived: rows.append(derived)
+            normal=output(row,remaining)
+            if normal and visible: rows.append(normal)
+            continue
+        normal=output(row,amount)
+        if normal and visible: rows.append(normal)
+    return rows
+def active_settlement_transaction_ids(transactions, db: Session):
+    items=list(transactions); transaction_ids={item.id for item in items}
+    if not transaction_ids: return set()
+    return set(db.scalars(select(HouseholdSettlement.payer_transaction_id).where(HouseholdSettlement.household_id==items[0].household_id,HouseholdSettlement.status=='active',HouseholdSettlement.payer_transaction_id.in_(transaction_ids))).all())|set(db.scalars(select(HouseholdSettlement.recipient_transaction_id).where(HouseholdSettlement.household_id==items[0].household_id,HouseholdSettlement.status=='active',HouseholdSettlement.recipient_transaction_id.in_(transaction_ids))).all())
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
     row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
@@ -304,7 +363,8 @@ def category_tracker(start_date:date|None=None,end_date:date|None=None,view_user
     totals={str(category.id):{'id':str(category.id),'parent_id':str(category.parent_id) if category.parent_id else None,'name':category.name,'kind':category.kind,'transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0} for category in categories}
     totals['uncategorized']={'id':None,'name':'Uncategorized','kind':'uncategorized','transaction_count':0,'debits':0.0,'credits':0.0,'net_amount':0.0,'activity_total':0.0}
     transactions=db.scalars(select(Transaction).where(*category_tracker_filters(h,start,end,view_user_id,db))).all()
-    for allocation in transaction_allocation_rows(transactions,db,view_user_id):
+    for allocation in scope_aware_transaction_allocations(transactions,db,view_user_id):
+        if not allocation['include_in_totals']: continue
         row=totals.get(str(allocation['category_id']),totals['uncategorized']); amount=allocation['amount']; row['transaction_count']+=1; row['credits']+=max(amount,0); row['debits']+=abs(min(amount,0)); row['net_amount']+=amount; row['activity_total']+=abs(amount)
     return {'start_date':str(start),'end_date':str(end),'categories':list(totals.values())}
 
@@ -316,9 +376,10 @@ def category_tracker_transactions(start_date:date,end_date:date,category_id:UUID
         if not db.scalar(select(Category.id).where(Category.id==category_id,Category.household_id==h)): raise HTTPException(404,'Category not found')
     items=db.scalars(select(Transaction).where(*filters).order_by(Transaction.date.desc(),Transaction.id).limit(1000)).all(); accounts={x.id:x for x in db.scalars(select(Account).where(Account.household_id==h)).all()}
     result=[]
-    for allocation in transaction_allocation_rows(items,db,view_user_id):
+    for allocation in scope_aware_transaction_allocations(items,db,view_user_id):
+        if not allocation['include_in_totals']: continue
         if (uncategorized and allocation['category_id'] is not None) or (category_id and allocation['category_id']!=category_id): continue
-        item=allocation['transaction']; result.append(dict(serialize(item),id=str(allocation['split_id'] or item.id),parent_transaction_id=str(item.id),amount=allocation['amount'],category_id=str(allocation['category_id']) if allocation['category_id'] else None,is_split=allocation['is_split'],account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account'))
+        item=allocation['transaction']; result.append(dict(serialize(item),id=str(allocation['split_id'] or item.id),parent_transaction_id=str(item.id),amount=allocation['amount'],category_id=str(allocation['category_id']) if allocation['category_id'] else None,is_split=allocation['is_split'],scope_treatment=allocation['scope_treatment'],account_name=accounts.get(item.account_id).name if item.account_id in accounts else 'Unknown account'))
     return {'items':result}
 @app.post('/api/v1/transactions')
 def add_transaction(body:ManualTransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -685,7 +746,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     # payroll period for sources configured to fund the following period.
     income_lookback=31 if joint_view else (14 if biweekly_schedule else 16)
     income_source_ids=set(manual_by_source); income_query=select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.amount>0,Transaction.is_pending==False,or_(and_(Transaction.date>=start-timedelta(days=income_lookback),Transaction.date<end),and_(Transaction.planner_effective_date>=start-timedelta(days=income_lookback),Transaction.planner_effective_date<end),Transaction.id.in_(income_source_ids))) if account_ids else select(Transaction).where(False)
-    income_candidates=db.scalars(income_query).all(); income_by_id={item.id:item for item in income_candidates}
+    income_candidates=db.scalars(income_query).all()
+    settlement_income_transaction_ids=active_settlement_transaction_ids(income_candidates,db)
+    income_candidates=[item for item in income_candidates if item.id not in settlement_income_transaction_ids]
+    manual_income_allocations=[record for record in manual_income_allocations if record.source_transaction_id not in settlement_income_transaction_ids]
+    manual_by_source={}
+    for record in manual_income_allocations: manual_by_source[record.source_transaction_id]=manual_by_source.get(record.source_transaction_id,0)+float(record.amount)
+    income_by_id={item.id:item for item in income_candidates}
+    period_allocations=scope_aware_transaction_allocations(transactions_in_period,db,view_user_id)
     relevant_tags=designated_tags|loan_reimbursement_tags
     tag_pairs=db.execute(select(TransactionTag.transaction_id,TransactionTag.tag_id).where(TransactionTag.transaction_id.in_([item.id for item in transactions_in_period]),TransactionTag.tag_id.in_(relevant_tags))).all() if transactions_in_period and relevant_tags else []
     tagged={transaction_id for transaction_id,tag_id in tag_pairs if tag_id in designated_tags}
@@ -694,13 +762,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         category_id=item.category_id if category_id is None else category_id
         category_name=(categories.get(category_id).name if category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
-    paycheck=automated=refunds_total=fixed_regular=expected=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]
+    paycheck=automated=refunds_total=fixed_regular=expected=household_settlement_expenses=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]; household_settlement_sources=[]; settlement_received_sources=[]
     # Only refunds explicitly marked Prorated are spread across the calendar
     # month. Ordinary refund credits keep their actual posting-period behavior.
     month_start=anchor.replace(day=1); month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
     month_refunds=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_pending==False,Transaction.is_prorated==True,or_(and_(Transaction.date>=month_start,Transaction.date<month_end),and_(Transaction.planner_effective_date>=month_start,Transaction.planner_effective_date<month_end)))).all() if account_ids else []
     prorated_refund_ids=set()
-    for allocation in transaction_allocation_rows(month_refunds,db,view_user_id):
+    for allocation in scope_aware_transaction_allocations(month_refunds,db,view_user_id):
+        if not allocation['include_in_totals']: continue
         item=allocation['transaction']; amount=allocation['amount']
         if not (month_start<=planner_effective_date(item)<month_end): continue
         if amount<=0 or not allocation['is_refund']:
@@ -803,10 +872,18 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
                     if source['id']==str(actual.id): source.update(allocation_type='reconciled_actual',expected_amount=float(rule.expected_amount),variance=variance)
                 continue
             amount=float(rule.expected_amount); row={'id':f'anticipated-{rule.id}-{occurrence}','description':rule.display_name,'date':None,'available_period_start':str(occurrence),'account_name':rule_account.name if rule_account else 'Anticipated','amount':amount,'allocation_type':'anticipated','income_status':'anticipated','status':'anticipated',**rule_scope};paycheck+=amount;paycheck_sources.append(row);anticipated_paychecks.append({'rule_id':str(rule.id),**row})
-    for allocation in transaction_allocation_rows(transactions_in_period,db,view_user_id):
+    for allocation in period_allocations:
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         effective_date=planner_effective_date(item)
         if item.planner_effective_date and not (start<=effective_date<end): continue
+        if allocation['scope_treatment']=='settlement_received':
+            settlement_received_sources.append({'id':f"settlement-received-{allocation['settlement_id']}",'settlement_id':allocation['settlement_id'],'date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':amount,'category_id':str(category_id) if category_id else None,'status':'settlement_received','include_in_totals':False})
+            continue
+        if not allocation['include_in_totals']: continue
+        if allocation['scope_treatment']=='household_settlement_expense':
+            value=abs(amount); household_settlement_expenses+=value
+            household_settlement_sources.append({'id':f"settlement-{allocation['settlement_id']}",'settlement_id':allocation['settlement_id'],'date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value,'category_id':str(category_id) if category_id else None,'category_name':categories[category_id].name if category_id in categories else None,'payer_user_id':allocation['settlement_payer_user_id'],'recipient_user_id':allocation['settlement_recipient_user_id'],'note':allocation['settlement_note'],'status':'household_settlement','scope_treatment':'household_settlement_expense'})
+            continue
         # An explicit refund classification takes precedence over the transfer
         # heuristic. A reimbursement may be received in any account role.
         if amount>0 and allocation['is_refund']:
@@ -844,29 +921,31 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
             expense_input_sources.append({'id':str(item.id),'type':'Fixed','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'period_amount':value})
     prorated_candidates=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(account_ids),Transaction.is_prorated==True,Transaction.is_pending==False,or_(Transaction.date<=anchor,Transaction.planner_effective_date<=anchor)).order_by(Transaction.date.desc())).all() if account_ids else []
     active_prorated=[]
-    for item in prorated_candidates:
+    for allocation in scope_aware_transaction_allocations(prorated_candidates,db,view_user_id):
+        if not allocation['include_in_totals'] or allocation['scope_treatment']!='normal': continue
+        item=allocation['transaction']
         account=accounts_by_id[item.account_id]; duration=max(1,int(item.proration_months or 12))
         # A purchase contributes from its purchase date up to, but not including,
         # the matching duration anniversary (3, 6, 12 months, or another choice).
         effective_date=planner_effective_date(item)
-        if float(item.amount)<0 and not is_debt_payment(item,account) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(item)
-    prorated_total=sum(abs(float(item.amount)) for item in active_prorated); period_divisor=(26 if period=='biweekly' else (24 if period=='paycheck' else 12)); prorated_expenses=sum(abs(float(item.amount))/(int(item.proration_months or 12)*period_divisor/12) for item in active_prorated)
-    for item in active_prorated:
-        account=accounts_by_id[item.account_id]; value=abs(float(item.amount)); duration=int(item.proration_months or 12); effective_date=planner_effective_date(item); expense_input_sources.append({'id':str(item.id),'type':'Prorated','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
+        if float(allocation['amount'])<0 and not is_debt_payment(item,account,allocation['category_id']) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(allocation)
+    prorated_total=sum(abs(float(item['amount'])) for item in active_prorated); period_divisor=(26 if period=='biweekly' else (24 if period=='paycheck' else 12)); prorated_expenses=sum(abs(float(item['amount']))/(int(item['transaction'].proration_months or 12)*period_divisor/12) for item in active_prorated)
+    for allocation in active_prorated:
+        item=allocation['transaction']; account=accounts_by_id[item.account_id]; value=abs(float(allocation['amount'])); duration=int(item.proration_months or 12); effective_date=planner_effective_date(item); expense_input_sources.append({'id':str(allocation['split_id'] or item.id),'type':'Prorated','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
     anticipated_expenses=0.0; anticipated_expense_sources=[]; reconciled_anticipated_expenses=[]
     # A rule is projected only when no source or matching actual charge is already
     # providing this period's allocation. This keeps imported actuals authoritative.
-    actual_candidates=[item for item in transactions_in_period if start<=planner_effective_date(item)<end and planner_effective_date(item)<=anchor and float(item.amount)<0 and not item.is_internal_transfer]
+    actual_candidates=[allocation for allocation in period_allocations if allocation['include_in_totals'] and allocation['scope_treatment']=='normal' and start<=planner_effective_date(allocation['transaction'])<end and planner_effective_date(allocation['transaction'])<=anchor and float(allocation['amount'])<0 and not allocation['transaction'].is_internal_transfer]
     for rule in expense_rules:
         # A rule begins forecasting only once its activation date reaches the
         # selected period. This keeps a newly configured rule out of history.
         effective_start=rule.effective_start_date or rule.created_at.date()
         if end<=effective_start: continue
-        actual=next((item for item in active_prorated if planner_expense_rule_matches(rule,item)),None)
-        actual=actual or next((item for item in actual_candidates if planner_expense_rule_matches(rule,item)),None)
+        actual=next((item for item in active_prorated if planner_expense_rule_matches(rule,item['transaction'])),None)
+        actual=actual or next((item for item in actual_candidates if planner_expense_rule_matches(rule,item['transaction'])),None)
         if actual:
-            actual_monthly=abs(float(actual.amount))/max(1,int(actual.proration_months or 1))
-            reconciled_anticipated_expenses.append({'rule_id':str(rule.id),'display_name':rule.display_name,'actual_transaction_id':str(actual.id),'actual_amount':actual_monthly,'projected_amount':float(rule.monthly_projected_amount),'variance':actual_monthly-float(rule.monthly_projected_amount),'status':'actual'})
+            actual_transaction=actual['transaction']; actual_monthly=abs(float(actual['amount']))/max(1,int(actual_transaction.proration_months or 1))
+            reconciled_anticipated_expenses.append({'rule_id':str(rule.id),'display_name':rule.display_name,'actual_transaction_id':str(actual_transaction.id),'actual_amount':actual_monthly,'projected_amount':float(rule.monthly_projected_amount),'variance':actual_monthly-float(rule.monthly_projected_amount),'status':'actual'})
             continue
         period_amount=float(rule.monthly_projected_amount)*(12/26 if period=='biweekly' else (1/2 if period=='paycheck' else 1))
         anticipated_expenses+=period_amount
@@ -875,8 +954,8 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     # paycheck and automated-savings inflows while transparently reducing costs.
     raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
     regular_expected_prorated=fixed_regular+expected+prorated_expenses; debt_total=sum(item['amount'] for item in debt_items)
-    gross_total_expenses=regular_expected_prorated+debt_total; combined_expenses=gross_total_expenses+anticipated_expenses; total_expenses=combined_expenses-refunds_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'joint_display_cadence':joint_display_cadence(period) if joint_view else None,'joint_display_biweekly_anchor':str(display_biweekly_anchor) if joint_view and period=='biweekly' else None,'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'anticipated_paychecks':anticipated_paychecks,'reconciled_paychecks':reconciled_paychecks,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'actual_expense_total':gross_total_expenses,'anticipated_expense_total':anticipated_expenses,'combined_period_expense_total':combined_expenses,'anticipated_expense_sources':anticipated_expense_sources,'reconciled_anticipated_expenses':reconciled_anticipated_expenses,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    gross_total_expenses=regular_expected_prorated+debt_total+household_settlement_expenses; combined_expenses=gross_total_expenses+anticipated_expenses; total_expenses=combined_expenses-refunds_total
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'joint_display_cadence':joint_display_cadence(period) if joint_view else None,'joint_display_biweekly_anchor':str(display_biweekly_anchor) if joint_view and period=='biweekly' else None,'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'anticipated_paychecks':anticipated_paychecks,'reconciled_paychecks':reconciled_paychecks,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'household_settlement_expenses':household_settlement_expenses,'household_settlement_sources':household_settlement_sources,'settlement_received_sources':settlement_received_sources,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'actual_expense_total':gross_total_expenses,'anticipated_expense_total':anticipated_expenses,'combined_period_expense_total':combined_expenses,'anticipated_expense_sources':anticipated_expense_sources,'reconciled_anticipated_expenses':reconciled_anticipated_expenses,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 def validate_planner_expense_rule(h, values, db: Session):
     account=db.get(Account,values['account_id'])
@@ -1041,6 +1120,7 @@ def validate_income_allocation(h, body, view_user_id, db: Session, exclude_id=No
     if body.period_type not in {'paycheck','biweekly','monthly'}: raise HTTPException(400,'Period type must be paycheck, biweekly, or monthly')
     transaction=db.get(Transaction,body.source_transaction_id)
     if not transaction or transaction.household_id!=h or float(transaction.amount)<=0: raise HTTPException(400,'Select a positive household transaction')
+    if transaction.id in active_settlement_transaction_ids([transaction],db): raise HTTPException(400,'Household settlement credits cannot be assigned as paychecks')
     account=db.get(Account,transaction.account_id)
     if not account or account.account_type!='spending' or transaction.is_internal_transfer or transaction.is_refund: raise HTTPException(400,'Only non-transfer spending-account credits can be assigned as paychecks')
     if view_user_id and account.ownership=='individual' and account.owner_id!=view_user_id: raise HTTPException(400,'Transaction is outside the selected user view')
@@ -1056,7 +1136,7 @@ def planner_income_allocations(period_type:str|None=None,view_user_id:UUID|None=
 def planner_income_candidates(anchor_date:date|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); anchor=anchor_date or date.today(); account_q=select(Account).where(Account.household_id==h,Account.account_type=='spending',Account.is_active==True)
     if view_user_id: account_q=account_q.where(Account.ownership=='individual',Account.owner_id==view_user_id)
-    accounts={item.id:item for item in db.scalars(account_q).all()}; items=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(accounts),Transaction.amount>0,Transaction.is_internal_transfer==False,Transaction.is_refund==False,Transaction.is_pending==False,Transaction.date>=anchor-timedelta(days=90),Transaction.date<=anchor+timedelta(days=31)).order_by(Transaction.date.desc())).all() if accounts else []
+    accounts={item.id:item for item in db.scalars(account_q).all()}; items=db.scalars(select(Transaction).where(Transaction.household_id==h,Transaction.account_id.in_(accounts),Transaction.amount>0,Transaction.is_internal_transfer==False,Transaction.is_refund==False,Transaction.is_pending==False,Transaction.date>=anchor-timedelta(days=90),Transaction.date<=anchor+timedelta(days=31)).order_by(Transaction.date.desc())).all() if accounts else []; items=[item for item in items if item.id not in active_settlement_transaction_ids(items,db)]
     return [{'id':str(item.id),'date':str(item.date),'description':item.description,'amount':float(item.amount),'account_name':accounts[item.account_id].name,'default_paycheck_period_start':str(default_paycheck_availability_start(item.date))} for item in items]
 @app.post('/api/v1/planner-income-allocations')
 def add_planner_income_allocation(body:PlannerIncomeAllocationIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -1129,6 +1209,7 @@ def delete_planner_income_rule(rule_id:UUID,view_user_id:UUID|None=None,user=Dep
 def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db);validate_view_member(h,view_user_id,db);t=db.get(Transaction,transaction_id)
     if not t or t.household_id!=h or float(t.amount)<=0 or t.is_pending or t.is_internal_transfer or t.is_refund: raise HTTPException(400,'Transaction is not an eligible paycheck credit')
+    if t.id in active_settlement_transaction_ids([t],db): raise HTTPException(400,'Transaction is not an eligible paycheck credit')
     account=db.get(Account,t.account_id);loan_tag=db.scalar(select(Tag.id).where(Tag.household_id==h,func.lower(Tag.name)=='loan reimbursement'))
     if not account or account.account_type!='spending' or (loan_tag and db.scalar(select(TransactionTag.transaction_id).where(TransactionTag.transaction_id==t.id,TransactionTag.tag_id==loan_tag))): raise HTTPException(400,'Transaction is not an eligible paycheck credit')
     rule_owner=view_user_id or (account.owner_id if account.ownership=='individual' else None); values={'account_id':t.account_id,'display_name':t.description[:120],'expected_amount':float(t.amount),'cadence':'twice_monthly','availability_day':1,'effective_start_date':date.today(),'source_description':t.description};validate_income_rule(h,values,rule_owner,db)
@@ -1362,7 +1443,8 @@ def monthly_breakdown(accounts, transactions, rules, db, manual_income=0.0, view
             sources[account.id]={'account_id':str(account.id),'account_name':account.name,'source_name':connection_names.get(account.connection_id,'Manual'),'account_type':account.account_type,'income':0.0,'expenses':0.0,'automated_savings':0.0,'spending_cash_flow':0.0}
         return sources[account.id]
     automated=spending_net=expenses=essential=transaction_income=0.0
-    for allocation in transaction_allocation_rows(transactions,db,view_user_id):
+    for allocation in scope_aware_transaction_allocations(transactions,db,view_user_id):
+        if not allocation['include_in_totals']: continue
         item=allocation['transaction']
         if item.is_internal_transfer: continue
         account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
@@ -1441,7 +1523,7 @@ def finance_trends(months:int=6,view_user_id:UUID|None=None,user=Depends(current
     series=[]
     for month_start in month_starts:
         month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
-        point=monthly_breakdown(accounts,[item for item in transactions_in_range if month_start<=item.date<month_end],rules,db,manual_income)
+        point=monthly_breakdown(accounts,[item for item in transactions_in_range if month_start<=item.date<month_end],rules,db,manual_income,view_user_id)
         series.append({'month':str(month_start),'label':month_start.strftime('%b %Y'),**point})
     return {'months':months,'series':series}
 
@@ -1491,16 +1573,18 @@ def reports(timeframe:str='3M',view_user_id:UUID|None=None,user=Depends(current_
             if account.account_type=='debt': debt+=abs(value); types['debt']+=abs(value)
             else: assets+=value; types[account.account_type]=types.get(account.account_type,0)+value
         net_worth_series.append({'date':str(point),'label':point.strftime('%b %-d' if timeframe in {'1M','3M'} else '%b %Y'),'assets':round(assets,2),'liabilities':round(debt,2),'net_worth':round(assets-debt,2),'by_account_type':{key:round(value,2) for key,value in types.items()}})
-    start=dates[0]; expense_transactions=[item for item in all_transactions if start<=item.date<=date.today() and float(item.amount)<0 and not item.is_internal_transfer and account_by_id[item.account_id].account_type in {'spending','debt'}]
+    report_allocations=scope_aware_transaction_allocations(all_transactions,db,view_user_id)
+    start=dates[0]; expense_allocations=[allocation for allocation in report_allocations if allocation['include_in_totals'] and start<=allocation['transaction'].date<=date.today() and float(allocation['amount'])<0 and not allocation['transaction'].is_internal_transfer and account_by_id[allocation['transaction'].account_id].account_type in {'spending','debt'}]
     categories={category.id:category.name for category in db.scalars(select(Category).where(Category.household_id==h)).all()}
     category_totals={}
-    for item in expense_transactions: category_totals[categories.get(item.category_id,'Uncategorized')]=category_totals.get(categories.get(item.category_id,'Uncategorized'),0)+abs(float(item.amount))
+    for allocation in expense_allocations:
+        category_name=categories.get(allocation['category_id'],'Uncategorized'); category_totals[category_name]=category_totals.get(category_name,0)+abs(float(allocation['amount']))
     monthly_points=[]; month_cursor=start.replace(day=1); current_month=date.today().replace(day=1)
     while month_cursor<=current_month:
         month_end=(month_cursor.replace(day=28)+timedelta(days=4)).replace(day=1)
-        month_items=[item for item in expense_transactions if month_cursor<=item.date<month_end]
-        recurring=sum(abs(float(item.amount)) for item in month_items if item.is_recurring or item.is_expected or item.is_prorated)
-        discretionary=sum(abs(float(item.amount)) for item in month_items if not (item.is_recurring or item.is_expected or item.is_prorated))
+        month_items=[allocation for allocation in expense_allocations if month_cursor<=allocation['transaction'].date<month_end]
+        recurring=sum(abs(float(item['amount'])) for item in month_items if item['transaction'].is_recurring or item['transaction'].is_expected or item['transaction'].is_prorated)
+        discretionary=sum(abs(float(item['amount'])) for item in month_items if not (item['transaction'].is_recurring or item['transaction'].is_expected or item['transaction'].is_prorated))
         monthly_points.append({'month':str(month_cursor),'label':month_cursor.strftime('%b %Y'),'recurring':round(recurring,2),'discretionary':round(discretionary,2),'total':round(recurring+discretionary,2)})
         month_cursor=month_end
     latest_spend=monthly_points[-1]['total'] if monthly_points else 0; previous_spend=monthly_points[-2]['total'] if len(monthly_points)>1 else 0
@@ -1509,11 +1593,11 @@ def reports(timeframe:str='3M',view_user_id:UUID|None=None,user=Depends(current_
     current_values={account.id:(float(account.crypto_usd_value or 0) if account.account_type=='crypto' else float(account.balance)) for account in accounts}
     investment_accounts=[account for account in accounts if account.account_type in {'brokerage','crypto'}]
     investment_value=sum(current_values[account.id] for account in investment_accounts)
-    investment_contributions=sum(float(item.amount) for item in all_transactions if item.account_id in {account.id for account in investment_accounts} and float(item.amount)>0 and not item.is_internal_transfer)
+    investment_contributions=sum(float(item['amount']) for item in report_allocations if item['include_in_totals'] and item['transaction'].account_id in {account.id for account in investment_accounts} and float(item['amount'])>0 and not item['transaction'].is_internal_transfer)
     allocation=[{'name':account.name,'type':account.account_type,'value':round(current_values[account.id],2)} for account in investment_accounts if current_values[account.id]!=0]
     latest_month_transactions=[item for item in all_transactions if current_month<=item.date<=date.today()]
     rules=db.scalars(select(SavingsRule).where(SavingsRule.household_id==h,SavingsRule.is_active==True)).all()
-    current_cash=monthly_breakdown(accounts,latest_month_transactions,rules,db)
+    current_cash=monthly_breakdown(accounts,latest_month_transactions,rules,db,view_user_id=view_user_id)
     target=float(db.get(Household,h).checking_account_ceiling or 0) or average_spend
     current_net=net_worth_series[-1]['net_worth'] if net_worth_series else 0; previous_net=net_worth_series[0]['net_worth'] if net_worth_series else 0
     return {'timeframe':timeframe,'net_worth':{'current':current_net,'change':round(current_net-previous_net,2),'change_percent':round(((current_net-previous_net)/abs(previous_net))*100,1) if previous_net else 0,'series':net_worth_series},'investments':{'current_value':round(investment_value,2),'net_contributions':round(investment_contributions,2),'return_amount':round(investment_value-investment_contributions,2),'return_percent':round(((investment_value-investment_contributions)/investment_contributions)*100,1) if investment_contributions else None,'allocation':allocation},'cost_of_living':{'average_monthly_spend':round(average_spend,2),'projected_month_end_spend':round(latest_spend/elapsed*month_days,2),'month_over_month_percent':round(((latest_spend-previous_spend)/previous_spend)*100,1) if previous_spend else None,'series':monthly_points,'recurring_total':round(sum(point['recurring'] for point in monthly_points),2),'discretionary_total':round(sum(point['discretionary'] for point in monthly_points),2)},'cash_flow':{'income':current_cash['monthly_income'],'savings':current_cash['monthly_savings'],'expenses':current_cash['monthly_expenses'],'categories':[{'name':name,'value':round(value,2)} for name,value in sorted(category_totals.items(),key=lambda row:row[1],reverse=True)]},'simple_mode':{'net_worth_trend':net_worth_series,'spend_target':{'actual':round(latest_spend,2),'target':round(target,2),'target_source':'Checking ceiling' if float(db.get(Household,h).checking_account_ceiling or 0) else 'Average monthly spend'},'top_categories':[{'name':name,'value':round(value,2)} for name,value in sorted(category_totals.items(),key=lambda row:row[1],reverse=True)[:3]]}}

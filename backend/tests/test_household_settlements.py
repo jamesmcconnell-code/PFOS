@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -7,7 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import create_household_settlement, delete_household_settlement, household_settlements, reverse_household_settlement, transaction_household_settlement, update_household_settlement
+from app.main import available_cash_planner, category_tracker, create_household_settlement, delete_household_settlement, household_settlements, income_rule_from_transaction, metrics, planner_cash_history, planner_income_candidates, reports, reverse_household_settlement, scope_aware_transaction_allocations, transaction_household_settlement, update_household_settlement
 from app.models import Account, Category, Household, HouseholdMember, HouseholdSettlement, HouseholdSettlementPurchaseLink, Transaction, TransactionSplit, User
 from app.schemas import HouseholdSettlementIn, HouseholdSettlementPurchaseLinkIn, HouseholdSettlementReverseIn, HouseholdSettlementUpdate
 
@@ -94,3 +94,74 @@ def test_multiple_settlements_can_link_to_one_original_purchase():
     db.add_all([second_payer,second_recipient]);db.commit()
     second=create_household_settlement(HouseholdSettlementIn(payer_transaction_id=second_payer.id,recipient_transaction_id=second_recipient.id,payer_user_id=bailey.id,recipient_user_id=james.id,settlement_amount=20,purchase_links=[HouseholdSettlementPurchaseLinkIn(original_transaction_id=grocery_one.id,allocated_amount=20)]),admin,db)
     assert first['purchase_links'][0]['original_transaction_id']==second['purchase_links'][0]['original_transaction_id']
+
+
+def test_settlement_treatment_is_payer_expense_recipient_info_and_joint_exclusion():
+    db,admin,bailey,james,home,groceries,payer,recipient,grocery_one,grocery_two=settlement_context()
+    today=date.today()
+    for transaction in (payer,recipient,grocery_one,grocery_two): transaction.date=today
+    db.commit()
+    create_household_settlement(settlement_body(bailey,james,groceries,payer,recipient,
+        HouseholdSettlementPurchaseLinkIn(original_transaction_id=grocery_one.id,allocated_amount=60),
+        HouseholdSettlementPurchaseLinkIn(original_transaction_id=grocery_two.id,allocated_amount=20),
+    ),admin,db)
+
+    bailey_planner=available_cash_planner('monthly',today,bailey.id,admin,db)
+    james_planner=available_cash_planner('monthly',today,james.id,admin,db)
+    joint_planner=available_cash_planner('monthly',today,None,admin,db)
+
+    assert bailey_planner['household_settlement_expenses']==80
+    assert bailey_planner['actual_expense_total']==80
+    assert bailey_planner['fixed_regular_expenses']==0
+    assert bailey_planner['total_period_expenses']==80
+    assert bailey_planner['free_spending_before_savings']==-80
+    assert bailey_planner['household_settlement_sources'][0]['scope_treatment']=='household_settlement_expense'
+    assert james_planner['settlement_received_sources'][0]['amount']==80
+    assert james_planner['actual_expense_total']==80
+    assert joint_planner['household_settlement_expenses']==0
+    assert joint_planner['actual_expense_total']==80
+    assert joint_planner['total_period_expenses']==80
+
+    bailey_metrics=metrics(home.id,db,bailey.id)
+    james_metrics=metrics(home.id,db,james.id)
+    joint_metrics=metrics(home.id,db)
+    assert bailey_metrics['monthly_expenses']==80
+    assert james_metrics['monthly_income']==0
+    assert joint_metrics['monthly_expenses']==80
+    assert joint_metrics['monthly_savings']==-80
+    assert planner_income_candidates(today,james.id,admin,db)==[]
+    with pytest.raises(HTTPException,match='eligible paycheck'):
+        income_rule_from_transaction(recipient.id,james.id,admin,db)
+
+    joint_categories=category_tracker(today,today,None,admin,db)
+    assert next(item for item in joint_categories['categories'] if item['id']==str(groceries.id))['debits']==80
+    report=reports('1M',None,admin,db)
+    assert report['cash_flow']['expenses']==80
+    assert report['cash_flow']['categories'][0]['value']==80
+
+
+def test_partial_and_split_settlements_preserve_normal_residual_allocations_and_rolling_cash():
+    db,admin,bailey,james,home,groceries,payer,recipient,grocery_one,grocery_two=settlement_context()
+    prior_month=(date.today().replace(day=1)-timedelta(days=1)).replace(day=1)
+    payer.date=prior_month;recipient.date=prior_month;grocery_one.date=prior_month;grocery_two.date=prior_month
+    payer.amount=-100;recipient.amount=80;grocery_one.amount=-80;db.commit()
+    create_household_settlement(HouseholdSettlementIn(payer_transaction_id=payer.id,recipient_transaction_id=recipient.id,payer_user_id=bailey.id,recipient_user_id=james.id,settlement_amount=80,category_id=groceries.id),admin,db)
+
+    allocations=scope_aware_transaction_allocations([payer],db,bailey.id)
+    assert sorted((item['scope_treatment'],item['amount']) for item in allocations)==[('household_settlement_expense',-80.0),('normal',-20.0)]
+    bailey_planner=available_cash_planner('monthly',prior_month,bailey.id,admin,db)
+    assert bailey_planner['household_settlement_expenses']==80
+    assert bailey_planner['fixed_regular_expenses']==20
+    assert bailey_planner['total_period_expenses']==100
+    history=planner_cash_history(home.id,'monthly',prior_month,bailey.id,admin,db)
+    assert history['current']['free_spending']==-100
+    assert history['current']['ending_rolling_available_cash']==-100
+
+    split_payer=Transaction(household_id=home.id,account_id=payer.account_id,date=prior_month,description='Split Venmo',amount=-100)
+    db.add(split_payer);db.flush()
+    settlement_split=TransactionSplit(transaction_id=split_payer.id,owner_id=bailey.id,ownership='individual',amount=-60)
+    normal_split=TransactionSplit(transaction_id=split_payer.id,owner_id=bailey.id,ownership='individual',amount=-40)
+    db.add_all([settlement_split,normal_split]);db.commit()
+    create_household_settlement(HouseholdSettlementIn(payer_transaction_id=split_payer.id,source_split_id=settlement_split.id,payer_user_id=bailey.id,recipient_user_id=james.id,settlement_amount=50,category_id=groceries.id),admin,db)
+    split_allocations=scope_aware_transaction_allocations([split_payer],db,bailey.id)
+    assert sorted((item['scope_treatment'],item['amount']) for item in split_allocations)==[('household_settlement_expense',-50.0),('normal',-40.0),('normal',-10.0)]
