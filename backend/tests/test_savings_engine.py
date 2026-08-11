@@ -312,6 +312,12 @@ def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
     assert result['current']['manual_adjustments']==-50
     assert result['current']['ending_rolling_available_cash']==850
 
+    filtered=planner_cash_history(home.id,'paycheck',date(2026,8,20),None,user,db,limit=18,start_date=date(2026,8,16))
+    assert filtered['display_start_date']=='2026-08-16'
+    assert len(filtered['history'])==1
+    assert filtered['opening_balance_before_display_range']==100
+    assert filtered['current']['ending_rolling_available_cash']==result['current']['ending_rolling_available_cash']
+
 def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolation():
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     james=User(email='rolling-james@example.com',display_name='James',password_hash='x');bailey=User(email='rolling-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()

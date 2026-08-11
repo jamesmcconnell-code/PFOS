@@ -1019,9 +1019,11 @@ def planner_period_anchor(h, view_user_id, period_type, db):
     if period_type!='biweekly': return None
     return JOINT_BIWEEKLY_DISPLAY_ANCHOR if view_user_id is None else individual_biweekly_schedule(h,view_user_id,db).biweekly_anchor_start_date
 def planner_scope_filter(model, view_user_id): return model.owner_id==view_user_id if view_user_id else model.owner_id.is_(None)
-def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session, limit=12):
+def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session, limit=12, start_date: date|None=None):
     """Derive running planner cash from source transactions plus the small ledger."""
     validate_view_member(h,view_user_id,db); biweekly_anchor=planner_period_anchor(h,view_user_id,period_type,db); target=planner_period_start(period_type,anchor,biweekly_anchor)
+    display_start=planner_period_start(period_type,start_date,biweekly_anchor) if start_date else None
+    if display_start and display_start>target: raise HTTPException(400,'History start date cannot be after the selected planner period')
     account_query=select(Account.id).where(Account.household_id==h,Account.is_active==True)
     if view_user_id: account_query=account_query.where(Account.ownership=='individual',Account.owner_id==view_user_id)
     account_ids=list(db.scalars(account_query).all())
@@ -1068,12 +1070,15 @@ def planner_cash_history(h, period_type, anchor, view_user_id, user, db: Session
             goal_sweeps.append({**{key:value for key,value in goal.items() if key!='remaining'},'amount':allocation,'status':'forecast'})
         history.append({'period_start':str(cursor),'period_end':planner['period_end'],'period_label':planner['period_label'],'paycheck_amount':float(planner['paycheck_amount']),'actual_expenses':float(planner['actual_expense_total']),'anticipated_expenses':float(planner['anticipated_expense_total']),'refund_credits':float(planner['refund_expense_offset']),'total_period_expenses':float(planner['total_period_expenses']),'free_spending':free,'free_spending_included':free_spending_included,'included_free_spending':included_free_spending,'manual_adjustments':adjustment_total,'adjustments':[serialize(item) for item in period_adjustments],'opening_carryover':float(opening.amount) if opening else None,'previous_carryover':previous,'ending_before_goal_sweeps':ending_before_goal_sweeps,'goal_sweep_total':sum(item['amount'] for item in goal_sweeps),'goal_sweeps':goal_sweeps,'ending_rolling_available_cash':running})
         cursor=next_cursor
-    return {'period_type':period_type,'anchor_date':str(anchor),'scope_user_id':str(view_user_id) if view_user_id else None,'history':history[-limit:],'current':history[-1] if history else None}
+    visible_history=[item for item in history if date.fromisoformat(item['period_start'])>=display_start] if display_start else history[-limit:]
+    if display_start and len(visible_history)>limit: raise HTTPException(400,f'History range exceeds the {limit}-period limit; choose a later start date')
+    opening_before_range=visible_history[0]['previous_carryover'] if visible_history else 0.0
+    return {'period_type':period_type,'anchor_date':str(anchor),'scope_user_id':str(view_user_id) if view_user_id else None,'display_start_date':str(display_start) if display_start else (visible_history[0]['period_start'] if visible_history else None),'opening_balance_before_display_range':opening_before_range,'history':visible_history,'current':history[-1] if history else None}
 
 @app.get('/api/v1/available-cash-planner/history')
-def available_cash_planner_history(period:str='paycheck',anchor_date:date|None=None,limit:int=12,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+def available_cash_planner_history(period:str='paycheck',anchor_date:date|None=None,start_date:date|None=None,limit:int=12,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     if limit<1 or limit>60: raise HTTPException(400,'History limit must be between 1 and 60')
-    h=household(user,db); return planner_cash_history(h,period,anchor_date or date.today(),view_user_id,user,db,limit)
+    h=household(user,db); return planner_cash_history(h,period,anchor_date or date.today(),view_user_id,user,db,limit,start_date)
 @app.get('/api/v1/planner-carryovers')
 def planner_carryovers(period_type:str|None=None,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); query=select(PlannerStartingCarryover).where(PlannerStartingCarryover.household_id==h,planner_scope_filter(PlannerStartingCarryover,view_user_id))
