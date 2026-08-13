@@ -90,6 +90,46 @@ class TransactionPlannerFlagsUpdate(BaseModel):
     is_expected: bool|None=None
     is_prorated: bool|None=None
     proration_months: int|None=Field(default=None,ge=1,le=120)
+class TransactionClassificationRuleIn(BaseModel):
+    owner_id: UUID|None=None
+    account_id: UUID|None=None
+    normalized_merchant_key: str|None=Field(default=None,min_length=1,max_length=255)
+    description_pattern: str|None=Field(default=None,min_length=1,max_length=255)
+    direction: str='any'
+    financial_role: str|None=None
+    category_id: UUID|None=None
+    classified_owner_id: UUID|None=None
+    tag_ids: list[UUID]=Field(default_factory=list,max_length=50)
+    essential: bool|None=None
+    internal_transfer: bool|None=None
+    refund_credit: bool|None=None
+    loan_reimbursement: bool|None=None
+    expected: bool|None=None
+    prorated: bool|None=None
+    proration_months: int|None=Field(default=None,ge=1,le=120)
+    priority: int=Field(default=100,ge=0,le=100000)
+    is_active: bool=True
+    source_type: str='user_authored'
+class TransactionClassificationRuleUpdate(BaseModel):
+    owner_id: UUID|None=None
+    account_id: UUID|None=None
+    normalized_merchant_key: str|None=Field(default=None,min_length=1,max_length=255)
+    description_pattern: str|None=Field(default=None,min_length=1,max_length=255)
+    direction: str|None=None
+    financial_role: str|None=None
+    category_id: UUID|None=None
+    classified_owner_id: UUID|None=None
+    tag_ids: list[UUID]|None=Field(default=None,max_length=50)
+    essential: bool|None=None
+    internal_transfer: bool|None=None
+    refund_credit: bool|None=None
+    loan_reimbursement: bool|None=None
+    expected: bool|None=None
+    prorated: bool|None=None
+    proration_months: int|None=Field(default=None,ge=1,le=120)
+    priority: int|None=Field(default=None,ge=0,le=100000)
+    is_active: bool|None=None
+    source_type: str|None=None
 class SavingsRuleIn(BaseModel): target_type: str; target_id: UUID
 class PlannerExpenseRuleIn(BaseModel):
     account_id: UUID

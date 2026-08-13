@@ -62,6 +62,62 @@ class TransactionTag(Base):
     __tablename__='transaction_tags'; transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE'),primary_key=True); tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
 class TransactionSplitTag(Base):
     __tablename__='transaction_split_tags'; split_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transaction_splits.id',ondelete='CASCADE'),primary_key=True); tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
+class MerchantIdentity(Audit, Base):
+    __tablename__='merchant_identities'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE'),index=True)
+    normalized_merchant_key: Mapped[str]=mapped_column(String(255))
+    display_name: Mapped[str]=mapped_column(String(255))
+    source_metadata: Mapped[str|None]=mapped_column(Text,nullable=True)
+    __table_args__=(UniqueConstraint('household_id','normalized_merchant_key',name='uq_merchant_identity_household_key'),)
+class TransactionClassificationRule(Audit, Base):
+    __tablename__='transaction_classification_rules'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE'),index=True)
+    owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True,index=True)
+    account_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE'),nullable=True,index=True)
+    normalized_merchant_key: Mapped[str|None]=mapped_column(String(255),nullable=True,index=True)
+    description_pattern: Mapped[str|None]=mapped_column(String(255),nullable=True)
+    direction: Mapped[str]=mapped_column(String(10),default='any')
+    financial_role: Mapped[str|None]=mapped_column(String(20),nullable=True)
+    category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True)
+    classified_owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True)
+    essential: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    internal_transfer: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    refund_credit: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    loan_reimbursement: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    expected: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    prorated: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    proration_months: Mapped[int|None]=mapped_column(nullable=True)
+    priority: Mapped[int]=mapped_column(default=100,index=True)
+    is_active: Mapped[bool]=mapped_column(Boolean,default=True,index=True)
+    source_type: Mapped[str]=mapped_column(String(20),default='user_authored')
+class TransactionClassificationRuleTag(Base):
+    __tablename__='transaction_classification_rule_tags'
+    rule_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transaction_classification_rules.id',ondelete='CASCADE'),primary_key=True)
+    tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
+class TransactionClassificationSuggestion(Audit, Base):
+    __tablename__='transaction_classification_suggestions'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE'),index=True)
+    transaction_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transactions.id',ondelete='CASCADE'),index=True)
+    category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='SET NULL'),nullable=True)
+    owner_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('users.id',ondelete='SET NULL'),nullable=True)
+    essential: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    internal_transfer: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    refund_credit: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    loan_reimbursement: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    expected: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    prorated: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    proration_months: Mapped[int|None]=mapped_column(nullable=True)
+    confidence_score: Mapped[float]=mapped_column(Numeric(5,4))
+    explanation: Mapped[str]=mapped_column(Text)
+    status: Mapped[str]=mapped_column(String(20),default='pending',index=True)
+    safe_for_auto_apply: Mapped[bool]=mapped_column(Boolean,default=False)
+class TransactionClassificationSuggestionTag(Base):
+    __tablename__='transaction_classification_suggestion_tags'
+    suggestion_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transaction_classification_suggestions.id',ondelete='CASCADE'),primary_key=True)
+    tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
 class SavingsRule(Audit, Base):
     __tablename__='savings_rules'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE'),nullable=True); category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='CASCADE'),nullable=True); tag_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),nullable=True); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
 class RecurringPlannerExpenseRule(Audit, Base):

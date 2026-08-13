@@ -1,4 +1,4 @@
-import calendar, csv, hashlib, io, json
+import calendar, csv, hashlib, io, json, re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -80,6 +80,45 @@ def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
     return {c.name:value(getattr(o,c.name)) if getattr(o,c.name) is not None else None for c in o.__table__.columns}
+def normalize_merchant_key(description: str) -> str:
+    """Create a stable local matching key without changing imported descriptions.
+
+    Only clearly noisy trailing reference/date tokens are removed. Merchant words
+    and ordinary numbers remain untouched so future matching stays explainable.
+    """
+    value=' '.join((description or '').strip().lower().split())
+    value=re.sub(r'\s+(?:ref(?:erence)?|confirmation|trace)\s*(?:#|id)?\s*[a-z0-9-]{5,}\b.*$','',value,flags=re.I)
+    value=re.sub(r'\s+on\s+\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b','',value,flags=re.I)
+    return ' '.join(value.split())
+def smart_tagging_scope(query, model, view_user_id: UUID|None):
+    return query.where(or_(model.owner_id.is_(None),model.owner_id==view_user_id)) if view_user_id else query.where(model.owner_id.is_(None))
+def validate_smart_tagging_references(h, values, db: Session):
+    if not values.get('normalized_merchant_key') and not values.get('description_pattern'):
+        raise HTTPException(400,'A merchant key or description pattern is required')
+    if values.get('direction','any') not in {'any','credit','debit'}: raise HTTPException(400,'Direction must be any, credit, or debit')
+    if values.get('financial_role') not in {None,'spending','income','debt','brokerage','crypto'}: raise HTTPException(400,'Invalid financial role')
+    if values.get('source_type','user_authored') not in {'user_authored','learned'}: raise HTTPException(400,'Source type must be user_authored or learned')
+    if values.get('prorated') is False and values.get('proration_months') is not None: raise HTTPException(400,'Proration months require a prorated rule')
+    for field,model in [('owner_id',User),('classified_owner_id',User)]:
+        identifier=values.get(field)
+        if identifier and not db.scalar(select(HouseholdMember).where(HouseholdMember.household_id==h,HouseholdMember.user_id==identifier)): raise HTTPException(400,f'{field} must belong to this household')
+    account_id=values.get('account_id')
+    if account_id:
+        account=db.get(Account,account_id)
+        if not account or account.household_id!=h: raise HTTPException(400,'Account must belong to this household')
+    category_id=values.get('category_id')
+    if category_id:
+        category=db.get(Category,category_id)
+        if not category or category.household_id!=h: raise HTTPException(400,'Category must belong to this household')
+    tag_ids=values.get('tag_ids',[])
+    if len(tag_ids)!=len(set(tag_ids)): raise HTTPException(400,'Tag IDs must be unique')
+    if tag_ids and db.scalar(select(func.count(Tag.id)).where(Tag.household_id==h,Tag.id.in_(tag_ids)))!=len(tag_ids): raise HTTPException(400,'Tags must belong to this household')
+def serialize_classification_rule(rule, h, db: Session):
+    tags=db.execute(select(Tag.id,Tag.name).join(TransactionClassificationRuleTag,TransactionClassificationRuleTag.tag_id==Tag.id).where(TransactionClassificationRuleTag.rule_id==rule.id,Tag.household_id==h)).all()
+    return dict(serialize(rule),tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags])
+def serialize_classification_suggestion(suggestion, h, db: Session):
+    tags=db.execute(select(Tag.id,Tag.name).join(TransactionClassificationSuggestionTag,TransactionClassificationSuggestionTag.tag_id==Tag.id).where(TransactionClassificationSuggestionTag.suggestion_id==suggestion.id,Tag.household_id==h)).all()
+    return dict(serialize(suggestion),tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags])
 def serialize_transaction_splits(transaction_id, h, db: Session):
     categories={item.id:item.name for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
     users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
@@ -1228,6 +1267,50 @@ def income_rule_from_transaction(transaction_id:UUID,view_user_id:UUID|None=None
 @app.get('/api/v1/categories')
 def categories(user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); ensure_groceries_category(h,db); return [serialize(x) for x in db.scalars(select(Category).where(Category.household_id==h).order_by(Category.name)).all()]
+@app.get('/api/v1/classification-rules')
+def classification_rules(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db)
+    query=smart_tagging_scope(select(TransactionClassificationRule).where(TransactionClassificationRule.household_id==h),TransactionClassificationRule,view_user_id)
+    return [serialize_classification_rule(rule,h,db) for rule in db.scalars(query.order_by(TransactionClassificationRule.priority,TransactionClassificationRule.created_at)).all()]
+@app.post('/api/v1/classification-rules')
+def create_classification_rule(body:TransactionClassificationRuleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); values=body.model_dump()
+    if view_user_id and values['owner_id'] not in {None,view_user_id}: raise HTTPException(400,'Rule scope must be Joint or the selected user')
+    if values.get('normalized_merchant_key'): values['normalized_merchant_key']=normalize_merchant_key(values['normalized_merchant_key'])
+    validate_smart_tagging_references(h,values,db); tag_ids=values.pop('tag_ids')
+    rule=TransactionClassificationRule(household_id=h,**values);db.add(rule);db.flush()
+    for tag_id in tag_ids: db.add(TransactionClassificationRuleTag(rule_id=rule.id,tag_id=tag_id))
+    db.commit();return serialize_classification_rule(rule,h,db)
+@app.patch('/api/v1/classification-rules/{rule_id}')
+def update_classification_rule(rule_id:UUID,body:TransactionClassificationRuleUpdate,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); rule=db.get(TransactionClassificationRule,rule_id)
+    if not rule or rule.household_id!=h: raise HTTPException(404,'Classification rule not found')
+    if view_user_id and rule.owner_id not in {None,view_user_id}: raise HTTPException(404,'Classification rule not found')
+    changes=body.model_dump(exclude_unset=True); tag_ids=changes.pop('tag_ids',None)
+    values={column.name:getattr(rule,column.name) for column in rule.__table__.columns}; values.update(changes)
+    if values.get('normalized_merchant_key'): values['normalized_merchant_key']=normalize_merchant_key(values['normalized_merchant_key'])
+    if view_user_id and values.get('owner_id') not in {None,view_user_id}: raise HTTPException(400,'Rule scope must be Joint or the selected user')
+    validate_smart_tagging_references(h,values|{'tag_ids':tag_ids if tag_ids is not None else [row.tag_id for row in db.scalars(select(TransactionClassificationRuleTag).where(TransactionClassificationRuleTag.rule_id==rule.id)).all()]},db)
+    for field,value in changes.items(): setattr(rule,field,value)
+    if 'normalized_merchant_key' in changes: rule.normalized_merchant_key=values['normalized_merchant_key']
+    if tag_ids is not None:
+        db.execute(delete(TransactionClassificationRuleTag).where(TransactionClassificationRuleTag.rule_id==rule.id))
+        for tag_id in tag_ids: db.add(TransactionClassificationRuleTag(rule_id=rule.id,tag_id=tag_id))
+    db.commit();return serialize_classification_rule(rule,h,db)
+@app.delete('/api/v1/classification-rules/{rule_id}',status_code=204)
+def delete_classification_rule(rule_id:UUID,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db); rule=db.get(TransactionClassificationRule,rule_id)
+    if not rule or rule.household_id!=h or (view_user_id and rule.owner_id not in {None,view_user_id}): raise HTTPException(404,'Classification rule not found')
+    db.delete(rule);db.commit()
+@app.get('/api/v1/classification-suggestions')
+def classification_suggestions(view_user_id:UUID|None=None,status:str|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); validate_view_member(h,view_user_id,db)
+    if status and status not in {'pending','accepted','rejected','applied'}: raise HTTPException(400,'Invalid suggestion status')
+    query=select(TransactionClassificationSuggestion).join(Transaction,Transaction.id==TransactionClassificationSuggestion.transaction_id).join(Account,Account.id==Transaction.account_id).where(TransactionClassificationSuggestion.household_id==h)
+    if view_user_id: query=query.where(or_(Account.owner_id==view_user_id,TransactionClassificationSuggestion.owner_id==view_user_id))
+    else: query=query.where(Account.ownership=='joint')
+    if status: query=query.where(TransactionClassificationSuggestion.status==status)
+    return [serialize_classification_suggestion(item,h,db) for item in db.scalars(query.order_by(TransactionClassificationSuggestion.created_at.desc())).all()]
 @app.post('/api/v1/categories')
 def add_category(body:CategoryIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); name=body.name.strip(); parent=db.get(Category,body.parent_id) if body.parent_id else None
