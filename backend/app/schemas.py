@@ -91,6 +91,7 @@ class TransactionPlannerFlagsUpdate(BaseModel):
     is_prorated: bool|None=None
     proration_months: int|None=Field(default=None,ge=1,le=120)
 class TransactionClassificationRuleIn(BaseModel):
+    name: str=Field(default='Classification rule',min_length=1,max_length=120)
     owner_id: UUID|None=None
     account_id: UUID|None=None
     normalized_merchant_key: str|None=Field(default=None,min_length=1,max_length=255)
@@ -110,7 +111,9 @@ class TransactionClassificationRuleIn(BaseModel):
     priority: int=Field(default=100,ge=0,le=100000)
     is_active: bool=True
     source_type: str='user_authored'
+    planner_automation_approved: bool=False
 class TransactionClassificationRuleUpdate(BaseModel):
+    name: str|None=Field(default=None,min_length=1,max_length=120)
     owner_id: UUID|None=None
     account_id: UUID|None=None
     normalized_merchant_key: str|None=Field(default=None,min_length=1,max_length=255)
@@ -130,6 +133,7 @@ class TransactionClassificationRuleUpdate(BaseModel):
     priority: int|None=Field(default=None,ge=0,le=100000)
     is_active: bool|None=None
     source_type: str|None=None
+    planner_automation_approved: bool|None=None
 class SavingsRuleIn(BaseModel): target_type: str; target_id: UUID
 class PlannerExpenseRuleIn(BaseModel):
     account_id: UUID

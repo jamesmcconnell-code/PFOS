@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import settings
 from .models import Account, Category, DataConnection, Transaction
+from .smart_tagging import evaluate_new_transaction
 
 @dataclass
 class NormalizedAccount:
@@ -134,7 +135,8 @@ def persist_payload(db: Session, connection: DataConnection, payload: SyncPayloa
             existing.account_id,existing.date,existing.description,existing.amount,existing.notes,existing.fingerprint,existing.category_id,existing.source_category,existing.is_pending,existing.is_essential,existing.is_internal_transfer=account.id,source.posted_on,source.description,source.amount,source.notes,fingerprint,category.id if category else None,source.source_category,source.is_pending,category.is_essential_default if category else False,source.is_internal_transfer
             continue
         if db.scalar(select(Transaction.id).where(Transaction.fingerprint==fingerprint)): duplicates+=1; continue
-        db.add(Transaction(household_id=connection.household_id,account_id=account.id,connection_id=connection.id,external_id=source.external_id,date=source.posted_on,description=source.description,amount=source.amount,notes=source.notes,fingerprint=fingerprint,category_id=category.id if category else None,source_category=source.source_category,is_pending=source.is_pending,is_essential=category.is_essential_default if category else False,is_internal_transfer=source.is_internal_transfer)); added+=1
+        transaction=Transaction(household_id=connection.household_id,account_id=account.id,connection_id=connection.id,external_id=source.external_id,date=source.posted_on,description=source.description,amount=source.amount,notes=source.notes,fingerprint=fingerprint,category_id=category.id if category else None,source_category=source.source_category,is_pending=source.is_pending,is_essential=category.is_essential_default if category else False,is_internal_transfer=source.is_internal_transfer)
+        db.add(transaction);db.flush();evaluate_new_transaction(transaction,db,source=connection.provider); added+=1
     return added,duplicates
 
 def _category_for(db: Session, cache: dict, household_id, source_category: str | None, amount: Decimal):

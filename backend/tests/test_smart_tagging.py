@@ -1,3 +1,5 @@
+from datetime import date
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -7,9 +9,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import classification_rules, classification_suggestions, create_classification_rule, delete_classification_rule, normalize_merchant_key, update_classification_rule
-from app.models import Account, Category, Household, HouseholdMember, MerchantIdentity, Tag, Transaction, TransactionClassificationRule, TransactionClassificationSuggestion, User
+from app.main import accept_classification_suggestion, classification_preview, classification_rules, classification_suggestions, create_classification_rule, delete_classification_rule, normalize_merchant_key, update_classification_rule
+from app.models import Account, Category, Household, HouseholdMember, MerchantIdentity, Tag, Transaction, TransactionClassificationRule, TransactionClassificationSuggestion, TransactionTag, User
 from app.schemas import TransactionClassificationRuleIn, TransactionClassificationRuleUpdate
+from app.smart_tagging import evaluate_new_transaction
+from app.connectors import NormalizedAccount, NormalizedTransaction, SyncPayload, persist_payload
 
 
 def smart_tagging_context():
@@ -68,3 +72,48 @@ def test_classification_rules_and_suggestions_remain_household_and_view_scoped()
     assert updated['is_active'] is False
     delete_classification_rule(__import__('uuid').UUID(individual['id']),bailey.id,admin,db)
     assert {row['id'] for row in classification_rules(bailey.id,admin,db)}=={joint['id']}
+
+
+def test_new_imported_transaction_applies_highest_priority_safe_rule_without_rewriting_history():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    generic=create_classification_rule(TransactionClassificationRuleIn(name='Generic store',normalized_merchant_key='target',category_id=category.id,priority=50),None,admin,db)
+    specific=create_classification_rule(TransactionClassificationRuleIn(name='Bailey Target',owner_id=bailey.id,account_id=account.id,normalized_merchant_key='target',category_id=category.id,tag_ids=[tag.id],essential=True,priority=50),bailey.id,admin,db)
+    old=Transaction(household_id=home.id,account_id=account.id,date=__import__('datetime').date.today(),description='Target',amount=-5)
+    imported=Transaction(household_id=home.id,account_id=account.id,date=__import__('datetime').date.today(),description='Target REF # ABCDE12345',amount=-10)
+    db.add_all([old,imported]);db.flush(); suggestion=evaluate_new_transaction(imported,db,source='plaid');db.commit()
+    assert old.category_id is None
+    assert imported.category_id==category.id and imported.is_essential is True
+    assert imported.classification_rule_id==__import__('uuid').UUID(specific['id'])
+    assert suggestion.status=='applied'
+    assert set(db.scalars(__import__('sqlalchemy').select(TransactionTag.tag_id).where(TransactionTag.transaction_id==imported.id)).all())=={tag.id}
+    preview=classification_preview(imported.id,admin,db)
+    assert preview['match']['id']==specific['id']
+    assert generic['id']!=specific['id']
+
+
+def test_connector_persistence_runs_deterministic_classification_for_new_rows():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    create_classification_rule(TransactionClassificationRuleIn(name='Local coffee',normalized_merchant_key='local coffee',category_id=category.id,tag_ids=[tag.id],priority=1),None,admin,db)
+    connection=__import__('app.models',fromlist=['DataConnection']).DataConnection(household_id=home.id,provider='plaid',name='Test connection')
+    db.add(connection);db.commit()
+    payload=SyncPayload([NormalizedAccount('acct-1','Checking','checking',Decimal('0'))],[NormalizedTransaction('txn-1','acct-1',date.today(),'LOCAL COFFEE REF # ABCDE12345',Decimal('-4.50'))])
+    added,duplicates=persist_payload(db,connection,payload);db.commit()
+    transaction=db.scalar(__import__('sqlalchemy').select(Transaction).where(Transaction.connection_id==connection.id))
+    assert (added,duplicates)==(1,0)
+    assert transaction.category_id==category.id and transaction.classification_rule_id is not None
+    assert db.scalar(__import__('sqlalchemy').select(TransactionClassificationSuggestion.status).where(TransactionClassificationSuggestion.transaction_id==transaction.id))=='applied'
+
+
+def test_planner_outputs_wait_for_review_unless_explicitly_approved():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    pending_rule=create_classification_rule(TransactionClassificationRuleIn(name='Transfer review',owner_id=bailey.id,normalized_merchant_key='venmo',internal_transfer=True,expected=True,priority=1),bailey.id,admin,db)
+    pending=Transaction(household_id=home.id,account_id=account.id,date=__import__('datetime').date.today(),description='Venmo',amount=-20)
+    db.add(pending);db.flush();suggestion=evaluate_new_transaction(pending,db,source='csv');db.commit()
+    assert suggestion.status=='pending' and pending.is_internal_transfer is False and pending.is_expected is False
+    accepted=accept_classification_suggestion(suggestion.id,admin,db)
+    assert accepted['status']=='applied' and pending.is_internal_transfer is True and pending.is_expected is True
+    approved_rule=create_classification_rule(TransactionClassificationRuleIn(name='Approved refund',owner_id=bailey.id,normalized_merchant_key='refund vendor',refund_credit=True,prorated=True,proration_months=1,planner_automation_approved=True,priority=1),bailey.id,admin,db)
+    approved=Transaction(household_id=home.id,account_id=account.id,date=__import__('datetime').date.today(),description='Refund vendor',amount=10)
+    db.add(approved);db.flush();applied=evaluate_new_transaction(approved,db,source='gemini');db.commit()
+    assert applied.status=='applied' and approved.is_refund is True and approved.is_prorated is True and approved.proration_months==1
+    assert pending_rule['id'] and approved_rule['id']

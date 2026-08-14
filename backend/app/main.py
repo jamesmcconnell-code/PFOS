@@ -1,4 +1,4 @@
-import calendar, csv, hashlib, io, json, re
+import calendar, csv, hashlib, io, json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
@@ -16,6 +16,7 @@ from .connectors import CONNECTORS, ConnectorAuthenticationError, CsvConnector, 
 from .crypto_prices import refresh_usd_values
 from .config import settings
 from .planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
+from .smart_tagging import apply_suggestion, evaluate_new_transaction, latest_suggestion, matching_rule, normalize_merchant_key
 
 app=FastAPI(title='PFOS API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -80,16 +81,6 @@ def serialize(o):
     def value(raw):
         return str(raw) if isinstance(raw,(UUID,date,datetime,Decimal)) else raw
     return {c.name:value(getattr(o,c.name)) if getattr(o,c.name) is not None else None for c in o.__table__.columns}
-def normalize_merchant_key(description: str) -> str:
-    """Create a stable local matching key without changing imported descriptions.
-
-    Only clearly noisy trailing reference/date tokens are removed. Merchant words
-    and ordinary numbers remain untouched so future matching stays explainable.
-    """
-    value=' '.join((description or '').strip().lower().split())
-    value=re.sub(r'\s+(?:ref(?:erence)?|confirmation|trace)\s*(?:#|id)?\s*[a-z0-9-]{5,}\b.*$','',value,flags=re.I)
-    value=re.sub(r'\s+on\s+\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b','',value,flags=re.I)
-    return ' '.join(value.split())
 def smart_tagging_scope(query, model, view_user_id: UUID|None):
     return query.where(or_(model.owner_id.is_(None),model.owner_id==view_user_id)) if view_user_id else query.where(model.owner_id.is_(None))
 def validate_smart_tagging_references(h, values, db: Session):
@@ -106,6 +97,7 @@ def validate_smart_tagging_references(h, values, db: Session):
     if account_id:
         account=db.get(Account,account_id)
         if not account or account.household_id!=h: raise HTTPException(400,'Account must belong to this household')
+        if account.ownership=='individual' and values.get('classified_owner_id') and account.owner_id!=values['classified_owner_id']: raise HTTPException(400,'An individual-account owner assignment must match the account owner')
     category_id=values.get('category_id')
     if category_id:
         category=db.get(Category,category_id)
@@ -119,6 +111,12 @@ def serialize_classification_rule(rule, h, db: Session):
 def serialize_classification_suggestion(suggestion, h, db: Session):
     tags=db.execute(select(Tag.id,Tag.name).join(TransactionClassificationSuggestionTag,TransactionClassificationSuggestionTag.tag_id==Tag.id).where(TransactionClassificationSuggestionTag.suggestion_id==suggestion.id,Tag.household_id==h)).all()
     return dict(serialize(suggestion),tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags])
+def smart_tagging_metadata(transaction, h, db: Session):
+    key=normalize_merchant_key(transaction.description)
+    identity=db.scalar(select(MerchantIdentity).where(MerchantIdentity.household_id==h,MerchantIdentity.normalized_merchant_key==key))
+    rule=db.get(TransactionClassificationRule,transaction.classification_rule_id) if transaction.classification_rule_id else None
+    suggestion=latest_suggestion(transaction.id,db)
+    return {'normalized_merchant_key':key,'merchant_display_name':identity.display_name if identity else None,'smart_tagging':{'applied_rule_id':str(rule.id) if rule else None,'applied_rule_name':rule.name if rule else None,'suggestion_id':str(suggestion.id) if suggestion else None,'suggestion_status':suggestion.status if suggestion else None,'explanation':transaction.classification_explanation or (suggestion.explanation if suggestion else None)}}
 def serialize_transaction_splits(transaction_id, h, db: Session):
     categories={item.id:item.name for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
     users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
@@ -382,7 +380,7 @@ def transactions(search:str|None=None,account_id:UUID|None=None,category_id:UUID
     if page_ids:
         for transaction_id,tag_id,tag_name in db.execute(select(TransactionTag.transaction_id,Tag.id,Tag.name).join(Tag,Tag.id==TransactionTag.tag_id).where(TransactionTag.transaction_id.in_(page_ids))).all(): tags_by_transaction[transaction_id].append({'id':str(tag_id),'name':tag_name})
     for x in page_transactions:
-        row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags],splits=serialize_transaction_splits(x.id,h,db));result.append(row)
+        row=serialize(x);account=accounts_by_id.get(x.account_id);transaction_tags=tags_by_transaction[x.id];row.update(account_name=account.name if account else 'Unknown account',account_type=account.account_type if account else None,category_name=categories_by_id.get(x.category_id).name if x.category_id in categories_by_id else None,source_name=connections_by_id.get(x.connection_id).name if x.connection_id in connections_by_id else 'Manual',tags=transaction_tags,tag_ids=[tag['id'] for tag in transaction_tags],splits=serialize_transaction_splits(x.id,h,db),**smart_tagging_metadata(x,h,db));result.append(row)
     return {'items':result,'page':page,'page_size':page_size,'total':total,'total_pages':max(1,(total+page_size-1)//page_size),'sort':sort}
 
 def category_tracker_filters(h, start_date, end_date, view_user_id, db):
@@ -430,7 +428,7 @@ def add_transaction(body:ManualTransactionIn,user=Depends(current_user),db:Sessi
     if len(valid_tags)!=len(tag_ids): raise HTTPException(400,'Invalid tag')
     if body.is_refund and body.amount<=0: raise HTTPException(400,'Only positive transactions can be refund credits')
     data=body.model_dump(exclude={'tag_ids'}); data['fingerprint']=hashlib.sha256(f'{body.account_id}|{body.date}|{body.amount}|{body.description.lower()}'.encode()).hexdigest()
-    t=Transaction(household_id=h,**data); db.add(t); db.flush(); db.add_all([TransactionTag(transaction_id=t.id,tag_id=tag_id) for tag_id in tag_ids]); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return dict(serialize(t),tags=[{'id':str(tag_id),'name':db.get(Tag,tag_id).name} for tag_id in tag_ids],tag_ids=[str(tag_id) for tag_id in tag_ids],splits=[])
+    t=Transaction(household_id=h,**data); db.add(t); db.flush(); db.add_all([TransactionTag(transaction_id=t.id,tag_id=tag_id) for tag_id in tag_ids]);evaluate_new_transaction(t,db,source='manual',preserve_fields=body.model_fields_set); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return dict(serialize(t),tags=[{'id':str(row.tag_id),'name':db.get(Tag,row.tag_id).name} for row in db.scalars(select(TransactionTag).where(TransactionTag.transaction_id==t.id)).all()],tag_ids=[str(row.tag_id) for row in db.scalars(select(TransactionTag).where(TransactionTag.transaction_id==t.id)).all()],splits=[],**smart_tagging_metadata(t,h,db))
 @app.patch('/api/v1/transactions/{transaction_id}')
 def update_transaction(transaction_id:UUID,body:TransactionIn,user=Depends(current_user),db:Session=Depends(get_db)):
     t=db.get(Transaction,transaction_id)
@@ -1272,6 +1270,13 @@ def classification_rules(view_user_id:UUID|None=None,user=Depends(current_user),
     h=household(user,db); validate_view_member(h,view_user_id,db)
     query=smart_tagging_scope(select(TransactionClassificationRule).where(TransactionClassificationRule.household_id==h),TransactionClassificationRule,view_user_id)
     return [serialize_classification_rule(rule,h,db) for rule in db.scalars(query.order_by(TransactionClassificationRule.priority,TransactionClassificationRule.created_at)).all()]
+@app.get('/api/v1/transactions/{transaction_id}/classification-preview')
+def classification_preview(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    rule,merchant,account=matching_rule(transaction,db)
+    if not rule: return {'transaction_id':str(transaction.id),'normalized_merchant_key':merchant.normalized_merchant_key,'merchant_display_name':merchant.display_name,'match':None}
+    return {'transaction_id':str(transaction.id),'normalized_merchant_key':merchant.normalized_merchant_key,'merchant_display_name':merchant.display_name,'match':{**serialize_classification_rule(rule,h,db),'would_create_pending_review':any(getattr(rule,field) is not None for field in ('internal_transfer','refund_credit','loan_reimbursement','expected','prorated','proration_months')) and not rule.planner_automation_approved,'account_type':account.account_type}}
 @app.post('/api/v1/classification-rules')
 def create_classification_rule(body:TransactionClassificationRuleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); values=body.model_dump()
@@ -1311,6 +1316,19 @@ def classification_suggestions(view_user_id:UUID|None=None,status:str|None=None,
     else: query=query.where(Account.ownership=='joint')
     if status: query=query.where(TransactionClassificationSuggestion.status==status)
     return [serialize_classification_suggestion(item,h,db) for item in db.scalars(query.order_by(TransactionClassificationSuggestion.created_at.desc())).all()]
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/accept')
+def accept_classification_suggestion(suggestion_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be accepted')
+    if not apply_suggestion(suggestion,db): raise HTTPException(400,'Suggestion no longer has an applicable rule')
+    db.commit();return serialize_classification_suggestion(suggestion,h,db)
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/reject')
+def reject_classification_suggestion(suggestion_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be rejected')
+    suggestion.status='rejected';suggestion.safe_for_auto_apply=False;db.commit();return serialize_classification_suggestion(suggestion,h,db)
 @app.post('/api/v1/categories')
 def add_category(body:CategoryIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); name=body.name.strip(); parent=db.get(Category,body.parent_id) if body.parent_id else None
@@ -1434,7 +1452,8 @@ async def commit_import(account_id:UUID,file:UploadFile=File(...),user=Depends(c
     for r in rows:
         amount=float(r.get('amount') or r.get('Amount') or 0); d=date.fromisoformat(r.get('date') or r.get('Date')); desc=r.get('description') or r.get('Description') or ''; fp=hashlib.sha256(f'{account_id}|{d}|{amount}|{desc.lower()}'.encode()).hexdigest()
         if db.scalar(select(Transaction.id).where(Transaction.fingerprint==fp)): dupes+=1;continue
-        db.add(Transaction(household_id=h,account_id=account_id,date=d,description=desc,amount=amount,fingerprint=fp));added+=1
+        transaction=Transaction(household_id=h,account_id=account_id,date=d,description=desc,amount=amount,fingerprint=fp)
+        db.add(transaction);db.flush();evaluate_new_transaction(transaction,db,source='csv');added+=1
     batch.imported_count=added;batch.duplicate_count=dupes;db.commit();return {'imported':added,'duplicates':dupes}
 @app.get('/api/v1/imports')
 def imports(user=Depends(current_user),db:Session=Depends(get_db)): return [serialize(x) for x in db.scalars(select(ImportBatch).where(ImportBatch.household_id==household(user,db)).order_by(ImportBatch.created_at.desc())).all()]
