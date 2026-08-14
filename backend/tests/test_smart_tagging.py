@@ -67,8 +67,10 @@ def test_classification_rules_and_suggestions_remain_household_and_view_scoped()
     assert {row['id'] for row in classification_rules(None,admin,db)}=={joint['id']}
     transaction=Transaction(household_id=home.id,account_id=account.id,date=__import__('datetime').date.today(),description='Target',amount=-10)
     db.add(transaction);db.flush();suggestion=TransactionClassificationSuggestion(household_id=home.id,transaction_id=transaction.id,category_id=category.id,owner_id=bailey.id,confidence_score=.9,explanation='Matched local rule',status='pending',safe_for_auto_apply=False);db.add(suggestion);db.commit()
-    assert len(classification_suggestions(bailey.id,None,admin,db))==1
-    assert classification_suggestions(None,None,admin,db)==[]
+    suggestion_rows=classification_suggestions(view_user_id=bailey.id,user=admin,db=db)
+    assert len(suggestion_rows)==1 and suggestion_rows[0]['transaction']['account_name']=='Bailey checking'
+    assert len(classification_suggestions(view_user_id=bailey.id,account_id=account.id,user=admin,db=db))==1
+    assert classification_suggestions(view_user_id=None,user=admin,db=db)==[]
     updated=update_classification_rule(__import__('uuid').UUID(individual['id']),TransactionClassificationRuleUpdate(is_active=False),bailey.id,admin,db)
     assert updated['is_active'] is False
     delete_classification_rule(__import__('uuid').UUID(individual['id']),bailey.id,admin,db)
