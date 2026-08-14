@@ -115,12 +115,24 @@ class TransactionClassificationSuggestion(Audit, Base):
     proration_months: Mapped[int|None]=mapped_column(nullable=True)
     confidence_score: Mapped[float]=mapped_column(Numeric(5,4))
     explanation: Mapped[str]=mapped_column(Text)
+    proposal_data: Mapped[str|None]=mapped_column(Text,nullable=True)
+    evidence_data: Mapped[str|None]=mapped_column(Text,nullable=True)
+    recurring: Mapped[bool|None]=mapped_column(Boolean,nullable=True)
+    source_type: Mapped[str]=mapped_column(String(20),default='rule')
     status: Mapped[str]=mapped_column(String(20),default='pending',index=True)
     safe_for_auto_apply: Mapped[bool]=mapped_column(Boolean,default=False)
 class TransactionClassificationSuggestionTag(Base):
     __tablename__='transaction_classification_suggestion_tags'
     suggestion_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transaction_classification_suggestions.id',ondelete='CASCADE'),primary_key=True)
     tag_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),primary_key=True)
+class TransactionClassificationSuggestionDecision(Audit, Base):
+    __tablename__='transaction_classification_suggestion_decisions'
+    id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid)
+    suggestion_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('transaction_classification_suggestions.id',ondelete='CASCADE'),index=True)
+    field_name: Mapped[str]=mapped_column(String(40))
+    decision: Mapped[str]=mapped_column(String(20))
+    value_data: Mapped[str|None]=mapped_column(Text,nullable=True)
+    __table_args__=(UniqueConstraint('suggestion_id','field_name',name='uq_suggestion_decision_field'),)
 class SavingsRule(Audit, Base):
     __tablename__='savings_rules'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); account_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE'),nullable=True); category_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('categories.id',ondelete='CASCADE'),nullable=True); tag_id: Mapped[uuid.UUID|None]=mapped_column(ForeignKey('tags.id',ondelete='CASCADE'),nullable=True); is_active: Mapped[bool]=mapped_column(Boolean,default=True)
 class RecurringPlannerExpenseRule(Audit, Base):

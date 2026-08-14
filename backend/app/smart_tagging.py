@@ -67,7 +67,9 @@ def _apply(transaction, rule, db, include_planner, override_import_category=Fals
 def evaluate_new_transaction(transaction: Transaction, db: Session, source: str='import', preserve_fields=frozenset()):
     """Classify only a just-created transaction. Never scans or rewrites history."""
     rule,merchant,_=matching_rule(transaction,db)
-    if not rule: return None
+    if not rule:
+        from .smart_tagging_learning import generate_historical_suggestion
+        return generate_historical_suggestion(transaction,db)
     planner_outputs=_planner_outputs(rule);auto_apply=not planner_outputs or rule.planner_automation_approved
     explanation=f"Matched local rule '{rule.name}' by merchant '{merchant.normalized_merchant_key}' (priority {rule.priority})."
     suggestion=TransactionClassificationSuggestion(household_id=transaction.household_id,transaction_id=transaction.id,rule_id=rule.id,category_id=rule.category_id,owner_id=rule.classified_owner_id,essential=rule.essential,internal_transfer=rule.internal_transfer,refund_credit=rule.refund_credit,loan_reimbursement=rule.loan_reimbursement,expected=rule.expected,prorated=rule.prorated,proration_months=rule.proration_months,confidence_score=1,explanation=explanation,status='applied' if auto_apply else 'pending',safe_for_auto_apply=auto_apply)

@@ -17,6 +17,7 @@ from .crypto_prices import refresh_usd_values
 from .config import settings
 from .planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
 from .smart_tagging import apply_suggestion, evaluate_new_transaction, latest_suggestion, matching_rule, normalize_merchant_key
+from .smart_tagging_learning import generate_historical_suggestion
 
 app=FastAPI(title='PFOS API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -110,13 +111,53 @@ def serialize_classification_rule(rule, h, db: Session):
     return dict(serialize(rule),tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags])
 def serialize_classification_suggestion(suggestion, h, db: Session):
     tags=db.execute(select(Tag.id,Tag.name).join(TransactionClassificationSuggestionTag,TransactionClassificationSuggestionTag.tag_id==Tag.id).where(TransactionClassificationSuggestionTag.suggestion_id==suggestion.id,Tag.household_id==h)).all()
-    return dict(serialize(suggestion),tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags])
+    decisions=[serialize(item) for item in db.scalars(select(TransactionClassificationSuggestionDecision).where(TransactionClassificationSuggestionDecision.suggestion_id==suggestion.id).order_by(TransactionClassificationSuggestionDecision.created_at)).all()]
+    row=serialize(suggestion);row['proposal_data']=json.loads(suggestion.proposal_data or '{}');row['evidence_data']=json.loads(suggestion.evidence_data or '{}')
+    return dict(row,tag_ids=[str(tag.id) for tag in tags],tags=[{'id':str(tag.id),'name':tag.name} for tag in tags],decisions=decisions)
 def smart_tagging_metadata(transaction, h, db: Session):
     key=normalize_merchant_key(transaction.description)
     identity=db.scalar(select(MerchantIdentity).where(MerchantIdentity.household_id==h,MerchantIdentity.normalized_merchant_key==key))
     rule=db.get(TransactionClassificationRule,transaction.classification_rule_id) if transaction.classification_rule_id else None
     suggestion=latest_suggestion(transaction.id,db)
-    return {'normalized_merchant_key':key,'merchant_display_name':identity.display_name if identity else None,'smart_tagging':{'applied_rule_id':str(rule.id) if rule else None,'applied_rule_name':rule.name if rule else None,'suggestion_id':str(suggestion.id) if suggestion else None,'suggestion_status':suggestion.status if suggestion else None,'explanation':transaction.classification_explanation or (suggestion.explanation if suggestion else None)}}
+    return {'normalized_merchant_key':key,'merchant_display_name':identity.display_name if identity else None,'smart_tagging':{'applied_rule_id':str(rule.id) if rule else None,'applied_rule_name':rule.name if rule else None,'suggestion_id':str(suggestion.id) if suggestion else None,'suggestion_status':suggestion.status if suggestion else None,'confidence_score':float(suggestion.confidence_score) if suggestion else None,'proposal_data':json.loads(suggestion.proposal_data or '{}') if suggestion else {},'evidence_data':json.loads(suggestion.evidence_data or '{}') if suggestion else {},'explanation':transaction.classification_explanation or (suggestion.explanation if suggestion else None)}}
+def suggestion_fields(suggestion):
+    proposed=(json.loads(suggestion.proposal_data or '{}').get('fields') or {})
+    if proposed: return proposed
+    fields={}
+    for name in ('category_id','owner_id','essential','internal_transfer','refund_credit','loan_reimbursement','expected','prorated','proration_months'):
+        value=getattr(suggestion,name)
+        if value is not None: fields[name]={'value':str(value) if isinstance(value,UUID) else value}
+    return fields
+def record_suggestion_decision(suggestion, field_name, decision, value, db: Session):
+    row=db.scalar(select(TransactionClassificationSuggestionDecision).where(TransactionClassificationSuggestionDecision.suggestion_id==suggestion.id,TransactionClassificationSuggestionDecision.field_name==field_name))
+    if row:
+        if row.decision!=decision: raise HTTPException(409,f'{field_name} was already {row.decision}')
+        return row
+    row=TransactionClassificationSuggestionDecision(suggestion_id=suggestion.id,field_name=field_name,decision=decision,value_data=json.dumps(value));db.add(row);return row
+def apply_suggestion_fields(suggestion, fields, db: Session):
+    transaction=db.get(Transaction,suggestion.transaction_id)
+    if not transaction: raise HTTPException(404,'Transaction not found')
+    proposed=suggestion_fields(suggestion); requested=set(fields or proposed.keys())
+    if not requested or not requested.issubset(set(proposed)): raise HTTPException(400,'Select only proposed suggestion fields')
+    account=db.get(Account,transaction.account_id)
+    for field in requested:
+        value=proposed[field]['value'] if isinstance(proposed[field],dict) else proposed[field]
+        record_suggestion_decision(suggestion,field,'accepted',value,db)
+        if field=='category_id': transaction.category_id=UUID(str(value))
+        elif field=='owner_id' and (account.ownership!='individual' or account.owner_id==UUID(str(value))): transaction.owner_id=UUID(str(value))
+        elif field=='essential': transaction.is_essential=bool(value)
+        elif field=='recurring': transaction.is_recurring=bool(value)
+        elif field=='tag_ids':
+            for tag_id in value:
+                parsed=UUID(str(tag_id))
+                if not db.get(TransactionTag,(transaction.id,parsed)): db.add(TransactionTag(transaction_id=transaction.id,tag_id=parsed))
+        elif field=='internal_transfer': transaction.is_internal_transfer=bool(value)
+        elif field=='refund_credit': transaction.is_refund=bool(value)
+        elif field=='expected': transaction.is_expected=bool(value)
+        elif field=='prorated': transaction.is_prorated=bool(value)
+        elif field=='proration_months': transaction.proration_months=int(value)
+    suggestion.status='applied';transaction.classification_explanation=suggestion.explanation
+    return transaction
 def serialize_transaction_splits(transaction_id, h, db: Session):
     categories={item.id:item.name for item in db.scalars(select(Category).where(Category.household_id==h)).all()}
     users={item.id:item.display_name for item in db.scalars(select(User).join(HouseholdMember,HouseholdMember.user_id==User.id).where(HouseholdMember.household_id==h)).all()}
@@ -1277,6 +1318,20 @@ def classification_preview(transaction_id:UUID,user=Depends(current_user),db:Ses
     rule,merchant,account=matching_rule(transaction,db)
     if not rule: return {'transaction_id':str(transaction.id),'normalized_merchant_key':merchant.normalized_merchant_key,'merchant_display_name':merchant.display_name,'match':None}
     return {'transaction_id':str(transaction.id),'normalized_merchant_key':merchant.normalized_merchant_key,'merchant_display_name':merchant.display_name,'match':{**serialize_classification_rule(rule,h,db),'would_create_pending_review':any(getattr(rule,field) is not None for field in ('internal_transfer','refund_credit','loan_reimbursement','expected','prorated','proration_months')) and not rule.planner_automation_approved,'account_type':account.account_type}}
+@app.post('/api/v1/transactions/{transaction_id}/historical-classification-suggestion')
+def generate_transaction_historical_suggestion(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    rule,_,_=matching_rule(transaction,db)
+    if rule: return {'result':'explicit_rule_exists','rule':serialize_classification_rule(rule,h,db)}
+    result=generate_historical_suggestion(transaction,db)
+    if isinstance(result,dict): return result
+    db.commit();return serialize_classification_suggestion(result,h,db)
+@app.get('/api/v1/transactions/{transaction_id}/classification-suggestions')
+def transaction_classification_suggestions(transaction_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); transaction=db.get(Transaction,transaction_id)
+    if not transaction or transaction.household_id!=h: raise HTTPException(404,'Transaction not found')
+    return [serialize_classification_suggestion(item,h,db) for item in db.scalars(select(TransactionClassificationSuggestion).where(TransactionClassificationSuggestion.transaction_id==transaction.id).order_by(TransactionClassificationSuggestion.created_at.desc())).all()]
 @app.post('/api/v1/classification-rules')
 def create_classification_rule(body:TransactionClassificationRuleIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); validate_view_member(h,view_user_id,db); values=body.model_dump()
@@ -1320,15 +1375,60 @@ def classification_suggestions(view_user_id:UUID|None=None,status:str|None=None,
 def accept_classification_suggestion(suggestion_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
     if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status=='applied': return serialize_classification_suggestion(suggestion,h,db)
     if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be accepted')
-    if not apply_suggestion(suggestion,db): raise HTTPException(400,'Suggestion no longer has an applicable rule')
+    if suggestion.source_type=='learned': apply_suggestion_fields(suggestion,None,db)
+    elif not apply_suggestion(suggestion,db): raise HTTPException(400,'Suggestion no longer has an applicable rule')
     db.commit();return serialize_classification_suggestion(suggestion,h,db)
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/accept-fields')
+def accept_classification_suggestion_fields(suggestion_id:UUID,body:ClassificationSuggestionFieldsIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status=='applied': return serialize_classification_suggestion(suggestion,h,db)
+    if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be accepted')
+    apply_suggestion_fields(suggestion,body.fields,db);db.commit();return serialize_classification_suggestion(suggestion,h,db)
 @app.post('/api/v1/classification-suggestions/{suggestion_id}/reject')
 def reject_classification_suggestion(suggestion_id:UUID,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
     if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status=='rejected': return serialize_classification_suggestion(suggestion,h,db)
     if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be rejected')
     suggestion.status='rejected';suggestion.safe_for_auto_apply=False;db.commit();return serialize_classification_suggestion(suggestion,h,db)
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/reject-fields')
+def reject_classification_suggestion_fields(suggestion_id:UUID,body:ClassificationSuggestionFieldsIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.status=='rejected': return serialize_classification_suggestion(suggestion,h,db)
+    if suggestion.status!='pending': raise HTTPException(400,'Only pending suggestions can be changed')
+    proposed=suggestion_fields(suggestion);fields=set(body.fields or proposed.keys())
+    if not fields or not fields.issubset(proposed): raise HTTPException(400,'Select only proposed suggestion fields')
+    for field in fields: record_suggestion_decision(suggestion,field,'rejected',proposed[field],db)
+    decisions=db.scalars(select(TransactionClassificationSuggestionDecision).where(TransactionClassificationSuggestionDecision.suggestion_id==suggestion.id)).all()
+    if {item.field_name for item in decisions if item.decision=='rejected'}>=set(proposed): suggestion.status='rejected';suggestion.safe_for_auto_apply=False
+    db.commit();return serialize_classification_suggestion(suggestion,h,db)
+def suggestion_rule_preview(suggestion, h, db: Session, body: AlwaysApplyClassificationIn):
+    transaction=db.get(Transaction,suggestion.transaction_id); account=db.get(Account,transaction.account_id); proposed=suggestion_fields(suggestion); fields=set(body.fields or proposed.keys())
+    if not fields or not fields.issubset(proposed): raise HTTPException(400,'Select only proposed suggestion fields')
+    values={'name':f"Always apply {normalize_merchant_key(transaction.description)}"[:120],'owner_id':account.owner_id if account.ownership=='individual' else None,'account_id':account.id,'normalized_merchant_key':normalize_merchant_key(transaction.description),'direction':'credit' if float(transaction.amount)>0 else 'debit','financial_role':account.account_type,'priority':body.priority,'is_active':True,'source_type':'user_authored','planner_automation_approved':False,'tag_ids':[]}
+    for field in fields:
+        value=proposed[field]['value'] if isinstance(proposed[field],dict) else proposed[field]
+        if field in {'category_id','owner_id','essential'}: values['classified_owner_id' if field=='owner_id' else field]=UUID(str(value)) if field in {'category_id','owner_id'} else value
+        elif field=='tag_ids': values['tag_ids']=[UUID(str(item)) for item in value]
+    validate_smart_tagging_references(h,values,db);return values
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/always-apply-preview')
+def classification_suggestion_always_apply_preview(suggestion_id:UUID,body:AlwaysApplyClassificationIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    return suggestion_rule_preview(suggestion,h,db,body)
+@app.post('/api/v1/classification-suggestions/{suggestion_id}/always-apply')
+def classification_suggestion_always_apply(suggestion_id:UUID,body:AlwaysApplyClassificationIn,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db); suggestion=db.get(TransactionClassificationSuggestion,suggestion_id)
+    if not suggestion or suggestion.household_id!=h: raise HTTPException(404,'Classification suggestion not found')
+    if suggestion.source_type!='learned': raise HTTPException(400,'Always apply is available for learned suggestions only')
+    if suggestion.status!='applied': raise HTTPException(400,'Accept the suggestion before creating an always-apply rule')
+    values=suggestion_rule_preview(suggestion,h,db,body);tag_ids=values.pop('tag_ids');rule=TransactionClassificationRule(household_id=h,**values);db.add(rule);db.flush()
+    for tag_id in tag_ids: db.add(TransactionClassificationRuleTag(rule_id=rule.id,tag_id=tag_id))
+    db.commit();return serialize_classification_rule(rule,h,db)
 @app.post('/api/v1/categories')
 def add_category(body:CategoryIn,user=Depends(current_user),db:Session=Depends(get_db)):
     h=household(user,db); name=body.name.strip(); parent=db.get(Category,body.parent_id) if body.parent_id else None

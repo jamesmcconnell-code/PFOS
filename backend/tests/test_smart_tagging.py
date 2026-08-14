@@ -9,10 +9,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.main import accept_classification_suggestion, classification_preview, classification_rules, classification_suggestions, create_classification_rule, delete_classification_rule, normalize_merchant_key, update_classification_rule
-from app.models import Account, Category, Household, HouseholdMember, MerchantIdentity, Tag, Transaction, TransactionClassificationRule, TransactionClassificationSuggestion, TransactionTag, User
-from app.schemas import TransactionClassificationRuleIn, TransactionClassificationRuleUpdate
+from app.main import accept_classification_suggestion, accept_classification_suggestion_fields, classification_preview, classification_rules, classification_suggestion_always_apply, classification_suggestion_always_apply_preview, classification_suggestions, create_classification_rule, delete_classification_rule, generate_transaction_historical_suggestion, normalize_merchant_key, reject_classification_suggestion_fields, update_classification_rule
+from app.models import Account, Category, Household, HouseholdMember, MerchantIdentity, Tag, Transaction, TransactionClassificationRule, TransactionClassificationSuggestion, TransactionClassificationSuggestionDecision, TransactionTag, User
+from app.schemas import AlwaysApplyClassificationIn, ClassificationSuggestionFieldsIn, TransactionClassificationRuleIn, TransactionClassificationRuleUpdate
 from app.smart_tagging import evaluate_new_transaction
+from app.smart_tagging_learning import generate_historical_suggestion
 from app.connectors import NormalizedAccount, NormalizedTransaction, SyncPayload, persist_payload
 
 
@@ -117,3 +118,58 @@ def test_planner_outputs_wait_for_review_unless_explicitly_approved():
     db.add(approved);db.flush();applied=evaluate_new_transaction(approved,db,source='gemini');db.commit()
     assert applied.status=='applied' and approved.is_refund is True and approved.is_prorated is True and approved.proration_months==1
     assert pending_rule['id'] and approved_rule['id']
+
+
+def test_historical_learning_builds_explainable_consensus_without_planner_flags():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    for index in range(18):
+        db.add(Transaction(household_id=home.id,account_id=account.id,category_id=category.id if index<17 else None,date=date.today(),description='Whole Foods REF # ABCDE12345',amount=-20,is_essential=True,is_expected=index==0))
+    current=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Whole Foods',amount=-30)
+    db.add(current);db.flush();suggestion=generate_transaction_historical_suggestion(current.id,admin,db);db.commit()
+    assert suggestion['source_type']=='learned' and suggestion['status']=='pending' and suggestion['category_id']==str(category.id)
+    assert suggestion['proposal_data']['fields']['category_id']['count']==17
+    assert '17 of 18' in suggestion['explanation']
+    assert suggestion['internal_transfer'] is None and suggestion['expected'] is None
+
+
+def test_historical_learning_conflict_unknown_and_field_acceptance_are_safe():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    for index in range(3): db.add(Transaction(household_id=home.id,account_id=account.id,category_id=category.id if index<2 else None,date=date.today(),description='Conflict Store',amount=-10))
+    conflict=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Conflict Store',amount=-11)
+    unknown=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Unknown Merchant',amount=-12)
+    db.add_all([conflict,unknown]);db.flush()
+    conflict_result=generate_transaction_historical_suggestion(conflict.id,admin,db)
+    unknown_result=generate_transaction_historical_suggestion(unknown.id,admin,db)
+    assert conflict_result['status']=='pending' and conflict_result['safe_for_auto_apply'] is False
+    assert unknown_result['result']=='insufficient_history'
+    accepted=accept_classification_suggestion_fields(__import__('uuid').UUID(conflict_result['id']),ClassificationSuggestionFieldsIn(fields=['category_id']),admin,db)
+    assert accepted['status']=='applied' and conflict.category_id==category.id
+    assert accept_classification_suggestion_fields(__import__('uuid').UUID(conflict_result['id']),ClassificationSuggestionFieldsIn(fields=['category_id']),admin,db)['status']=='applied'
+    preview=classification_suggestion_always_apply_preview(__import__('uuid').UUID(conflict_result['id']),AlwaysApplyClassificationIn(fields=['category_id']),admin,db)
+    rule=classification_suggestion_always_apply(__import__('uuid').UUID(conflict_result['id']),AlwaysApplyClassificationIn(fields=['category_id']),admin,db)
+    assert preview['normalized_merchant_key']=='conflict store' and rule['source_type']=='user_authored'
+
+
+def test_historical_learning_never_uses_other_household_or_owner_history():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    other_home=db.scalar(__import__('sqlalchemy').select(Household).where(Household.name=='Other household'))
+    other_account=Account(household_id=other_home.id,owner_id=other.id,ownership='individual',name='Other checking',type='checking',account_type='spending')
+    james_account=Account(household_id=home.id,owner_id=admin.id,ownership='individual',name='James checking',type='checking',account_type='spending')
+    db.add_all([other_account,james_account]);db.flush()
+    for source_household,source_account,source_category in ((other_home,other_account,other_category),(home,james_account,category)):
+        for _ in range(3): db.add(Transaction(household_id=source_household.id,account_id=source_account.id,category_id=source_category.id,date=date.today(),description='Private Market',amount=-9))
+    current=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Private Market',amount=-9)
+    db.add(current);db.flush()
+    result=generate_transaction_historical_suggestion(current.id,admin,db)
+    assert result['result']=='insufficient_history' and result['evidence_count']==0
+
+
+def test_rejecting_selected_suggestion_fields_is_audited_and_idempotent():
+    db,admin,bailey,other,home,category,tag,other_category,account=smart_tagging_context()
+    for _ in range(3): db.add(Transaction(household_id=home.id,account_id=account.id,category_id=category.id,date=date.today(),description='Local Market',amount=-10))
+    current=Transaction(household_id=home.id,account_id=account.id,date=date.today(),description='Local Market',amount=-11)
+    db.add(current);db.flush();suggestion=generate_historical_suggestion(current,db);db.commit()
+    result=reject_classification_suggestion_fields(suggestion.id,ClassificationSuggestionFieldsIn(fields=['category_id']),admin,db)
+    assert result['status']=='pending'
+    assert reject_classification_suggestion_fields(suggestion.id,ClassificationSuggestionFieldsIn(fields=['category_id']),admin,db)['status']=='pending'
+    assert db.scalar(__import__('sqlalchemy').select(TransactionClassificationSuggestionDecision.decision).where(TransactionClassificationSuggestionDecision.suggestion_id==suggestion.id,TransactionClassificationSuggestionDecision.field_name=='category_id'))=='rejected'

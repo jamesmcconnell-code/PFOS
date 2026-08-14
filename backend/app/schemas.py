@@ -134,6 +134,11 @@ class TransactionClassificationRuleUpdate(BaseModel):
     is_active: bool|None=None
     source_type: str|None=None
     planner_automation_approved: bool|None=None
+class ClassificationSuggestionFieldsIn(BaseModel):
+    fields: list[str]|None=Field(default=None,max_length=20)
+class AlwaysApplyClassificationIn(BaseModel):
+    fields: list[str]|None=Field(default=None,max_length=20)
+    priority: int=Field(default=100,ge=0,le=100000)
 class SavingsRuleIn(BaseModel): target_type: str; target_id: UUID
 class PlannerExpenseRuleIn(BaseModel):
     account_id: UUID
