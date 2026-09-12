@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { apiBase } from '@/lib/api';
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { LayoutDashboard, WalletCards, ReceiptText, Target, ChartNoAxesCombined, Upload, Plug, Coins, HandCoins, Tags, ChartPie } from 'lucide-react';
@@ -14,7 +15,7 @@ export function Nav() {
 
   useEffect(() => {
     setView(localStorage.getItem('pfos_view_user_id') || '');
-    fetch((process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000/api/v1') + '/household/members', { headers: { Authorization: `Bearer ${localStorage.getItem('pfos_token')}` } })
+    fetch(apiBase() + '/household/members', { headers: { Authorization: `Bearer ${localStorage.getItem('pfos_token')}` } })
       .then((response) => response.json()).then(setMembers).catch(() => {});
   }, [path]);
 

@@ -27,3 +27,25 @@ backups/
 *.dump
 *.age
 .DS_Store
+
+# Local SQLite household data and sidecar files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Built desktop runtime (contains platform-specific binaries)
+desktop/.build/
+desktop/resources/backend/
+
+# Local desktop installation secrets and process lock
+runtime.json
+.backend.lock

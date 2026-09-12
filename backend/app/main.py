@@ -27,7 +27,9 @@ def plaid_host() -> str:
     try: return hosts[settings.plaid_environment]
     except KeyError: raise HTTPException(500,'Invalid PLAID_ENVIRONMENT configuration')
 def current_user(c: HTTPAuthorizationCredentials=Depends(bearer), db: Session=Depends(get_db)):
-    user=db.get(User, decode_token(c.credentials))
+    try: user_id=UUID(decode_token(c.credentials))
+    except (ValueError, TypeError, AttributeError): raise HTTPException(401,'Invalid token subject')
+    user=db.get(User, user_id)
     if not user: raise HTTPException(401,'User not found')
     return user
 def require_admin(user: User=Depends(current_user)):
@@ -1637,6 +1639,7 @@ async def import_csv_normalized(account_id:UUID,file:UploadFile=File(...),user=D
     connection=db.scalar(select(DataConnection).where(DataConnection.household_id==account.household_id,DataConnection.provider=='csv',DataConnection.name==f'CSV: {account.name}'))
     if not connection: connection=DataConnection(household_id=account.household_id,provider='csv',name=f'CSV: {account.name}');db.add(connection);db.flush()
     account.connection_id=connection.id; account.external_id=str(account.id)
+    db.flush()  # The import pipeline queries this link with autoflush disabled.
     try: payload=CsvConnector().parse(await file.read(),str(account.id)); added,dupes=persist_payload(db,connection,payload);db.commit();return {'imported':added,'duplicates':dupes}
     except ValueError as exc: raise HTTPException(400,str(exc))
 @app.get('/api/v1/connections/{connection_id}/syncs')

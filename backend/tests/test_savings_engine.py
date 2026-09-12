@@ -180,14 +180,18 @@ def test_subcategory_inherits_its_parents_savings_rule_at_any_depth():
     assert available_cash_planner('paycheck',date.today(),None,user,db)['automated_savings_amount']==125
     assert metrics(home.id,db)['automated_savings']==125
 
-def test_anticipated_monthly_expense_projects_before_posting_and_splits_paychecks():
+def test_anticipated_monthly_expense_projects_before_posting_and_splits_paychecks(monkeypatch):
+    class ScenarioDate(date):
+        @classmethod
+        def today(cls): return cls(2026, 8, 2)
+    monkeypatch.setattr('app.main.date', ScenarioDate)
     engine=create_engine('sqlite://')
     Base.metadata.create_all(engine)
     db=sessionmaker(bind=engine)()
     user=User(email='anticipated@example.com',display_name='Anticipated',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(account);db.flush()
     source=Transaction(household_id=home.id,account_id=account.id,date=date(2026,7,1),description='Phone Bill',amount=-120,is_expected=True,is_prorated=True,proration_months=1);db.add(source);db.flush()
-    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1,effective_start_date=date(2026,7,1)));db.commit()
     paycheck=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
     monthly=available_cash_planner('monthly',date(2026,8,2),None,user,db)
     assert paycheck['actual_expense_total']==0
@@ -196,14 +200,18 @@ def test_anticipated_monthly_expense_projects_before_posting_and_splits_paycheck
     assert paycheck['anticipated_expense_sources'][0]['status']=='anticipated'
     assert monthly['anticipated_expense_total']==120
 
-def test_actual_recurring_expense_reconciles_and_replaces_projection():
+def test_actual_recurring_expense_reconciles_and_replaces_projection(monkeypatch):
+    class ScenarioDate(date):
+        @classmethod
+        def today(cls): return cls(2026, 8, 2)
+    monkeypatch.setattr('app.main.date', ScenarioDate)
     engine=create_engine('sqlite://')
     Base.metadata.create_all(engine)
     db=sessionmaker(bind=engine)()
     user=User(email='reconciled@example.com',display_name='Reconciled',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     account=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(account);db.flush()
     source=Transaction(household_id=home.id,account_id=account.id,date=date(2026,7,1),description='Phone Bill',amount=-120,is_expected=True,is_prorated=True,proration_months=1);actual=Transaction(household_id=home.id,account_id=account.id,date=date(2026,8,2),description='Phone Bill',amount=-140,is_expected=True,is_prorated=True,proration_months=1);db.add_all([source,actual]);db.flush()
-    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=account.id,display_name='Phone Bill',source_description='Phone Bill',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1,effective_start_date=date(2026,7,1)));db.commit()
     result=available_cash_planner('paycheck',date(2026,8,2),None,user,db)
     assert result['anticipated_expense_total']==0
     assert result['actual_expense_total']==70
@@ -301,7 +309,11 @@ def test_starting_carryover_can_be_removed_only_from_its_active_scope():
     delete_planner_carryover(bailey_opening.id,bailey.id,james,db)
     assert db.get(PlannerStartingCarryover,bailey_opening.id) is None
 
-def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
+def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments(monkeypatch):
+    class ScenarioDate(date):
+        @classmethod
+        def today(cls): return cls(2026, 8, 2)
+    monkeypatch.setattr('app.main.date', ScenarioDate)
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     user=User(email='rolling-paycheck@example.com',display_name='Rolling',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
     checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0);db.add(checking);db.flush()
@@ -318,12 +330,16 @@ def test_rolling_cash_carries_paychecks_and_applies_signed_adjustments():
     assert filtered['opening_balance_before_display_range']==100
     assert filtered['current']['ending_rolling_available_cash']==result['current']['ending_rolling_available_cash']
 
-def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolation():
+def test_rolling_cash_monthly_uses_opening_anticipated_refunds_and_scope_isolation(monkeypatch):
+    class ScenarioDate(date):
+        @classmethod
+        def today(cls): return cls(2026, 8, 2)
+    monkeypatch.setattr('app.main.date', ScenarioDate)
     engine=create_engine('sqlite://');Base.metadata.create_all(engine);db=sessionmaker(bind=engine)()
     james=User(email='rolling-james@example.com',display_name='James',password_hash='x');bailey=User(email='rolling-bailey@example.com',display_name='Bailey',password_hash='x');home=Household(name='Test household');db.add_all([james,bailey,home]);db.flush();db.add_all([HouseholdMember(household_id=home.id,user_id=james.id),HouseholdMember(household_id=home.id,user_id=bailey.id)]);db.flush()
     joint=Account(household_id=home.id,name='Joint checking',type='checking',account_type='spending',balance=0);individual=Account(household_id=home.id,owner_id=bailey.id,ownership='individual',name='Bailey checking',type='checking',account_type='spending',balance=0);db.add_all([joint,individual]);db.flush()
     source=Transaction(household_id=home.id,account_id=joint.id,date=date(2026,7,1),description='Phone',amount=-120,is_expected=True,is_prorated=True,proration_months=1)
-    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=100),PlannerAdjustment(household_id=home.id,owner_id=bailey.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=500),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,3),description='Refund',amount=50,is_refund=True),source]);db.flush();db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=joint.id,display_name='Phone',source_description='Phone',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1));db.commit()
+    db.add_all([PlannerStartingCarryover(household_id=home.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=100),PlannerAdjustment(household_id=home.id,owner_id=bailey.id,period_type='monthly',effective_period_start=date(2026,8,1),amount=500),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,2),description='Pay',amount=1000),Transaction(household_id=home.id,account_id=joint.id,date=date(2026,8,3),description='Refund',amount=50,is_refund=True),source]);db.flush();db.add(RecurringPlannerExpenseRule(household_id=home.id,source_transaction_id=source.id,account_id=joint.id,display_name='Phone',source_description='Phone',monthly_projected_amount=120,expected_day_of_month=1,proration_months=1,effective_start_date=date(2026,7,1)));db.commit()
     joint_result=planner_cash_history(home.id,'monthly',date(2026,8,2),None,james,db)
     assert joint_result['current']['anticipated_expenses']==120
     assert joint_result['current']['total_period_expenses']==70

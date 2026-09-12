@@ -10,7 +10,7 @@ depends_on = None
 def upgrade():
     op.execute("""
         UPDATE accounts
-        SET asset_symbol = regexp_replace(name, ' Wallet$', '')
+        SET asset_symbol = substr(name, 1, length(name) - 7)
         WHERE account_type = 'crypto'
           AND asset_symbol IS NULL
           AND name LIKE '% Wallet'

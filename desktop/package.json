@@ -1,0 +1,22 @@
+{
+  "name": "pfos-desktop",
+  "productName": "PFOS",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PFOS local desktop application",
+  "main": "entry.cjs",
+  "scripts": {
+    "start": "node scripts/run.cjs .",
+    "dev": "node scripts/dev.cjs",
+    "test": "node --test tests/*.test.cjs",
+    "test:smoke": "node scripts/run.cjs tests/smoke.cjs",
+    "build:backend": "node scripts/build-backend.cjs",
+    "test:backend": "node --test tests/backend.integration.cjs",
+    "test:bundled": "node scripts/run.cjs tests/bundled-smoke.cjs",
+    "test:lifecycle": "node scripts/run.cjs tests/app-lifecycle.cjs",
+    "test:storage": "node --test tests/storage.integration.cjs"
+  },
+  "devDependencies": {
+    "electron": "44.3.0"
+  }
+}

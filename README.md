@@ -12,7 +12,7 @@ docker-compose.yml  PostgreSQL + API + web application
 
 ## Architecture and decisions
 
-- PostgreSQL is the source of truth. All 15 requested entities use UUID keys, foreign keys, and audit timestamps (join-only `transaction_tags` is the intentional exception to audit fields).
+- PostgreSQL is the source of truth for server deployments; SQLite is supported for local desktop storage. All 15 requested entities use UUID keys, foreign keys, and audit timestamps (join-only `transaction_tags` is the intentional exception to audit fields).
 - The API scopes every household resource through the authenticated member. Passwords are bcrypt hashes; JWTs are short-lived bearer credentials (24 hours by default).
 - Imports use a stable SHA-256 fingerprint of account/date/amount/description, so re-importing a statement does not double-count transactions.
 - Financial metrics are derived, not duplicated. Savings rate is monthly savings divided by monthly income; emergency target is surfaced by the dashboard alert using six months of essential monthly spend.
@@ -26,13 +26,24 @@ docker-compose.yml  PostgreSQL + API + web application
 
 For development without Docker, install `backend/requirements.txt`, set `DATABASE_URL`, run `cd backend && alembic upgrade head`, and use `uvicorn app.main:app --reload`. Install frontend dependencies with `cd frontend && npm install && npm run dev`.
 
+## Local desktop storage (step 1)
+
+SQLite migration and backend compatibility are implemented. The installer is a subsequent step. See [SQLite storage and verification](docs/SQLITE.md)
+for local setup, migration behavior, and the tests that exercise migrated database files.
+
+The [Electron desktop app](docs/DESKTOP.md) now includes permanent local storage (step 4), the window (step 2), and a
+bundled Python backend (step 3). Build the backend once, then run
+`npm run dev --prefix desktop` to open PFOS with its API managed automatically.
+A separately running API is no longer needed. The complete downloadable installer
+remains a subsequent step.
+
 ## API surface
 
 `/api/v1/auth` supplies registration, login and current-user endpoints. Authenticated routes cover `/household`, `/accounts`, `/categories`, `/transactions`, `/imports/preview`, `/imports/commit`, `/imports`, `/goals`, `/dashboard`, `/forecast`, and `/analysis/live-on-one-income`. The interactive OpenAPI contract is at `http://localhost:8000/docs`.
 
 ## Tests
 
-Run backend tests with `cd backend && pytest`. The test suite validates password and JWT security primitives; endpoint behavior is designed for integration testing against PostgreSQL.
+Run backend tests with `cd backend && python -m pytest`. Use `python -m pytest --migrated-sqlite` to run existing database scenarios against migrated SQLite files with foreign-key enforcement. Tests cover authentication, financial calculations, imports, settlements, tagging, migrations, and local persistence.
 
 ## Deployment
 
