@@ -1,8 +1,10 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, shell, nativeImage } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, nativeImage, session } = require('electron');
 const path = require('node:path');
 const { startBackend, bundledBackendPath } = require('./backend.cjs');
+const { runMaintenance } = require('./maintenance.cjs');
+const { startFrontend, bundledFrontendPath } = require('./frontend.cjs');
 const { storagePaths, LOCAL_SESSION } = require('./storage.cjs');
 const { localAppURL, isAppNavigation, isExternalURL } = require('./policy.cjs');
 const iconPath = path.join(__dirname, 'assets', 'icon.png');
@@ -74,7 +76,7 @@ function createWindow(origin, { show = true, partition = 'persist:pfos-desktop',
   return window;
 }
 
-function menuTemplate(getWindow, origin, { dataDir } = {}) {
+function menuTemplate(getWindow, origin, { dataDir, backup, restore } = {}) {
   const navigate = route => () => { const window = getWindow(); if (window) void window.loadApp(route); };
   const reload = () => {
     const window = getWindow();
@@ -93,6 +95,7 @@ function menuTemplate(getWindow, origin, { dataDir } = {}) {
       { label: 'Accounts', accelerator: 'CmdOrCtrl+2', click: navigate('/accounts') },
       { label: 'Transactions', accelerator: 'CmdOrCtrl+3', click: navigate('/transactions') },
       { label: 'Import CSV…', accelerator: 'CmdOrCtrl+I', click: navigate('/import') },
+      ...(backup ? [{label:'Back Up Local Data…', click:backup}, {label:'Restore Local Backup…', click:restore}] : []),
       ...(dataDir ? [{ type: 'separator' }, { label: 'Show Data Folder…', click: async () => {
         try {
           const error = await shell.openPath(dataDir);
@@ -114,15 +117,17 @@ function menuTemplate(getWindow, origin, { dataDir } = {}) {
 
 async function start({ userDataPath } = {}) {
   app.setName('PFOS');
-  const storage = storagePaths(app.getPath('appData'), userDataPath);
+  const storage = storagePaths(app.getPath('appData'), userDataPath || app.commandLine.getSwitchValue('user-data-dir') || undefined);
   app.setPath('userData', storage.profileDir);
   let origin;
-  try { origin = localAppURL(process.env.PFOS_DESKTOP_URL); }
+  try { origin = localAppURL(app.isPackaged ? undefined : process.env.PFOS_DESKTOP_URL); }
   catch (error) { await app.whenReady(); dialog.showErrorBox('PFOS could not start', error.message); app.quit(); return; }
   if (!app.requestSingleInstanceLock()) { app.quit(); return; }
-  let window, backend, startup;
+  let window, backend, startup, frontend, maintenance;
+  let maintaining = false;
   let quitting = false, shutdownComplete = false;
   const openWindow = () => {
+    if (maintaining || quitting) return;
     if (!window || window.isDestroyed()) {
       window = createWindow(origin, { backend, partition: LOCAL_SESSION });
       void window.loadApp();
@@ -132,33 +137,85 @@ async function start({ userDataPath } = {}) {
     return window;
   };
   app.on('second-instance', () => { if (backend && !quitting) openWindow(); });
-  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+  app.on('window-all-closed', () => { if (process.platform !== 'darwin' && !maintaining) app.quit(); });
   app.on('before-quit', event => {
     if (shutdownComplete) return;
     event.preventDefault();
     if (quitting) return;
     quitting = true;
     void (async () => {
-      try { const runtime = await startup; await runtime?.stop(); }
+      try { await maintenance; const runtime = await startup; await runtime?.stop(); }
       catch { /* Failed startup already cleans up its child process. */ }
-      finally { shutdownComplete = true; app.quit(); }
+      finally { await frontend?.stop(); shutdownComplete = true; app.quit(); }
     })();
   });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => app.quit());
   await app.whenReady();
-  startup = startBackend({
+  startup = (async () => {
+    if (app.isPackaged || !process.env.PFOS_DESKTOP_URL) {
+      frontend = await startFrontend({directory: bundledFrontendPath({isPackaged: app.isPackaged, resourcesPath: process.resourcesPath})});
+      origin = frontend.origin;
+    }
+    return startBackend({
     dataDir: storage.dataDir, frontendOrigin: origin,
     executable: bundledBackendPath({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath }),
     onUnexpectedExit: error => {
       if (!quitting) { dialog.showErrorBox('PFOS stopped', error.message); app.quit(); }
     },
   });
+  })();
   backend = await startup;
   if (quitting) return;
   app.setAboutPanelOptions({ applicationName: 'PFOS', applicationVersion: app.getVersion(),
     iconPath, comments: 'Personal financial operating system' });
   if (app.dock) app.dock.setIcon(nativeImage.createFromPath(iconPath));
-  Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate(openWindow, origin, storage)));
+  async function maintain(operation) {
+    if (maintaining || quitting) return;
+    openWindow();
+    maintaining = true;
+    maintenance = (async () => {
+      let stopped = false;
+      try {
+        const filters = [{name:'PFOS local backup', extensions:['pfosbackup']}];
+        let file;
+        if (operation === 'backup') {
+          const result = await dialog.showSaveDialog(window, {title:'Back Up Local Data', filters,
+            defaultPath:'PFOS-' + new Date().toISOString().replace(/[:.]/g,'-') + '.pfosbackup',
+            message:'Contains financial data and account secrets. This file is not encrypted; save it in a protected location.'});
+          if (result.canceled || !result.filePath) return;
+          file = result.filePath;
+        } else {
+          const result = await dialog.showOpenDialog(window, {title:'Restore Local Backup', filters, properties:['openFile']});
+          if (result.canceled || !result.filePaths.length) return;
+          file = result.filePaths[0];
+          const confirmation = await dialog.showMessageBox(window, {type:'warning', buttons:['Cancel','Restore'],
+            defaultId:0, cancelId:0, message:'Replace local data with this backup?',
+            detail:file + '\nCurrent data will be saved in a recovery backup first. You will sign in again using the account in the backup.'});
+          if (confirmation.response !== 1) return;
+        }
+        window?.destroy(); window = null;
+        await backend.stop(); stopped = true;
+        const result = await runMaintenance({dataDir:storage.dataDir, operation, file,
+          executable:bundledBackendPath({isPackaged:app.isPackaged, resourcesPath:process.resourcesPath})});
+        if (operation === 'restore') await session.fromPartition(LOCAL_SESSION).clearStorageData({storages:['localstorage']});
+        await dialog.showMessageBox({type:'info', message:operation === 'backup'?'Backup saved':'Backup restored',
+          detail:operation === 'backup'?result.path:'Recovery copy: ' + result.path});
+      } catch (error) {dialog.showErrorBox('PFOS backup / restore', error.message)}
+      finally {
+        if (stopped && !quitting) {
+          startup = startBackend({dataDir:storage.dataDir, frontendOrigin:origin,
+            executable:bundledBackendPath({isPackaged:app.isPackaged, resourcesPath:process.resourcesPath}),
+            onUnexpectedExit:error => {dialog.showErrorBox('PFOS stopped',error.message); app.quit()}});
+          try {backend = await startup} catch (error) {dialog.showErrorBox('PFOS could not reopen',error.message); app.quit()}
+        }
+        maintaining = false;
+        if (!quitting) openWindow();
+      }
+    })();
+    await maintenance;
+  }
+  Menu.setApplicationMenu(Menu.buildFromTemplate(menuTemplate(openWindow, origin, {...storage,
+    backup:()=>void maintain('backup'), restore:()=>void maintain('restore')})));
   openWindow();
   app.on('activate', () => { if (!quitting) openWindow(); });
 }

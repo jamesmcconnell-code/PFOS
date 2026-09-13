@@ -49,3 +49,13 @@ desktop/resources/backend/
 # Local desktop installation secrets and process lock
 runtime.json
 .backend.lock
+
+# Built desktop interface
+desktop/resources/frontend/
+
+# Local household backup archives and interrupted-restore state
+*.pfosbackup
+restore.pending
+
+# Desktop installer artifacts
+desktop/dist/

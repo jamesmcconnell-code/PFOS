@@ -9,7 +9,8 @@ const { localAppURL } = require('../policy.cjs');
 
 async function run() {
   const profile = await fs.mkdtemp(path.join(os.tmpdir(), 'pfos-app-lifecycle-'));
-  process.env.PFOS_DESKTOP_URL = localAppURL(process.env.PFOS_SMOKE_URL);
+  if (process.env.PFOS_SMOKE_URL) process.env.PFOS_DESKTOP_URL = localAppURL(process.env.PFOS_SMOKE_URL);
+  else delete process.env.PFOS_DESKTOP_URL;
   await start({ userDataPath: profile });
   const window = BrowserWindow.getAllWindows()[0];
   assert.ok(window, 'Desktop startup did not create its window');
@@ -22,12 +23,16 @@ async function run() {
   }
   assert.ok(apiBase, 'Desktop startup did not connect its backend');
   assert.equal((await fetch(apiBase.replace('/api/v1', '/health'))).status, 401);
+  const frontendOrigin = new URL(window.webContents.getURL()).origin;
   app.once('will-quit', event => {
     event.preventDefault();
     void (async () => {
       let alive = false;
       try { await fetch(apiBase.replace('/api/v1', '/health'), { signal: AbortSignal.timeout(1000) }); alive = true; } catch {}
       assert.equal(alive, false, 'API remains active after the app quit sequence');
+      if (!process.env.PFOS_SMOKE_URL) {
+        await assert.rejects(fetch(frontendOrigin, {signal:AbortSignal.timeout(1000)}));
+      }
       console.log('Whole-app lifecycle passed: automatic bundled API startup and graceful shutdown before quit.');
       app.exit(0);
     })().catch(error => { console.error(error); app.exit(1); });

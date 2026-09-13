@@ -39,7 +39,9 @@ test('replacing the app bundle preserves local finances, settings, and secrets w
       assert.ok(response.ok, await response.clone().text());
       return response.json();
     };
+    assert.deepEqual(await api('/desktop/setup'), {setup_required:true});
     headers.Authorization = 'Bearer ' + (await api('/auth/register', { ...credentials, display_name: 'Bundled' })).access_token;
+    assert.deepEqual(await api('/desktop/setup'), {setup_required:false});
     const settingResponse = await fetch(runtime.url + '/api/v1/household/financial-settings', {
       method: 'PATCH', headers, body: JSON.stringify({ checking_account_ceiling: 1234.56 }),
     });

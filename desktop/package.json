@@ -14,9 +14,15 @@
     "test:backend": "node --test tests/backend.integration.cjs",
     "test:bundled": "node scripts/run.cjs tests/bundled-smoke.cjs",
     "test:lifecycle": "node scripts/run.cjs tests/app-lifecycle.cjs",
-    "test:storage": "node --test tests/storage.integration.cjs"
+    "test:storage": "node --test tests/storage.integration.cjs",
+    "build:frontend": "node scripts/build-frontend.cjs",
+    "test:frontend": "node --test tests/frontend.integration.cjs",
+    "test:backup": "node scripts/run.cjs tests/backup-smoke.cjs",
+    "package:mac": "electron-builder --config electron-builder.cjs --mac --x64 --publish never",
+    "test:packaged": "node --test tests/packaged.integration.cjs"
   },
   "devDependencies": {
-    "electron": "44.3.0"
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3"
   }
 }

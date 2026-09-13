@@ -1,4 +1,6 @@
-# PFOS encrypted backups
+# PFOS encrypted server backups
+
+For the local desktop app, see [desktop backup and restore](DESKTOP-BACKUPS.md).
 
 PFOS stores its working database in Docker's named volume. That volume survives normal shutdowns, but it is not an external backup. The backup workflow creates encrypted PostgreSQL dumps on an external drive.
 

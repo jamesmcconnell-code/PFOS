@@ -31,11 +31,12 @@ For development without Docker, install `backend/requirements.txt`, set `DATABAS
 SQLite migration and backend compatibility are implemented. The installer is a subsequent step. See [SQLite storage and verification](docs/SQLITE.md)
 for local setup, migration behavior, and the tests that exercise migrated database files.
 
-The [Electron desktop app](docs/DESKTOP.md) now includes permanent local storage (step 4), the window (step 2), and a
-bundled Python backend (step 3). Build the backend once, then run
-`npm run dev --prefix desktop` to open PFOS with its API managed automatically.
-A separately running API is no longer needed. The complete downloadable installer
-remains a subsequent step.
+The [Electron desktop app](docs/DESKTOP.md) bundles the interface and Python backend,
+with permanent local storage, first-launch setup, and [local backup/restore](docs/DESKTOP-BACKUPS.md) (steps 2–7). Build both bundles,
+then run `npm start --prefix desktop`; PFOS manages its own interface and API.
+Use `npm run dev --prefix desktop` for frontend development.
+An [unsigned Intel macOS installer](docs/DESKTOP-INSTALLER.md) is available in `desktop/dist/`
+(step 8). Signing and notarization remain before public release.
 
 ## API surface
 

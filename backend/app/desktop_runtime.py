@@ -122,8 +122,25 @@ def initialize_database():
     if not tables:
         command.upgrade(config, 'head')
     elif revisions != (head,):
-        # Automatic existing-data upgrades require the backup workflow in step 7.
-        raise RuntimeError('Local database needs a migration. Back it up and upgrade it before opening this PFOS version.')
+        known = {item.revision for item in ScriptDirectory.from_config(config).walk_revisions()}
+        if len(revisions) != 1 or revisions[0] not in known:
+            raise RuntimeError('Local database has an unsupported revision. No migration was attempted.')
+        from .desktop_backup import recovery_backup
+        recovery_backup(Path(engine.url.database).parent, 'before-upgrade')
+        command.upgrade(config, 'head')
+
+
+def install_setup_route(application):
+    """Only the desktop runtime exposes setup state, behind DesktopAccess."""
+    from fastapi import Depends
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+    from .database import get_db
+    from .models import User
+
+    @application.get('/api/v1/desktop/setup')
+    def setup_status(db: Session = Depends(get_db)):
+        return {'setup_required': db.scalar(select(User.id).limit(1)) is None}
 
 
 class DesktopAccess:
@@ -149,8 +166,26 @@ class DesktopAccess:
 def main():
     parser = argparse.ArgumentParser(description='PFOS bundled desktop backend')
     parser.add_argument('--data-dir', required=True)
-    parser.add_argument('--frontend-origin', required=True)
+    parser.add_argument('--frontend-origin')
+    parser.add_argument('--maintenance', choices=['backup', 'restore'])
+    parser.add_argument('--file')
     args = parser.parse_args()
+    if args.maintenance:
+        from .desktop_backup import create_backup, restore_backup, recover_interrupted_restore
+        if not args.file:
+            parser.error('--file is required for maintenance')
+        os.umask(0o077)
+        directory = Path(args.data_dir).resolve()
+        lock = lock_storage(directory)
+        try:
+            recover_interrupted_restore(directory)
+            result = (create_backup if args.maintenance == 'backup' else restore_backup)(directory, args.file)
+            print(json.dumps({'path': result}), flush=True)
+        finally:
+            lock.close()
+        return
+    if not args.frontend_origin:
+        parser.error('--frontend-origin is required')
     origin = urlsplit(args.frontend_origin)
     if (origin.scheme != 'http' or origin.hostname not in ('localhost', '127.0.0.1', '::1')
             or origin.username or origin.password or origin.path or origin.query or origin.fragment):
@@ -169,6 +204,8 @@ def main():
     directory = Path(args.data_dir).resolve()
     lock = lock_storage(directory)
     try:
+        from .desktop_backup import recover_interrupted_restore
+        recover_interrupted_restore(directory)
         database, values = prepare_storage(directory)
         configure_environment(database, values, args.frontend_origin)
         os.chdir(directory)
@@ -179,6 +216,7 @@ def main():
         import asyncio
         import uvicorn
         from .main import app
+        install_setup_route(app)
         from .database import engine
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(('127.0.0.1', 0))

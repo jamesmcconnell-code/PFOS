@@ -1,40 +1,50 @@
-# PFOS desktop: window, bundled backend, and permanent storage (steps 2–4)
+# PFOS desktop: window, bundled backend, and permanent storage (steps 2–8)
 
 Electron now starts a self-contained Python API automatically, waits for it to become
 ready, and connects the PFOS interface to its local port. Quitting PFOS shuts down
 the API. Users do not need a Python installation to run the built backend.
 
-The frontend still runs through Next.js during development. A signed, downloadable
-installer containing the complete application remains a later step.
+The interface is now bundled as static files and served by Electron itself. An [unsigned Intel macOS installer](DESKTOP-INSTALLER.md) is now available.
+Apple signing and notarization remain release work.
 
 ## Run the desktop app
 
-With frontend/desktop dependencies installed and the backend bundle built:
+With dependencies installed and the backend bundle built, build the interface once:
 
 ```sh
-npm run dev --prefix desktop
-```
-
-This starts Next.js on `http://localhost:3000`, then Electron and its bundled API.
-There is **no separate API command**. The API selects an unused loopback port rather
-than occupying port 8000 or attaching to another PFOS server.
-
-If your frontend is already running on port 3000, use:
-
-```sh
+npm run build:frontend --prefix desktop
 npm start --prefix desktop
 ```
 
-That command starts Electron and its API only; it does not stop the separately
-running frontend. `npm run dev` refuses an occupied frontend port.
+PFOS starts its interface and API automatically. No Next.js server, separate API,
+Python installation, or Docker is required at runtime. The interface uses
+`http://127.0.0.1:37841`; startup refuses an occupied port instead of attaching to
+another service. Both servers bind only to loopback. The API uses a separate random port.
+
+This stable interface address preserves browser storage across subsequent launches.
+Switching from the earlier development origin requires signing in again; household
+data and financial settings remain in the same permanent database.
+
+For frontend development with live rebuilding, use `npm run dev --prefix desktop`.
+That launcher starts Next.js and explicitly selects its development origin. To attach
+to an already running development frontend, set `PFOS_DESKTOP_URL` explicitly.
+Packaged applications always use the bundled interface.
 
 Use **Command-Q** to quit PFOS or **Control-C** to stop the development launcher.
 Both stop the owned API; the development launcher also stops its frontend. On
 macOS, closing the window leaves the application and API running. Clicking the
 Dock icon reopens the window.
 
-A new local installation starts with an empty household database. Choose **New here?
-Create an account** on the sign-in screen. Existing server data and server login
+A new local installation opens a **Welcome to PFOS** setup screen. Enter your name,
+email, password, and password confirmation to create the local household. Passwords
+require at least 10 characters, including a letter and a number. The email identifies
+your account locally; setup does not send a verification email. Successful setup opens
+the dashboard. Existing installations show sign-in, and saved sessions continue working.
+
+Setup state is read from the database, so clearing browser storage does not restart
+household setup. If the setup check fails, PFOS offers Retry before accepting account
+creation. The setup-status endpoint is installed only in the bundled desktop runtime
+and is protected by its private launch capability. Existing server data and server login
 sessions are not automatically imported into this local installation.
 
 To select another frontend origin:
@@ -85,7 +95,20 @@ Build output and installation secrets are ignored by Git.
 For future installer packaging, copy the entire `desktop/resources/backend/`
 directory to `<Electron resources>/backend/` outside the ASAR archive. The desktop
 launcher already resolves that packaged path when `app.isPackaged` is true.
-Code signing and installer production are not part of this step.
+The installer configuration implements this layout. Code signing remains release work.
+
+## Build the interface
+
+`npm run build:frontend --prefix desktop` selects Next.js static export only for the
+desktop build and copies the result into `desktop/resources/frontend/` (approximately
+1.9 MB). Normal web builds retain their existing Next.js configuration. Rebuild this
+bundle after frontend changes. For installer packaging, copy it to
+`<Electron resources>/frontend/` alongside the backend bundle.
+
+The embedded HTTP server serves only this directory, supports exported routes and
+assets, rejects foreign Host headers and paths outside the bundle, and closes during
+normal application shutdown. Local financial workflows work without an external
+frontend service; remote bank connections and live market data still need a network.
 
 ## Runtime ownership and storage
 
@@ -112,12 +135,13 @@ are adopted with their original secrets after database validation.
 Keep the database and its secrets together. Browser login and preferences are stored
 elsewhere within the same Electron profile and require the same frontend origin across
 launches. Deleting the profile removes local data; replacing the application bundle does
-not. First-launch screens, backup/restore, and transfer of existing data remain later
-steps. If an existing database has lost its secrets, startup refuses to generate keys.
+not. Use the [desktop backup and restore workflow](DESKTOP-BACKUPS.md) to save or
+transfer local data. If an existing database has lost its secrets, startup refuses to
+generate keys and offers restoration from a backup.
 
 Fresh databases are migrated automatically. An existing database at the current
-revision is reopened. An older or unversioned database is refused with an explanation;
-automatic upgrades of existing data will be added with the backup workflow. Server
+revision is reopened. Known older revisions are backed up before automatic migration.
+Unknown/newer or unversioned databases are refused with an explanation. Server
 `DATABASE_URL`, provider keys, `.env`, and Python search paths are not inherited by
 the launched backend.
 
@@ -166,9 +190,16 @@ npm run test:storage --prefix desktop
 # Electron window behavior with an isolated HTTP fixture
 npm run test:smoke --prefix desktop
 
-# With the real frontend already running: full bundled API and UI checks
-PFOS_SMOKE_URL=http://localhost:3000 npm run test:bundled --prefix desktop
-PFOS_SMOKE_URL=http://localhost:3000 npm run test:lifecycle --prefix desktop
+# Native local backup / restore with temporary test data
+npm run test:backup --prefix desktop
+
+# Embedded static server checks
+npm run test:frontend --prefix desktop
+
+# Complete bundled interface/API; no separately running frontend required
+npm run test:bundled --prefix desktop
+npm run test:lifecycle --prefix desktop
+# Set PFOS_SMOKE_URL explicitly to test a development frontend instead.
 
 # Existing financial regressions against migrated SQLite files
 cd backend
@@ -181,24 +212,28 @@ startup timeout, parent-process death, and unexpected exit reporting. They remov
 old runtime bundle, install a replacement in another resources directory, and verify
 financial totals, settings, and secrets are retained. They also verify that a missing
 initialized database is refused and can be reopened after its original file is restored.
-This tests replacement at the current schema revision; installer upgrades and automatic
-schema upgrades are not yet implemented.
+This tests replacement at the current schema revision. Backup tests additionally cover
+backing up known older revisions before migration; the packaged application is additionally tested from a temporary installation.
 
 The storage test quits Electron completely and starts a second process against the
 same temporary profile and frontend origin. The saved login authenticates successfully
 without signing in again, and a browser preference survives.
 
-The bundled Electron test creates a temporary household, imports synthetic transactions,
+The bundled Electron test completes the welcome form, checks password mismatch handling,
+verifies subsequent sign-in mode, imports synthetic transactions,
 and verifies the actual accounts, import, and dashboard pages. It also checks that
 an unrelated window cannot use the private API. The lifecycle test exercises the
-real application startup and confirms the API is stopped before quit completes.
+real application startup and confirms both local servers stop before quit completes.
 These tests use temporary databases/profiles and no real credentials or financial data.
 Electron tests require a graphical desktop environment and permission to bind local ports.
 
-The source backend suite has 84 passing tests on Python 3.12. The frontend production
-build also passes. Windows/ARM builds, remote bank OAuth, full installer execution,
-Keychain-based secret storage, signing, and notarization have not been verified here.
+The source backend suite has 92 passing tests on Python 3.12. The frontend production
+build also passes. Windows/ARM builds, remote bank OAuth, Keychain-based secret storage, signing, and
+notarization have not been verified here. The Intel macOS packaged application has
+been tested with an isolated household, including reopening and persistence.
 
 Implementation references: [PyInstaller directory bundles](https://pyinstaller.org/en/stable/spec-files.html),
 [Electron web requests](https://www.electronjs.org/docs/latest/api/web-request), and
 [Electron security guidance](https://www.electronjs.org/docs/latest/tutorial/security).
+
+Static build reference: [Next.js static exports](https://nextjs.org/docs/app/guides/static-exports).
