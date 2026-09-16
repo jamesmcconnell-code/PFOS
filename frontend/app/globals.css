@@ -195,3 +195,24 @@ html[data-simple-mode='true'] body { @apply bg-amber-50 text-slate-800; }
 .simple-refund { @apply rounded-full px-3 py-2 text-sm font-bold transition-transform hover:scale-105; }
 .simple-refund-on { @apply bg-emerald-500 text-white; }
 .simple-refund-off { @apply bg-slate-200 text-slate-600; }
+
+/* Privacy is presentational: values remain available to calculations and exports. */
+[data-financial-value] { display: inline-block; }
+html[data-blur-financial='true'] [data-financial-value] {
+  filter: blur(7px);
+  user-select: none;
+}
+html[data-blur-financial='true'] input[type='number'] {
+  color: transparent !important;
+  text-shadow: 0 0 8px #64748b;
+  caret-color: transparent;
+}
+html[data-blur-financial='true'] input[type='number']::placeholder {
+  color: #94a3b8;
+  text-shadow: none;
+}
+html[data-blur-financial='true'] .recharts-yAxis .recharts-cartesian-axis-tick-value,
+html[data-blur-financial='true'] .recharts-tooltip-item-value,
+html[data-blur-financial='true'] .recharts-pie-label-text {
+  filter: blur(7px);
+}

@@ -1,7 +1,7 @@
 {
   "name": "pfos-desktop",
   "productName": "PFOS",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "private": true,
   "description": "PFOS local desktop application",
   "main": "entry.cjs",
@@ -19,7 +19,8 @@
     "test:frontend": "node --test tests/frontend.integration.cjs",
     "test:backup": "node scripts/run.cjs tests/backup-smoke.cjs",
     "package:mac": "electron-builder --config electron-builder.cjs --mac --x64 --publish never",
-    "test:packaged": "node --test tests/packaged.integration.cjs"
+    "test:packaged": "node --test tests/packaged.integration.cjs",
+    "test:plaid": "node scripts/run.cjs tests/plaid-smoke.cjs"
   },
   "devDependencies": {
     "electron": "44.3.0",

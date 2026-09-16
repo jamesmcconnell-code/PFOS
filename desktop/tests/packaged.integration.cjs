@@ -68,16 +68,27 @@ test('installed macOS application starts without development services and preser
           if(${JSON.stringify(phase)}==='create') {
             const auth=await request('/auth/register',{email:'packaged@example.com',password:'Packaged-test-123',display_name:'Packaged'});
             localStorage.setItem('pfos_token',auth.access_token);
+            localStorage.setItem('pfos_blur_financial_numbers','true');
+            document.documentElement.dataset.blurFinancial='true';
             await request('/accounts',{name:'Packaged checking',type:'checking',balance:1234.56});
           }
-          return {email:(await request('/auth/me')).email,accounts:await request('/accounts')};
+          return {email:(await request('/auth/me')).email,accounts:await request('/accounts'),hosted:await request('/connections/plaid/hosted')};
         })()`);
         assert.equal(result.email,'packaged@example.com');
+        assert.deepEqual(result.hosted,{status:'idle'});
+        assert.equal(await client.evaluate('typeof window.pfosDesktop.plaidLink.open'),'function');
         assert.ok(result.accounts.some(account=>account.name==='Packaged checking' && Number(account.balance)===1234.56));
         await client.evaluate("location.href='/accounts/'; true");
         await waitFor(async()=>{
           try {return (await client.evaluate('document.body.innerText')).includes('Packaged checking')} catch {return false}
         });
+        assert.equal(await client.evaluate("document.documentElement.dataset.blurFinancial"),'true');
+        assert.equal(await client.evaluate("getComputedStyle(document.querySelector('[data-financial-value]')).filter"),'blur(7px)');
+        await client.evaluate("location.href='/desktop-help/'; true");
+        await waitFor(async()=>{
+          try {return (await client.evaluate('document.body.innerText')).includes('Plaid is disabled on this Mac.')} catch {return false}
+        });
+        assert.ok((await client.evaluate('document.body.innerText')).includes('Backups and moving to another Mac'));
         client.close(); client=null;
         child.kill('SIGTERM');
         assert.equal((await exited).code,0,output);

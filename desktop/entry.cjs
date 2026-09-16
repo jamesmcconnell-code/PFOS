@@ -14,7 +14,7 @@ void start().catch(async error => {
       filters:[{name:'PFOS local backup',extensions:['pfosbackup']}]});
     if (!selected.canceled && selected.filePaths.length) {
       const confirm = await dialog.showMessageBox({type:'warning', message:'Replace local data with this backup?',
-        detail:selected.filePaths[0]+'\nCurrent files will be preserved in a recovery copy first.',
+        detail:selected.filePaths[0]+'\nCurrent files will be preserved in a recovery copy first. Restore replaces data; it does not merge households. Sign in with an account and password from the backup. This Mac’s Plaid developer credentials are unchanged.',
         buttons:['Cancel','Restore'], defaultId:0, cancelId:0});
       if (confirm.response === 1) {
         try {
@@ -24,7 +24,7 @@ void start().catch(async error => {
           const {session} = require('electron');
           const {LOCAL_SESSION} = require('./storage.cjs');
           await session.fromPartition(LOCAL_SESSION).clearStorageData({storages:['localstorage']});
-          await dialog.showMessageBox({message:'Backup restored. PFOS will restart.',detail:'Recovery copy: '+result.path});
+          await dialog.showMessageBox({message:'Backup restored. PFOS will restart.',detail:'Recovery copy: '+result.path+'\nAfter restarting, sign in with the backup’s account and password. Open File → Backup and Migration Guide for Plaid setup and restored-bank checks.'});
           app.relaunch();
         } catch (failure) {dialog.showErrorBox('Unable to restore backup',failure.message)}
       }

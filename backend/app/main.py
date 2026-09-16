@@ -12,9 +12,10 @@ from .database import get_db
 from .models import *
 from .schemas import *
 from .security import hash_password, verify_password, create_token, decode_token
-from .connectors import CONNECTORS, ConnectorAuthenticationError, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
+from .connectors import CONNECTORS, ConnectorAuthenticationError, PlaidReauthorizationRequired, PlaidNewConnectionRequired, CsvConnector, decrypt_credentials, encrypt_credentials, persist_payload
 from .crypto_prices import refresh_usd_values
 from .config import settings
+from . import plaid_configuration
 from .planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
 from .smart_tagging import apply_suggestion, evaluate_new_transaction, latest_suggestion, matching_rule, normalize_merchant_key
 from .smart_tagging_learning import generate_historical_suggestion
@@ -22,10 +23,9 @@ from .smart_tagging_learning import generate_historical_suggestion
 app=FastAPI(title='PFOS API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 bearer=HTTPBearer()
-def plaid_host() -> str:
-    hosts={'sandbox':'https://sandbox.plaid.com','development':'https://development.plaid.com','production':'https://production.plaid.com'}
-    try: return hosts[settings.plaid_environment]
-    except KeyError: raise HTTPException(500,'Invalid PLAID_ENVIRONMENT configuration')
+def plaid_request_credentials():
+    try: return plaid_configuration.credentials()
+    except ValueError as error: raise HTTPException(503, str(error)) from None
 def current_user(c: HTTPAuthorizationCredentials=Depends(bearer), db: Session=Depends(get_db)):
     try: user_id=UUID(decode_token(c.credentials))
     except (ValueError, TypeError, AttributeError): raise HTTPException(401,'Invalid token subject')
@@ -257,7 +257,11 @@ def active_settlement_transaction_ids(transactions, db: Session):
     return set(db.scalars(select(HouseholdSettlement.payer_transaction_id).where(HouseholdSettlement.household_id==items[0].household_id,HouseholdSettlement.status=='active',HouseholdSettlement.payer_transaction_id.in_(transaction_ids))).all())|set(db.scalars(select(HouseholdSettlement.recipient_transaction_id).where(HouseholdSettlement.household_id==items[0].household_id,HouseholdSettlement.status=='active',HouseholdSettlement.recipient_transaction_id.in_(transaction_ids))).all())
 def serialize_connection(connection: DataConnection):
     """Connection credentials are write-only: never return ciphertext to any client."""
-    row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials); return row
+    row=serialize(connection); row.pop('encrypted_credentials',None); row['credentials_configured']=bool(connection.encrypted_credentials)
+    if connection.provider=='plaid' and __import__('os').environ.get('PFOS_DESKTOP_RUNTIME')=='1':
+        from .plaid_hosted import connection_state
+        row.update(connection_state(connection))
+    return row
 def record_balance_snapshots(db: Session, accounts: list[Account], snapshot_date: date|None=None, source: str='calculated'):
     """Upsert one point-in-time balance per account/day without changing balances."""
     captured_on=snapshot_date or date.today()
@@ -1599,21 +1603,28 @@ def create_connection(body:ConnectionIn,user=Depends(current_user),db:Session=De
         x.encrypted_credentials=encrypt_credentials(body.credentials);x.cursor=None;x.status='active'
     else: x=DataConnection(household_id=h,provider=body.provider,name=body.name,encrypted_credentials=encrypt_credentials(body.credentials));db.add(x)
     db.commit();return serialize_connection(x)
+@app.get('/api/v1/connections/plaid/configuration')
+def plaid_configuration_status(user=Depends(current_user)):
+    try:
+        config=plaid_configuration.credentials()
+        return {'configured':True, 'environment':config['environment']}
+    except ValueError:
+        return {'configured':False, 'environment':None}
 @app.post('/api/v1/connections/plaid/link-token')
 def plaid_link_token(user=Depends(current_user),db:Session=Depends(get_db)):
-    if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
+    config=plaid_request_credentials()
     import httpx
-    try: response=httpx.post(f'{plaid_host()}/link/token/create',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'client_name':'PFOS','language':'en','country_codes':['US'],'products':['transactions'],'user':{'client_user_id':str(user.id)}},timeout=30).raise_for_status().json()
+    try: response=httpx.post(f'{plaid_configuration.host(config)}/link/token/create',json={'client_id':config['client_id'],'secret':config['secret'],'client_name':'PFOS','language':'en','country_codes':['US'],'products':['transactions'],'user':{'client_user_id':str(user.id)}},timeout=30).raise_for_status().json()
     except httpx.HTTPError as exc: raise HTTPException(502,'Plaid Link could not be initialized; verify your Plaid production configuration') from exc
     return {'link_token':response['link_token']}
 @app.post('/api/v1/connections/plaid/exchange')
 def plaid_exchange(body:PlaidExchangeIn,user=Depends(current_user),db:Session=Depends(get_db)):
-    if not settings.plaid_client_id or not settings.plaid_secret: raise HTTPException(503,'Plaid is not configured on the server')
+    config=plaid_request_credentials()
     import httpx
-    try: raw=httpx.post(f'{plaid_host()}/item/public_token/exchange',json={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'public_token':body.public_token},timeout=30).raise_for_status().json()
+    try: raw=httpx.post(f'{plaid_configuration.host(config)}/item/public_token/exchange',json={'client_id':config['client_id'],'secret':config['secret'],'public_token':body.public_token},timeout=30).raise_for_status().json()
     except httpx.HTTPError as exc: raise HTTPException(502,'Plaid account authorization could not be saved') from exc
     h=household(user,db)
-    x=DataConnection(household_id=h,provider='plaid',name=next_connection_name(h,'plaid',body.name,db),encrypted_credentials=encrypt_credentials({'access_token':raw['access_token']}))
+    x=DataConnection(household_id=h,provider='plaid',name=next_connection_name(h,'plaid',body.name,db),encrypted_credentials=encrypt_credentials({'access_token':raw['access_token'],'plaid_identity':plaid_configuration.identity(config)}))
     try:
         db.add(x);db.commit()
     except IntegrityError as exc:
@@ -1626,11 +1637,14 @@ def sync_connection(connection_id:UUID,user=Depends(current_user),db:Session=Dep
     if not x or x.household_id!=household(user,db): raise HTTPException(404,'Connection not found')
     run=ConnectionSync(connection_id=x.id,status='running');db.add(run);db.flush()
     try:
-        payload=CONNECTORS[x.provider].fetch(decrypt_credentials(x.encrypted_credentials),x.cursor); added,dupes=persist_payload(db,x,payload);x.cursor=payload.cursor;x.last_synced_at=datetime.utcnow();run.status='complete';run.imported_count=added;run.duplicate_count=dupes;db.commit();return {'imported':added,'duplicates':dupes,'connection':serialize_connection(x)}
+        payload=CONNECTORS[x.provider].fetch(decrypt_credentials(x.encrypted_credentials),x.cursor); added,dupes=persist_payload(db,x,payload);x.cursor=payload.cursor;x.last_synced_at=datetime.utcnow();run.status='complete';run.imported_count=added;run.duplicate_count=dupes;x.status='active';db.commit();return {'imported':added,'duplicates':dupes,'connection':serialize_connection(x)}
     except ConnectorAuthenticationError as exc:
-        db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc));db.add(run);db.commit();raise HTTPException(422,str(exc))
+        db.rollback()
+        if isinstance(exc,PlaidReauthorizationRequired): x.status='reauthorization_required'
+        elif isinstance(exc,PlaidNewConnectionRequired): x.status='new_connection_required'
+        run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc));db.add(run);db.commit();raise HTTPException(422,str(exc))
     except Exception as exc:
-        db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message=str(exc)[:500]);db.add(run);db.commit();raise HTTPException(502,'Sync failed; review the connection credentials and provider status')
+        db.rollback();run=ConnectionSync(connection_id=x.id,status='failed',error_message='Plaid sync failed; check local configuration and provider status' if x.provider=='plaid' else str(exc)[:500]);db.add(run);db.commit();raise HTTPException(502,'Sync failed; review the connection credentials and provider status')
 @app.post('/api/v1/connections/csv/{account_id}')
 async def import_csv_normalized(account_id:UUID,file:UploadFile=File(...),user=Depends(current_user),db:Session=Depends(get_db)):
     account=db.get(Account,account_id)
@@ -1838,3 +1852,6 @@ def one_income(view_user_id:UUID|None=None,user=Depends(current_user),db:Session
     h=household(user,db);m=metrics(h,db,view_user_id); income_q=select(IncomeSource).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
     incomes=db.scalars(income_q).all(); return {'monthly_expenses':m['monthly_expenses'],'scenarios':[{'name':x.name,'income':float(x.monthly_amount),'surplus':float(x.monthly_amount)-m['monthly_expenses'],'sustainable':float(x.monthly_amount)>=m['monthly_expenses']} for x in incomes]+[{'name':'Combined income','income':m['monthly_income'],'surplus':m['monthly_savings'],'sustainable':m['monthly_savings']>=0}]}
+
+from .plaid_hosted import install_routes as install_plaid_hosted_routes
+install_plaid_hosted_routes(app, current_user, household, next_connection_name)

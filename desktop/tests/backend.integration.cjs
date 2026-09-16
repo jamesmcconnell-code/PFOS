@@ -156,3 +156,27 @@ test('missing initialized database is reported without creating an empty replace
     await runtime.stop();
   } finally { await runtime?.stop(); await fs.rm(dataDir, { recursive: true, force: true }); }
 });
+
+test('bundled API accepts only private local credential updates and has no fallback', {timeout:30000},async()=>{
+  const dataDir=await temporary();let runtime;
+  try{
+    runtime=await startBackend({dataDir,frontendOrigin:origin});
+    const headers={'Content-Type':'application/json','X-PFOS-Desktop-Token':runtime.token};
+    const register=await fetch(runtime.url+'/api/v1/auth/register',{method:'POST',headers,body:JSON.stringify({email:'plaid-local@example.com',password:'Local-test-123',display_name:'Local'})});
+    headers.Authorization='Bearer '+(await register.json()).access_token;
+    const status=async()=> (await fetch(runtime.url+'/api/v1/connections/plaid/configuration',{headers})).json();
+    assert.equal((await status()).configured,false);
+    assert.equal((await fetch(runtime.url+'/api/v1/connections/plaid/link-token',{method:'POST',headers})).status,503);
+    const local={client_id:'synthetic-client',secret:'synthetic-secret',environment:'sandbox'};
+    assert.equal((await fetch(runtime.url+'/api/v1/desktop/plaid-runtime',{method:'PUT',headers,body:JSON.stringify(local)})).status,403);
+    await runtime.updatePlaid(local);
+    assert.deepEqual(await status(),{configured:true,environment:'sandbox'});
+    await runtime.updatePlaid(null);
+    assert.deepEqual(await status(),{configured:false,environment:null});
+    assert.ok(!(await fs.readFile(path.join(dataDir,'runtime.json'),'utf8')).includes(local.secret));
+    await runtime.stop();
+    runtime=await startBackend({dataDir,frontendOrigin:origin});
+    headers['X-PFOS-Desktop-Token']=runtime.token;
+    assert.equal((await status()).configured,false);
+  }finally{await runtime?.stop();await fs.rm(dataDir,{recursive:true,force:true})}
+});

@@ -19,13 +19,14 @@ function backendEnvironment() {
   return env;
 }
 
-async function startBackend({ dataDir, frontendOrigin, executable = bundledBackendPath(), timeoutMs = 60000, onUnexpectedExit = () => {} }) {
+async function startBackend({ dataDir, frontendOrigin, executable = bundledBackendPath(), timeoutMs = 60000, plaid = null, onUnexpectedExit = () => {} }) {
   const origin = localAppURL(frontendOrigin);
   await fs.access(executable).catch(() => {
     throw new Error('The bundled PFOS backend is missing. Run npm run build:backend in desktop/ first.');
   });
   await fs.mkdir(dataDir, { recursive: true, mode: 0o700 });
   const token = randomBytes(48).toString('base64url');
+  const managementToken = randomBytes(48).toString('base64url');
   const child = spawn(executable, ['--data-dir', path.resolve(dataDir), '--frontend-origin', origin], {
     cwd: dataDir, env: backendEnvironment(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
   });
@@ -51,7 +52,7 @@ async function startBackend({ dataDir, frontendOrigin, executable = bundledBacke
     return stopPromise;
   }
   child.stdin.on('error', () => {}); // Exit-before-bootstrap is reported by close.
-  child.stdin.write(JSON.stringify({ token }) + '\n');
+  child.stdin.write(JSON.stringify({ token, management_token:managementToken, plaid }) + '\n');
   let timeout;
   try {
     const url = await new Promise((resolve, reject) => {
@@ -85,7 +86,12 @@ async function startBackend({ dataDir, frontendOrigin, executable = bundledBacke
       throw new Error('Bundled backend health check failed');
     }
     ready = true;
-    return { url, token, pid: child.pid, stop, closed };
+    return { url, token, pid: child.pid, stop, closed, updatePlaid:async values=>{
+      const response=await fetch(url+'/api/v1/desktop/plaid-runtime',{method:'PUT',
+        headers:{'Content-Type':'application/json','X-PFOS-Desktop-Token':token,'X-PFOS-Management-Token':managementToken},
+        body:JSON.stringify(values),signal:AbortSignal.timeout(120000)});
+      if(!response.ok) throw new Error('Could not apply local Plaid configuration. Restart PFOS.');
+    }};
   } catch (error) {
     await stop();
     throw error;

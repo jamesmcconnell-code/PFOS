@@ -163,3 +163,12 @@ class ConnectionSync(Audit, Base):
     __tablename__='connection_syncs'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); connection_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('data_connections.id',ondelete='CASCADE')); status: Mapped[str]=mapped_column(String(20),default='running'); imported_count: Mapped[int]=mapped_column(default=0); duplicate_count: Mapped[int]=mapped_column(default=0); error_message: Mapped[str|None]=mapped_column(Text,nullable=True)
 class ForecastingProfile(Audit, Base):
     __tablename__='forecasting_profiles'; id: Mapped[uuid.UUID]=mapped_column(primary_key=True,default=uid); household_id: Mapped[uuid.UUID]=mapped_column(ForeignKey('households.id',ondelete='CASCADE')); name: Mapped[str]=mapped_column(String(100)); monthly_savings_override: Mapped[float|None]=mapped_column(Numeric(14,2),nullable=True); assumptions: Mapped[str|None]=mapped_column(Text,nullable=True)
+
+class PlaidLinkSession(Audit, Base):
+    __tablename__ = 'plaid_link_sessions'
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uid)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+    household_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('households.id', ondelete='CASCADE'))
+    status: Mapped[str] = mapped_column(String(20), default='pending')
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    encrypted_state: Mapped[str] = mapped_column(Text)

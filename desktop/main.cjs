@@ -1,8 +1,10 @@
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, shell, nativeImage, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, nativeImage, session, ipcMain, safeStorage } = require('electron');
 const path = require('node:path');
 const { startBackend, bundledBackendPath } = require('./backend.cjs');
+const { createPlaidVault, registerPlaidIPC } = require('./plaid.cjs');
+const { isPlaidCompletion, registerPlaidLinkIPC } = require('./plaid-link.cjs');
 const { runMaintenance } = require('./maintenance.cjs');
 const { startFrontend, bundledFrontendPath } = require('./frontend.cjs');
 const { storagePaths, LOCAL_SESSION } = require('./storage.cjs');
@@ -95,7 +97,7 @@ function menuTemplate(getWindow, origin, { dataDir, backup, restore } = {}) {
       { label: 'Accounts', accelerator: 'CmdOrCtrl+2', click: navigate('/accounts') },
       { label: 'Transactions', accelerator: 'CmdOrCtrl+3', click: navigate('/transactions') },
       { label: 'Import CSV…', accelerator: 'CmdOrCtrl+I', click: navigate('/import') },
-      ...(backup ? [{label:'Back Up Local Data…', click:backup}, {label:'Restore Local Backup…', click:restore}] : []),
+      ...(backup ? [{label:'Back Up Local Data…', click:backup}, {label:'Restore Local Backup…', click:restore}, {label:'Backup and Migration Guide', click:navigate('/desktop-help')}] : []),
       ...(dataDir ? [{ type: 'separator' }, { label: 'Show Data Folder…', click: async () => {
         try {
           const error = await shell.openPath(dataDir);
@@ -124,13 +126,23 @@ async function start({ userDataPath } = {}) {
   catch (error) { await app.whenReady(); dialog.showErrorBox('PFOS could not start', error.message); app.quit(); return; }
   if (!app.requestSingleInstanceLock()) { app.quit(); return; }
   let window, backend, startup, frontend, maintenance;
+  let returnedFromPlaid=false;
+  let showRestoreGuide=false;
+  app.on('open-url',(event,url)=>{
+    event.preventDefault();
+    if(!isPlaidCompletion(url))return;
+    returnedFromPlaid=true;
+    if(backend && !quitting && !maintaining){const target=openWindow();void target.loadApp('/connections');}
+  });
+  let plaidSettingsBusy=()=>false;
   let maintaining = false;
   let quitting = false, shutdownComplete = false;
   const openWindow = () => {
     if (maintaining || quitting) return;
     if (!window || window.isDestroyed()) {
       window = createWindow(origin, { backend, partition: LOCAL_SESSION });
-      void window.loadApp();
+      void window.loadApp(showRestoreGuide?'/desktop-help?restored=1':returnedFromPlaid?'/connections':'/dashboard');
+      showRestoreGuide=false;
     }
     if (window.isMinimized()) window.restore();
     window.show(); window.focus();
@@ -151,12 +163,16 @@ async function start({ userDataPath } = {}) {
   });
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => app.quit());
   await app.whenReady();
+  // Isolated verification profiles must not replace the installed app's URL handler.
+  if(app.isPackaged && !app.commandLine.hasSwitch('user-data-dir'))app.setAsDefaultProtocolClient('pfos');
+  const plaidVault=createPlaidVault(storage.profileDir,safeStorage);
+  const localPlaid=()=>plaidVault.load().catch(()=>null);
   startup = (async () => {
     if (app.isPackaged || !process.env.PFOS_DESKTOP_URL) {
       frontend = await startFrontend({directory: bundledFrontendPath({isPackaged: app.isPackaged, resourcesPath: process.resourcesPath})});
       origin = frontend.origin;
     }
-    return startBackend({
+    return startBackend({plaid:await localPlaid(),
     dataDir: storage.dataDir, frontendOrigin: origin,
     executable: bundledBackendPath({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath }),
     onUnexpectedExit: error => {
@@ -166,11 +182,14 @@ async function start({ userDataPath } = {}) {
   })();
   backend = await startup;
   if (quitting) return;
+  plaidSettingsBusy=registerPlaidIPC({ipcMain,vault:plaidVault,getBackend:()=>backend,getWindow:()=>window,origin,canConfigure:()=>!maintaining&&!quitting});
+  registerPlaidLinkIPC({ipcMain,getBackend:()=>backend,getWindow:()=>window,origin,openExternal:url=>shell.openExternal(url)});
   app.setAboutPanelOptions({ applicationName: 'PFOS', applicationVersion: app.getVersion(),
     iconPath, comments: 'Personal financial operating system' });
   if (app.dock) app.dock.setIcon(nativeImage.createFromPath(iconPath));
   async function maintain(operation) {
     if (maintaining || quitting) return;
+    if(plaidSettingsBusy()){dialog.showErrorBox('Plaid settings are busy','Wait for the Plaid settings operation to finish, then retry backup or restore.');return;}
     openWindow();
     maintaining = true;
     maintenance = (async () => {
@@ -181,7 +200,7 @@ async function start({ userDataPath } = {}) {
         if (operation === 'backup') {
           const result = await dialog.showSaveDialog(window, {title:'Back Up Local Data', filters,
             defaultPath:'PFOS-' + new Date().toISOString().replace(/[:.]/g,'-') + '.pfosbackup',
-            message:'Contains financial data and account secrets. This file is not encrypted; save it in a protected location.'});
+            message:'Contains financial data, bank/exchange tokens, and their decryption keys. This file is not encrypted. Plaid developer credentials and device preferences are excluded. Save it privately.'});
           if (result.canceled || !result.filePath) return;
           file = result.filePath;
         } else {
@@ -190,20 +209,20 @@ async function start({ userDataPath } = {}) {
           file = result.filePaths[0];
           const confirmation = await dialog.showMessageBox(window, {type:'warning', buttons:['Cancel','Restore'],
             defaultId:0, cancelId:0, message:'Replace local data with this backup?',
-            detail:file + '\nCurrent data will be saved in a recovery backup first. You will sign in again using the account in the backup.'});
+            detail:file + '\nCurrent data will be saved in a recovery copy first. Restore replaces data; it does not merge households. Sign in using an account and password from the backup. This Mac’s Plaid developer credentials are unchanged; a new Mac needs its own Plaid setup.'});
           if (confirmation.response !== 1) return;
         }
         window?.destroy(); window = null;
         await backend.stop(); stopped = true;
         const result = await runMaintenance({dataDir:storage.dataDir, operation, file,
           executable:bundledBackendPath({isPackaged:app.isPackaged, resourcesPath:process.resourcesPath})});
-        if (operation === 'restore') await session.fromPartition(LOCAL_SESSION).clearStorageData({storages:['localstorage']});
+        if (operation === 'restore') {await session.fromPartition(LOCAL_SESSION).clearStorageData({storages:['localstorage']});showRestoreGuide=true;}
         await dialog.showMessageBox({type:'info', message:operation === 'backup'?'Backup saved':'Backup restored',
-          detail:operation === 'backup'?result.path:'Recovery copy: ' + result.path});
+          detail:operation === 'backup'?result.path+'\nKeep this unencrypted backup private. It does not include this Mac’s Plaid developer credentials.':'Recovery copy: ' + result.path+'\nSign in with the backup’s account and password, review restored data, and check Settings → Plaid before syncing. The backup and migration guide will open next.'});
       } catch (error) {dialog.showErrorBox('PFOS backup / restore', error.message)}
       finally {
         if (stopped && !quitting) {
-          startup = startBackend({dataDir:storage.dataDir, frontendOrigin:origin,
+          startup = startBackend({plaid:await localPlaid(),dataDir:storage.dataDir, frontendOrigin:origin,
             executable:bundledBackendPath({isPackaged:app.isPackaged, resourcesPath:process.resourcesPath}),
             onUnexpectedExit:error => {dialog.showErrorBox('PFOS stopped',error.message); app.quit()}});
           try {backend = await startup} catch (error) {dialog.showErrorBox('PFOS could not reopen',error.message); app.quit()}

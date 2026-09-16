@@ -59,3 +59,7 @@ restore.pending
 
 # Desktop installer artifacts
 desktop/dist/
+
+# Per-installation Keychain-protected Plaid settings
+plaid-credentials.json
+plaid-credentials.json.*.tmp

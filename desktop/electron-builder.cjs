@@ -7,11 +7,12 @@ module.exports = {
   electronDist:path.join(__dirname,'node_modules/electron/dist'),
   asar:true,
   files:['entry.cjs','main.cjs','backend.cjs','frontend.cjs','maintenance.cjs',
-    'policy.cjs','preload.cjs','storage.cjs','unavailable.html','assets/icon.png','package.json'],
+    'plaid.cjs','plaid-link.cjs','policy.cjs','preload.cjs','storage.cjs','unavailable.html','assets/icon.png','package.json'],
   extraResources:[
     {from:'resources/backend',to:'backend'},
     {from:'resources/frontend',to:'frontend'},
   ],
+  protocols:[{name:'PFOS bank authorization',schemes:['pfos']}],
   mac:{target:[{target:'dmg',arch:['x64']},{target:'zip',arch:['x64']}],
     category:'public.app-category.finance',icon:'assets/icon.png',identity:null},
   artifactName:'PFOS-${version}-mac-${arch}.${ext}',

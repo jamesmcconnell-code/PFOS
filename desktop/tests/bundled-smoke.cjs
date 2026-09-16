@@ -32,7 +32,7 @@ async function run() {
     await window.loadApp('/login');
     assert.equal(await window.webContents.executeJavaScript('window.pfosDesktop.apiBase'), runtime.url + '/api/v1');
     assert.equal(await window.webContents.executeJavaScript('typeof require'), 'undefined');
-    assert.deepEqual(await window.webContents.executeJavaScript('Object.keys(window.pfosDesktop)'), ['apiBase']);
+    assert.deepEqual(await window.webContents.executeJavaScript('Object.keys(window.pfosDesktop)'), ['apiBase','plaid','plaidLink']);
     await waitFor(async () => (await window.webContents.executeJavaScript('document.body.innerText')).includes('Welcome to PFOS'));
     await window.webContents.executeJavaScript(`(() => {
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
@@ -76,6 +76,45 @@ async function run() {
     await waitFor(async () => (await window.webContents.executeJavaScript('document.body.innerText')).includes('Bundled checking'));
     await window.loadApp('/dashboard');
     await waitFor(async () => (await window.webContents.executeJavaScript('document.body.innerText')).includes('957.78'));
+    // Debt purchases affect the planner but were omitted by the old dashboard totals.
+    await window.webContents.executeJavaScript(`(async()=>{
+      const base=window.pfosDesktop.apiBase;
+      const headers={'Content-Type':'application/json',Authorization:'Bearer '+localStorage.getItem('pfos_token')};
+      const accountResponse=await fetch(base+'/accounts',{method:'POST',headers,body:JSON.stringify({name:'Planner debt',account_type:'debt',type:'credit_card',balance:0})});
+      const account=await accountResponse.json();
+      if(!accountResponse.ok) throw new Error('Could not add debt account');
+      const response=await fetch(base+'/transactions',{method:'POST',headers,body:JSON.stringify({account_id:account.id,date:new Date().toLocaleDateString('en-CA'),description:'Planner debt purchase',amount:-100})});
+      if(!response.ok) throw new Error(await response.text());
+    })()`);
+    await window.loadApp('/dashboard');
+    await waitFor(async()=> (await window.webContents.executeJavaScript('document.body.innerText')).includes('857.78'));
+    const parity=await window.webContents.executeJavaScript(`(async()=>{
+      const planner=await (await fetch(window.pfosDesktop.apiBase+'/available-cash-planner?period=monthly&anchor_date='+new Date().toLocaleDateString('en-CA'),{headers:{Authorization:'Bearer '+localStorage.getItem('pfos_token')}})).json();
+      const format=value=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(value);
+      const values={'Income':planner.paycheck_amount,'Expenses':planner.total_period_expenses,'Automated savings':planner.automated_savings_amount,'Spending cash flow':planner.paycheck_amount-planner.total_period_expenses,'Monthly savings':planner.paycheck_amount+planner.automated_savings_amount-planner.total_period_expenses};
+      return Object.entries(values).every(([label,value])=>[...document.querySelectorAll('dt')].find(node=>node.textContent===label)?.nextElementSibling.textContent.includes(format(value)));
+    })()`);
+    assert.equal(parity,true,'Dashboard figures diverged from Available Cash');
+    // Privacy mode changes presentation without hiding labels or changing values.
+    async function privacyToggle() {
+      await window.webContents.executeJavaScript(`document.querySelector('[aria-label="Open settings"]').click()`);
+      await waitFor(async()=>await window.webContents.executeJavaScript(`Boolean([...document.querySelectorAll('button')].find(button=>button.textContent==='Visual preferences'))`));
+      await window.webContents.executeJavaScript(`[...document.querySelectorAll('button')].find(button=>button.textContent==='Visual preferences').click()`);
+      await waitFor(async()=>await window.webContents.executeJavaScript(`Boolean(document.querySelector('[aria-label="Blur financial numbers"]'))`));
+      await window.webContents.executeJavaScript(`document.querySelector('[aria-label="Blur financial numbers"]').click()`);
+    }
+    await privacyToggle();
+    assert.equal(await window.webContents.executeJavaScript(`document.documentElement.dataset.blurFinancial`),'true');
+    assert.equal(await window.webContents.executeJavaScript(`getComputedStyle(document.querySelector('[data-financial-value]')).filter`),'blur(7px)');
+    assert.equal(await window.webContents.executeJavaScript(`getComputedStyle([...document.querySelectorAll('dt')].find(node=>node.textContent==='Income')).filter`),'none');
+    await window.loadApp('/accounts');
+    await waitFor(async()=>await window.webContents.executeJavaScript(`Boolean(document.querySelector('[data-financial-value]'))`));
+    assert.equal(await window.webContents.executeJavaScript(`getComputedStyle(document.querySelector('[data-financial-value]')).filter`),'blur(7px)');
+    await window.loadApp('/dashboard');
+    await waitFor(async()=>await window.webContents.executeJavaScript(`Boolean(document.querySelector('[data-financial-value]'))`));
+    assert.equal(await window.webContents.executeJavaScript(`getComputedStyle(document.querySelector('[data-financial-value]')).filter`),'blur(7px)');
+    await privacyToggle();
+    assert.equal(await window.webContents.executeJavaScript(`getComputedStyle(document.querySelector('[data-financial-value]')).filter`),'none');
     // Another Electron window sharing the session does not receive the launch capability.
     const outsider = new BrowserWindow({ show: false, webPreferences: { partition: 'persist:bundled-smoke', sandbox: true, contextIsolation: true } });
     try {

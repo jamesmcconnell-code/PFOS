@@ -1,13 +1,13 @@
 # PFOS macOS installer (step 8)
 
-The first installable desktop build is **PFOS 0.1.0 for Intel Macs (x64)**.
+The current desktop build is **PFOS 0.1.6 for Intel Macs (x64)**.
 Electron requires macOS 13 or newer for this build. Apple Silicon native builds and
 Windows installers have not been built or tested.
 
 Build output:
 
-- `desktop/dist/PFOS-0.1.0-mac-x64.dmg`: drag-to-Applications installer, about 149 MB.
-- `desktop/dist/PFOS-0.1.0-mac-x64.zip`: ZIP containing the same application, about 151 MB.
+- `desktop/dist/PFOS-0.1.6-mac-x64.dmg`: drag-to-Applications installer, approximately 150 MB.
+- `desktop/dist/PFOS-0.1.6-mac-x64.zip`: ZIP containing the same application, approximately 152 MB.
 - `desktop/dist/mac/PFOS.app`: unpacked application.
 - `desktop/dist/SHA256SUMS.txt`: SHA-256 checksums for the DMG and ZIP.
 
@@ -62,3 +62,9 @@ Applications folder are not modified during verification.
 
 Packaging references: [electron-builder macOS targets](https://www.electron.build/v26/docs/mac/)
 and [application contents](https://www.electron.build/v26/docs/contents/).
+
+See [release notes](RELEASE-NOTES.md) for the planner-driven command center and financial privacy toggle.
+
+See [per-installation Plaid setup](DESKTOP-PLAID.md) for local credentials and browser bank authorization and live-testing requirements.
+
+See [backup and migration guidance](DESKTOP-BACKUPS.md) before moving a household to another Mac.

@@ -191,7 +191,7 @@ def main():
             or origin.username or origin.password or origin.path or origin.query or origin.fragment):
         parser.error('frontend-origin must be a loopback HTTP origin')
     # The launch capability travels through a private pipe, never argv or disk.
-    bootstrap = json.loads(sys.stdin.readline(4096))
+    bootstrap = json.loads(sys.stdin.readline(8192))
     token = bootstrap.get('token', '')
     if not isinstance(token, str) or len(token) < 32 or not token.isascii():
         raise RuntimeError('Missing desktop launch capability')
@@ -208,6 +208,8 @@ def main():
         recover_interrupted_restore(directory)
         database, values = prepare_storage(directory)
         configure_environment(database, values, args.frontend_origin)
+        from .plaid_configuration import set_desktop_credentials
+        set_desktop_credentials(bootstrap.get('plaid'))
         os.chdir(directory)
         initialize_database()
         mark_storage_initialized(directory, values)
@@ -217,6 +219,22 @@ def main():
         import uvicorn
         from .main import app
         install_setup_route(app)
+        from fastapi import Request, HTTPException
+        management_token=bootstrap.get('management_token')
+        @app.put('/api/v1/desktop/plaid-runtime')
+        async def update_plaid_runtime(request: Request):
+            if not management_token or not hmac.compare_digest(request.headers.get('x-pfos-management-token',''),management_token):
+                raise HTTPException(403,'Desktop management access required')
+            from .plaid_hosted import replace_configuration
+            from .database import SessionLocal
+            try:
+                values = await request.json()
+                # Do not block the event loop while an existing Link request finishes.
+                def apply():
+                    with SessionLocal() as db: replace_configuration(values, db)
+                await asyncio.to_thread(apply)
+            except ValueError: raise HTTPException(400,'Invalid Plaid configuration') from None
+            return {'updated':True}
         from .database import engine
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(('127.0.0.1', 0))

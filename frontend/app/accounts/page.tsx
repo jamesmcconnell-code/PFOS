@@ -1,4 +1,5 @@
 'use client';
+import { FinancialValue } from "@/components/financial-value";
 
 import { useEffect, useState } from 'react';
 import { api, money } from '@/lib/api';
@@ -110,8 +111,8 @@ export default function Accounts() {
       {filteredRows.map((account) => <button key={account.id} onClick={() => open(account)} className="card text-left transition hover:-translate-y-0.5 hover:ring-2 hover:ring-mint">
         <div className="flex justify-between gap-2"><span className="label capitalize">{account.account_type}</span><span className="text-xs text-slate-400">{account.ownership === 'joint' ? 'Joint' : account.owner_name}</span></div>
         <b className="mt-2 block">{account.name}</b>
-        <p className="metric mt-3">{account.account_type === 'crypto' ? `${Number(account.balance).toLocaleString(undefined,{maximumFractionDigits:8})} ${account.asset_symbol || ''}` : money(account.balance)}</p>
-        {account.account_type === 'crypto' && <p className="mt-1 text-sm text-slate-500">{account.crypto_usd_value == null ? 'Quote unavailable' : money(account.crypto_usd_value)}</p>}
+        <p className="metric mt-3"><FinancialValue>{account.account_type === 'crypto' ? `${Number(account.balance).toLocaleString(undefined,{maximumFractionDigits:8})} ${account.asset_symbol || ''}` : money(account.balance)}</FinancialValue></p>
+        {account.account_type === 'crypto' && <p className="mt-1 text-sm text-slate-500"><FinancialValue>{account.crypto_usd_value == null ? 'Quote unavailable' : money(account.crypto_usd_value)}</FinancialValue></p>}
         <p className="mt-2 text-xs text-slate-400">{account.source_name} · Click to edit</p>
       </button>)}
       {!filteredRows.length && <p className="card text-sm text-slate-500 md:col-span-3">No accounts match the selected filters.</p>}

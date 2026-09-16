@@ -1,6 +1,7 @@
 """Provider adapters and the canonical PFOS normalization/persistence pipeline."""
 import base64, binascii, csv, hashlib, hmac, io, json, secrets, time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -13,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import settings
+from . import plaid_configuration
+import os
 from .models import Account, Category, DataConnection, Transaction
 from .smart_tagging import evaluate_new_transaction
 
@@ -37,6 +40,8 @@ class Connector(ABC):
     @abstractmethod
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload: ...
 class ConnectorAuthenticationError(Exception): pass
+class PlaidReauthorizationRequired(ConnectorAuthenticationError): pass
+class PlaidNewConnectionRequired(ConnectorAuthenticationError): pass
 
 class CsvConnector(Connector):
     """Accepts conventional date/description/amount rows; callers supply an account external id."""
@@ -53,12 +58,30 @@ class CsvConnector(Connector):
 
 class PlaidConnector(Connector):
     def fetch(self, credentials: dict[str, Any], cursor: str | None) -> SyncPayload:
-        if not settings.plaid_client_id or not settings.plaid_secret: raise ValueError('Plaid server credentials are not configured')
-        host={'sandbox':'https://sandbox.plaid.com','development':'https://development.plaid.com','production':'https://production.plaid.com'}[settings.plaid_environment]
+        try: config=plaid_configuration.credentials()
+        except ValueError as error: raise ConnectorAuthenticationError(str(error)) from None
+        if os.environ.get('PFOS_DESKTOP_RUNTIME')=='1' and credentials.get('plaid_identity')!=plaid_configuration.identity(config):
+            raise ConnectorAuthenticationError('This bank connection must be relinked with this installation’s Plaid credentials.')
+        host=plaid_configuration.host(config)
         page_cursor=cursor or ''; accounts={}; transactions=[]
         while True:
-            data={'client_id':settings.plaid_client_id,'secret':settings.plaid_secret,'access_token':credentials['access_token'],'cursor':page_cursor,'count':500}
-            body=httpx.post(f'{host}/transactions/sync',json=data,timeout=45).raise_for_status().json()
+            data={'client_id':config['client_id'],'secret':config['secret'],'access_token':credentials['access_token'],'cursor':page_cursor,'count':500}
+            desktop = os.environ.get('PFOS_DESKTOP_RUNTIME') == '1'
+            with plaid_configuration.operation_lock if desktop else nullcontext():
+                if desktop:
+                    try: current = plaid_configuration.credentials()
+                    except ValueError as error: raise ConnectorAuthenticationError(str(error)) from None
+                    if current != config:
+                        raise ConnectorAuthenticationError('Plaid settings changed during sync. Retry with the current credentials.')
+                response=httpx.post(f'{host}/transactions/sync',json=data,timeout=45)
+            if getattr(response,'is_error',False):
+                try: code=response.json().get('error_code')
+                except ValueError: code=None
+                if code=='ITEM_LOGIN_REQUIRED':
+                    raise PlaidReauthorizationRequired('Your bank needs authorization again. Select Reauthorize bank in Connected Sources.')
+                if code in ('INVALID_ACCESS_TOKEN','ITEM_NOT_FOUND'):
+                    raise PlaidNewConnectionRequired('This bank token no longer works. Connect this bank again; imported history is preserved.')
+            body=response.raise_for_status().json()
             for a in body.get('accounts',[]): accounts[a['account_id']]=NormalizedAccount(a['account_id'],a['name'],_plaid_type(a.get('subtype'),a.get('type')),Decimal(str(a['balances'].get('current') or 0)))
             for t in body.get('added',[])+body.get('modified',[]):
                 source_category=(t.get('personal_finance_category') or {}).get('primary')

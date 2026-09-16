@@ -1,60 +1,84 @@
-# Local desktop backup and restore (step 7)
+# PFOS backups, restore, and moving to another Mac
 
-Use **File → Back Up Local Data…** and choose a new `.pfosbackup` filename on your
-computer or an external drive. PFOS briefly closes its window and pauses its local
-API, saves a consistent SQLite snapshot, and reopens the interface. Existing backup
-files are not overwritten; choose a new filename each time.
+Open **File → Backup and Migration Guide** in the macOS app for these instructions
+and a check of the signed-in household's current Plaid configuration. The guide opens
+automatically after a successful restore and is also linked from Settings → Plaid.
 
-The file contains financial data, household settings, accounts, password hashes,
-and the secrets needed to reopen the household and decrypt saved connector credentials.
-It is **not encrypted**. Save it in a protected location. Owner-only permissions are
-requested, but the destination filesystem determines which permissions are supported.
-Browser preferences and saved browser sessions are not included. This workflow does
-not send files to a server or configure a backup schedule.
+## What moves with a backup
 
-To restore, choose **File → Restore Local Backup…**, select a PFOS backup, and confirm
-replacement. PFOS checks the format, checksums, SQLite integrity, foreign keys, and
-migration revision before replacing data. It saves a recovery copy of the current
-household under `data/backups/before-restore-*.pfosbackup`. After restore, sign in
-using an account and password from the restored backup. Current browser login/view
-preferences are cleared to avoid retaining a different household's session.
+A `.pfosbackup` file contains the financial database, local users and password hashes,
+preferences stored in the database, encrypted bank/exchange tokens, and the runtime
+keys needed to read the database's credentials. It is **not encrypted as an archive**.
+Since the decryption keys are included, protect it as you would readable financial
+data and account secrets. Share the DMG with someone who needs the app, not a copy of
+your household backup.
 
-If PFOS cannot start because local files are missing or damaged, the startup error
-dialog also offers **Restore Local Backup…**. Damaged originals are preserved as raw
-files in `data/backups/before-restore-raw-*/` rather than being discarded. These raw
-folders are for manual recovery, not selectable PFOS backup archives.
+The installation's Plaid developer secret and its Keychain-protected configuration
+file are excluded. Bank records can still contain the associated Plaid client ID and
+environment as identity metadata. Browser sign-in sessions and device preferences,
+such as Blur financial numbers, are excluded. Destination Plaid developer settings
+remain unchanged on restore. Browser local storage is cleared, so sign in again and
+re-enable device preferences as needed.
 
-A restore interrupted between database and secrets replacement is rolled back from
-its recovery copy on the next launch, before the API starts. Do not delete
-`restore.pending` or its recovery files while an interrupted restore is pending.
-If recovery itself cannot finish (for example, disk failure), startup stops and retains
-the recovery state for another attempt.
+The archive format is unchanged: `pfos.db`, `runtime.json`, and `manifest.json` with
+integrity checksums and a migration revision. Do not edit or extract those files as
+a substitute for the restore command.
 
-Known older database revisions are backed up under `data/backups/before-upgrade-*`
-before automatic migration. Unknown/newer or unversioned databases are refused.
-Recovery copies on the same disk do not protect against losing that disk; save a
-separate backup to another location for that purpose. Recovery copies are retained
-without automatic pruning.
+## Back up
 
-The supported archive limit is a 1 GiB uncompressed database and 64 KiB each for
-secrets and metadata. Only restore backups you trust: checksums detect accidental
-corruption, not who created a file. Windows and ARM execution remain unverified.
+1. Finish or cancel bank authorization and wait for sync/credential operations.
+2. Choose **File → Back Up Local Data…** and a new `.pfosbackup` filename.
+3. Keep it in a protected location and maintain a separate copy away from this Mac.
+4. Keep a known-good backup before application updates or moving machines. Copying
+   the app bundle does not back up your data. Copying a live database file can miss
+   pending writes; use PFOS's backup command.
 
-Developer verification:
+## Restore or move machines
 
-```sh
-npm run build:backend --prefix desktop
-npm run test:backup --prefix desktop
-DATABASE_URL=sqlite:// PYTHONPATH=backend python -m pytest backend/tests/test_desktop_backup.py -q
-```
+1. Install a compatible PFOS version on the destination Mac and transfer the backup
+   privately. Keep the source Mac and backup until you have verified the destination.
+2. Choose **File → Restore Local Backup…**. This is available before registering a
+   household. If startup fails, the error dialog also offers restore.
+3. Review the confirmation: this replaces destination data and does not merge it.
+   PFOS validates the archive and preserves current data in a recovery copy first.
+4. Sign in with the account/password that existed when the backup was made. A newer
+   password changed after that backup will not be the restored password.
+5. Review accounts, transaction history, and preferences. Re-enable the visual privacy
+   toggle if desired, then review Plaid before syncing. Other providers' restored
+   tokens may also require renewed access from their provider.
+6. Keep your backup and recovery copy until the restored household is verified.
 
-The Electron test uses native menu handlers with automated test-only file selections,
-a temporary household, and the frozen backend. Source tests cover snapshot consistency
-with WAL data, restore/recovery copies, corrupted archives, interrupted replacement,
-missing/damaged profiles, and backup before schema migration.
+Both Macs maintain independent databases. There is no automatic synchronization or
+merge between them. Replacing the app with an updated DMG on the same Mac normally
+needs no restore: quit PFOS, replace the application, and reopen it. The local data
+profile and protected Plaid configuration stay on that Mac.
 
-Implementation references: [SQLite backup API in Python](https://docs.python.org/3.12/library/sqlite3.html#sqlite3.Connection.backup)
-and [Electron native dialogs](https://www.electronjs.org/docs/latest/api/dialog).
+## Plaid after restoring
 
-The existing [encrypted PostgreSQL backup workflow](BACKUPS.md) is for the server
-installation and remains separate from these local desktop archives.
+| Situation | Action |
+| --- | --- |
+| New Mac, no developer credentials | Enter your own settings in Settings → Plaid. Do not copy another Mac's encrypted credential file. |
+| Same Plaid Client ID/environment | Validate with the account's current secret. Existing bank tokens may work; verify by syncing. |
+| Bank requests authorization | Connected Sources → Manage → Reauthorize bank preserves existing accounts/history. |
+| Different or unknown client/environment, or invalid token | Restore the original credentials or connect separately. Review overlap before importing from the new source. |
+| No Plaid account wanted | Review restored data, use manual entry, or import CSV. Plaid stays disabled. |
+
+A pending Link session from an old backup can be expired or tied to another setup.
+Cancel it and start again if needed. PFOS does not merge account IDs/history across
+Plaid accounts. A stored token or matching configuration is not evidence that live
+bank access is healthy. See [Plaid setup](DESKTOP-PLAID.md).
+
+## Recovery
+
+**File → Show Data Folder…** opens the local data directory. Its `backups` folder
+contains `before-restore-*.pfosbackup` recovery files. Damaged/incomplete original
+files can instead be kept in a `before-restore-raw-*` folder for manual recovery;
+keep that folder rather than treating it as a normal backup archive.
+
+Unsupported, corrupted, or tampered archives are rejected before replacing the live
+database. Use a known-good backup or a compatible newer application. Do not delete
+original files when troubleshooting. The existing startup recovery mechanism handles
+interrupted restore operations before opening the database.
+
+Verification uses synthetic households, malformed archives, and isolated desktop
+profiles; it does not contact banks or alter the user's live household.
