@@ -6,10 +6,10 @@ from sqlalchemy.orm import sessionmaker
 from fastapi import HTTPException
 
 from app.database import Base
-from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, planner_pay_schedule, planner_period_start, replace_transaction_splits, reports, update_planner_income_rule, update_planner_pay_schedule, update_transaction_date, update_transaction_planner_effective_date
+from app.main import add_transaction, available_cash_planner, category_tracker, delete_category, delete_planner_carryover, income_rule_from_transaction, metrics, planner_cash_history, planner_pay_schedule, planner_period_start, replace_transaction_splits, reports, update_planner_income_rule, update_planner_pay_schedule, update_transaction_date, update_transaction_planner_effective_date, update_transaction_planner_flags
 from app.models import Account, AccountBalanceSnapshot, Category, Goal, Household, HouseholdMember, PlannerAdjustment, PlannerIncomeAllocation, PlannerPaySchedule, PlannerStartingCarryover, RecurringPlannerExpenseRule, RecurringPlannerIncomeRule, SavingsRule, Tag, Transaction, TransactionTag, User
 from app.planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
-from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, PlannerPayScheduleIn, TransactionDateUpdate, TransactionSplitsUpdate
+from app.schemas import CategoryDelete, ManualTransactionIn, PlannerExpenseEffectiveDateUpdate, PlannerIncomeRuleUpdate, PlannerPayScheduleIn, TransactionDateUpdate, TransactionPlannerFlagsUpdate, TransactionSplitsUpdate
 
 
 def test_manual_transaction_creation_persists_metadata_tags_and_account_balance():
@@ -28,7 +28,7 @@ def test_manual_transaction_creation_persists_metadata_tags_and_account_balance(
     result=add_transaction(ManualTransactionIn(
         account_id=checking.id,date=date(2026,8,3),description='Farmers market',amount=-42.75,
         category_id=groceries.id,owner_id=user.id,source_category='Cash',notes='Weekly produce',
-        is_essential=True,is_expected=True,is_prorated=True,proration_months=1,tag_ids=[tag.id],
+        is_essential=True,is_expected=True,is_prorated=True,exclude_from_available_cash=True,proration_months=1,tag_ids=[tag.id],
     ),user,db)
 
     created=db.get(Transaction,UUID(result['id']))
@@ -38,7 +38,7 @@ def test_manual_transaction_creation_persists_metadata_tags_and_account_balance(
     assert created.owner_id==user.id
     assert created.source_category=='Cash'
     assert created.notes=='Weekly produce'
-    assert created.is_essential and created.is_expected and created.is_prorated
+    assert created.is_essential and created.is_expected and created.is_prorated and created.exclude_from_available_cash
     assert created.proration_months==1
     assert float(db.get(Account,checking.id).balance)==57.25
     assert result['tag_ids']==[str(tag.id)]
@@ -129,6 +129,40 @@ def test_available_cash_planner_separates_refunds_prorated_expected_and_debt_ite
     assert result['refund_expense_offset']==50
     assert result['total_period_expenses']==280
     assert result['refunds'][0]['refund_included'] is True
+
+def test_reserved_fund_debits_are_excluded_only_from_available_cash():
+    engine=create_engine('sqlite://')
+    Base.metadata.create_all(engine)
+    db=sessionmaker(bind=engine)()
+    user=User(email='reserved@example.com',display_name='Reserved Fund',password_hash='x');home=Household(name='Test household');db.add_all([user,home]);db.flush();db.add(HouseholdMember(household_id=home.id,user_id=user.id));db.flush()
+    checking=Account(household_id=home.id,name='Checking',type='checking',account_type='spending',balance=0)
+    card=Account(household_id=home.id,name='Card',type='credit',account_type='debt',balance=0)
+    wedding=Category(household_id=home.id,name='Wedding',kind='expense')
+    db.add_all([checking,card,wedding]);db.flush()
+    excluded=[
+        Transaction(household_id=home.id,account_id=checking.id,category_id=wedding.id,date=date.today(),description='Wedding venue',amount=-500,exclude_from_available_cash=True),
+        Transaction(household_id=home.id,account_id=card.id,category_id=wedding.id,date=date.today(),description='Wedding flowers',amount=-300,exclude_from_available_cash=True),
+        Transaction(household_id=home.id,account_id=checking.id,category_id=wedding.id,date=date.today(),description='Wedding catering deposit',amount=-1200,is_prorated=True,proration_months=12,exclude_from_available_cash=True),
+    ]
+    ordinary=Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Groceries',amount=-100)
+    db.add_all([*excluded,ordinary]);db.commit()
+
+    planner=available_cash_planner('monthly',date.today(),None,user,db)
+    assert planner['total_period_expenses']==100
+    assert planner['fixed_regular_expenses']==100
+    assert planner['debt_line_item_total']==0
+    assert planner['prorated_expenses']==0
+    assert planner['excluded_expense_total']==2000
+    assert {item['description'] for item in planner['excluded_expense_sources']}=={'Wedding venue','Wedding flowers','Wedding catering deposit'}
+    tracked=category_tracker(None,None,None,user,db)
+    wedding_row=next(item for item in tracked['categories'] if item['name']=='Wedding')
+    assert wedding_row['debits']==2000
+
+    update_transaction_planner_flags(ordinary.id,TransactionPlannerFlagsUpdate(exclude_from_available_cash=True),user,db)
+    assert available_cash_planner('monthly',date.today(),None,user,db)['total_period_expenses']==0
+    credit=Transaction(household_id=home.id,account_id=checking.id,date=date.today(),description='Credit',amount=50);db.add(credit);db.commit()
+    with pytest.raises(HTTPException,match='Only debit transactions'):
+        update_transaction_planner_flags(credit.id,TransactionPlannerFlagsUpdate(exclude_from_available_cash=True),user,db)
 
 def test_monthly_planner_returns_every_paycheck_source_and_monthly_nmp():
     engine=create_engine('sqlite://')

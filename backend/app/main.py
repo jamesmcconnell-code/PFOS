@@ -482,6 +482,7 @@ def add_transaction(body:ManualTransactionIn,user=Depends(current_user),db:Sessi
     tag_ids=list(dict.fromkeys(body.tag_ids)); valid_tags=set(db.scalars(select(Tag.id).where(Tag.household_id==h,Tag.id.in_(tag_ids))).all()) if tag_ids else set()
     if len(valid_tags)!=len(tag_ids): raise HTTPException(400,'Invalid tag')
     if body.is_refund and body.amount<=0: raise HTTPException(400,'Only positive transactions can be refund credits')
+    if body.exclude_from_available_cash and body.amount>=0: raise HTTPException(400,'Only debit transactions can be excluded from Available Cash')
     data=body.model_dump(exclude={'tag_ids'}); data['fingerprint']=hashlib.sha256(f'{body.account_id}|{body.date}|{body.amount}|{body.description.lower()}'.encode()).hexdigest()
     t=Transaction(household_id=h,**data); db.add(t); db.flush(); db.add_all([TransactionTag(transaction_id=t.id,tag_id=tag_id) for tag_id in tag_ids]);evaluate_new_transaction(t,db,source='manual',preserve_fields=body.model_fields_set); a.balance=float(a.balance)+body.amount; record_balance_snapshots(db,[a],source='manual'); db.commit(); return dict(serialize(t),tags=[{'id':str(row.tag_id),'name':db.get(Tag,row.tag_id).name} for row in db.scalars(select(TransactionTag).where(TransactionTag.transaction_id==t.id)).all()],tag_ids=[str(row.tag_id) for row in db.scalars(select(TransactionTag).where(TransactionTag.transaction_id==t.id)).all()],splits=[],**smart_tagging_metadata(t,h,db))
 @app.patch('/api/v1/transactions/{transaction_id}')
@@ -489,6 +490,7 @@ def update_transaction(transaction_id:UUID,body:TransactionIn,user=Depends(curre
     t=db.get(Transaction,transaction_id)
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     for k,v in body.model_dump().items(): setattr(t,k,v)
+    if float(t.amount)>=0: t.exclude_from_available_cash=False
     db.commit(); return serialize(t)
 @app.patch('/api/v1/transactions/{transaction_id}/internal-transfer')
 def update_internal_transfer(transaction_id:UUID,body:TransactionTransferUpdate,user=Depends(current_user),db:Session=Depends(get_db)):
@@ -568,6 +570,7 @@ def update_transaction_planner_flags(transaction_id:UUID,body:TransactionPlanner
     if not t or t.household_id!=household(user,db): raise HTTPException(404,'Transaction not found')
     changes=body.model_dump(exclude_unset=True)
     if changes.get('is_refund') and float(t.amount)<=0: raise HTTPException(400,'Only positive transactions can be refunds')
+    if changes.get('exclude_from_available_cash') and float(t.amount)>=0: raise HTTPException(400,'Only debit transactions can be excluded from Available Cash')
     for field,value in changes.items(): setattr(t,field,value)
     if changes.get('is_refund') is False: t.refund_included=True
     db.commit();return serialize(t)
@@ -854,7 +857,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         category_id=item.category_id if category_id is None else category_id
         category_name=(categories.get(category_id).name if category_id in categories else '').lower()
         return item.is_internal_transfer or (account.account_type!='debt' and category_name in {'debt payments','transfers'})
-    paycheck=automated=refunds_total=fixed_regular=expected=household_settlement_expenses=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]; household_settlement_sources=[]; settlement_received_sources=[]
+    paycheck=automated=refunds_total=fixed_regular=expected=household_settlement_expenses=0.0; refunds=[]; paycheck_sources=[]; automated_savings_sources=[]; expense_input_sources=[]; debt_items=[]; household_settlement_sources=[]; settlement_received_sources=[]; excluded_expense_sources=[]
     # Only refunds explicitly marked Prorated are spread across the calendar
     # month. Ordinary refund credits keep their actual posting-period behavior.
     month_start=anchor.replace(day=1); month_end=(month_start.replace(day=28)+timedelta(days=4)).replace(day=1)
@@ -968,6 +971,10 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; amount=allocation['amount']; category_id=allocation['category_id']
         effective_date=planner_effective_date(item)
         if item.planner_effective_date and not (start<=effective_date<end): continue
+        if amount<0 and item.exclude_from_available_cash:
+            if allocation['include_in_totals']:
+                excluded_expense_sources.append({'id':str(allocation['split_id'] or item.id),'parent_transaction_id':str(item.id),'date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':abs(amount),'category_id':str(category_id) if category_id else None,'is_split':allocation['is_split']})
+            continue
         if allocation['scope_treatment']=='settlement_received':
             settlement_received_sources.append({'id':f"settlement-received-{allocation['settlement_id']}",'settlement_id':allocation['settlement_id'],'date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':amount,'category_id':str(category_id) if category_id else None,'status':'settlement_received','include_in_totals':False})
             continue
@@ -1020,14 +1027,14 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
         # A purchase contributes from its purchase date up to, but not including,
         # the matching duration anniversary (3, 6, 12 months, or another choice).
         effective_date=planner_effective_date(item)
-        if float(allocation['amount'])<0 and not is_debt_payment(item,account,allocation['category_id']) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(allocation)
+        if float(allocation['amount'])<0 and not item.exclude_from_available_cash and not is_debt_payment(item,account,allocation['category_id']) and effective_date<=anchor and anchor<add_months(effective_date,duration): active_prorated.append(allocation)
     prorated_total=sum(abs(float(item['amount'])) for item in active_prorated); period_divisor=(26 if period=='biweekly' else (24 if period=='paycheck' else 12)); prorated_expenses=sum(abs(float(item['amount']))/(int(item['transaction'].proration_months or 12)*period_divisor/12) for item in active_prorated)
     for allocation in active_prorated:
         item=allocation['transaction']; account=accounts_by_id[item.account_id]; value=abs(float(allocation['amount'])); duration=int(item.proration_months or 12); effective_date=planner_effective_date(item); expense_input_sources.append({'id':str(allocation['split_id'] or item.id),'type':'Prorated','date':str(item.date),'planner_effective_date':str(effective_date),'description':item.description,'account_name':account.name,'amount':value,'proration_months':duration,'period_amount':value/(duration*period_divisor/12)})
     anticipated_expenses=0.0; anticipated_expense_sources=[]; reconciled_anticipated_expenses=[]
     # A rule is projected only when no source or matching actual charge is already
     # providing this period's allocation. This keeps imported actuals authoritative.
-    actual_candidates=[allocation for allocation in period_allocations if allocation['include_in_totals'] and allocation['scope_treatment']=='normal' and start<=planner_effective_date(allocation['transaction'])<end and planner_effective_date(allocation['transaction'])<=anchor and float(allocation['amount'])<0 and not allocation['transaction'].is_internal_transfer]
+    actual_candidates=[allocation for allocation in period_allocations if allocation['include_in_totals'] and allocation['scope_treatment']=='normal' and start<=planner_effective_date(allocation['transaction'])<end and planner_effective_date(allocation['transaction'])<=anchor and float(allocation['amount'])<0 and not allocation['transaction'].is_internal_transfer and not allocation['transaction'].exclude_from_available_cash]
     for rule in expense_rules:
         # A rule begins forecasting only once its activation date reaches the
         # selected period. This keeps a newly configured rule out of history.
@@ -1047,7 +1054,7 @@ def available_cash_planner(period:str='paycheck',anchor_date:date|None=None,view
     raw_nmp=paycheck+automated; nmp_paycheck=raw_nmp/multiplier; net_monthly_pay=nmp_paycheck*2
     regular_expected_prorated=fixed_regular+expected+prorated_expenses; debt_total=sum(item['amount'] for item in debt_items)
     gross_total_expenses=regular_expected_prorated+debt_total+household_settlement_expenses; combined_expenses=gross_total_expenses+anticipated_expenses; total_expenses=combined_expenses-refunds_total
-    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'joint_display_cadence':joint_display_cadence(period) if joint_view else None,'joint_display_biweekly_anchor':str(display_biweekly_anchor) if joint_view and period=='biweekly' else None,'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'anticipated_paychecks':anticipated_paychecks,'reconciled_paychecks':reconciled_paychecks,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'household_settlement_expenses':household_settlement_expenses,'household_settlement_sources':household_settlement_sources,'settlement_received_sources':settlement_received_sources,'expense_input_sources':expense_input_sources,'debt_line_items':debt_items,'debt_line_item_total':debt_total,'actual_expense_total':gross_total_expenses,'anticipated_expense_total':anticipated_expenses,'combined_period_expense_total':combined_expenses,'anticipated_expense_sources':anticipated_expense_sources,'reconciled_anticipated_expenses':reconciled_anticipated_expenses,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
+    return {'period':period,'period_label':label,'period_start':str(start),'period_end':str(end-timedelta(days=1)),'joint_display_cadence':joint_display_cadence(period) if joint_view else None,'joint_display_biweekly_anchor':str(display_biweekly_anchor) if joint_view and period=='biweekly' else None,'debt_line_item_through':str(anchor),'paycheck_amount':paycheck,'paycheck_sources':paycheck_sources,'anticipated_paychecks':anticipated_paychecks,'reconciled_paychecks':reconciled_paychecks,'automated_savings_amount':automated,'automated_savings_sources':automated_savings_sources,'included_refunds':refunds_total,'refund_expense_offset':refunds_total,'nmp_paycheck':nmp_paycheck,'net_monthly_pay':net_monthly_pay,'fixed_regular_expenses':fixed_regular,'expected_expenses':expected,'prorated_expense_total':prorated_total,'prorated_expenses':prorated_expenses,'regular_expected_prorated_expenses':regular_expected_prorated,'household_settlement_expenses':household_settlement_expenses,'household_settlement_sources':household_settlement_sources,'settlement_received_sources':settlement_received_sources,'expense_input_sources':expense_input_sources,'excluded_expense_sources':excluded_expense_sources,'excluded_expense_total':sum(item['amount'] for item in excluded_expense_sources),'debt_line_items':debt_items,'debt_line_item_total':debt_total,'actual_expense_total':gross_total_expenses,'anticipated_expense_total':anticipated_expenses,'combined_period_expense_total':combined_expenses,'anticipated_expense_sources':anticipated_expense_sources,'reconciled_anticipated_expenses':reconciled_anticipated_expenses,'gross_total_period_expenses':gross_total_expenses,'total_period_expenses':total_expenses,'free_spending_before_savings':net_monthly_pay-total_expenses,'refunds':refunds}
 
 def validate_planner_expense_rule(h, values, db: Session):
     account=db.get(Account,values['account_id'])

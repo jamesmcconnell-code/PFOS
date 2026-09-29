@@ -83,6 +83,7 @@ def test_upgrade_preserves_existing_rows_and_backfills_dates(storage):
             transaction = db.get(Transaction, transaction_id)
             assert transaction.amount == Decimal('-42.37')
             assert transaction.date == date(2026, 7, 1)
+            assert transaction.exclude_from_available_cash is False
             assert transaction.category_id in {category_id, duplicate_id}
             assert len(db.scalars(select(Category)).all()) == 1
             from app.models import RecurringPlannerExpenseRule

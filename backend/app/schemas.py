@@ -26,6 +26,7 @@ class ManualTransactionIn(BaseModel):
     is_essential: bool=False
     is_recurring: bool=False
     is_internal_transfer: bool=False
+    exclude_from_available_cash: bool=False
     is_refund: bool=False
     refund_included: bool=True
     is_expected: bool=False
@@ -85,6 +86,7 @@ class CategoryRename(BaseModel): name: str=Field(min_length=1,max_length=100)
 class CategoryDelete(BaseModel): replacement_category_id: UUID
 class TransactionPlannerFlagsUpdate(BaseModel):
     is_essential: bool|None=None
+    exclude_from_available_cash: bool|None=None
     is_refund: bool|None=None
     refund_included: bool|None=None
     is_expected: bool|None=None
