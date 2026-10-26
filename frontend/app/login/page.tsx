@@ -8,7 +8,7 @@ export default function Login() {
   const [name,setName]=useState(''), [confirm,setConfirm]=useState('');
   const [error,setError]=useState(''), [register,setRegister]=useState(false);
   const [desktop,setDesktop]=useState(false), [firstLaunch,setFirstLaunch]=useState(false);
-  const [checking,setChecking]=useState(true), [checkFailed,setCheckFailed]=useState(false);
+  const [checking,setChecking]=useState(true), [checkFailed,setCheckFailed]=useState(false), [sessionExpired,setSessionExpired]=useState(false);
   const [busy,setBusy]=useState(false);
   const router=useRouter();
   async function checkSetup() {
@@ -24,7 +24,13 @@ export default function Login() {
       setCheckFailed(true); setError('PFOS could not check your local household. Retry to continue.');
     } finally { setChecking(false); }
   }
-  useEffect(()=>{void checkSetup()},[]);
+  useEffect(()=>{
+    if (sessionStorage.getItem('pfos_session_expired')) {
+      sessionStorage.removeItem('pfos_session_expired');
+      setSessionExpired(true);
+    }
+    void checkSetup();
+  },[]);
   async function submit(e:React.FormEvent) {
     e.preventDefault();
     if (busy || checking || checkFailed) return;
@@ -39,6 +45,8 @@ export default function Login() {
         register?{email,password,display_name:name.trim() || email.split('@')[0]}:{email,password})});
       localStorage.setItem('pfos_token',r.access_token);
       localStorage.removeItem('pfos_view_user_id');
+      sessionStorage.removeItem('pfos_session_expired');
+      setSessionExpired(false);
       router.replace('/dashboard');
     } catch(e) {setError(e instanceof Error?e.message:'Unable to sign in'); setBusy(false);}
   }
@@ -51,6 +59,7 @@ export default function Login() {
         :'Your private household money system.'}</p>
       {firstLaunch && <p className="mb-5 rounded-lg bg-slate-50 p-3 text-sm text-slate-600">Your email identifies your local account; no email verification is needed. Use File → Show Data Folder to find your saved data. Existing server data is not imported automatically.</p>}
       {error && <p role="alert" className="mb-3 rounded bg-red-50 p-2 text-sm text-red-700">{error}</p>}
+      {sessionExpired && <p role="status" className="mb-3 rounded bg-amber-50 p-2 text-sm text-amber-800">Your session expired. Please sign in again.</p>}
       {checking?<p role="status">Checking your household…</p>:checkFailed?
         <button type="button" onClick={()=>void checkSetup()} className="w-full rounded-lg bg-navy py-2.5 text-white">Retry</button>:
         <><fieldset disabled={busy}>
