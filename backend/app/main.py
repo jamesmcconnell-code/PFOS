@@ -19,6 +19,7 @@ from . import plaid_configuration
 from .planner_schedule import adjacent_period_start, biweekly_period_bounds, period_bounds, periods_per_year, semimonthly_period_bounds
 from .smart_tagging import apply_suggestion, evaluate_new_transaction, latest_suggestion, matching_rule, normalize_merchant_key
 from .smart_tagging_learning import generate_historical_suggestion
+from .assistant_scenarios import add_months, project_goal_months
 
 app=FastAPI(title='PFOS API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=[origin.strip() for origin in settings.cors_origins.split(',') if origin.strip()], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
@@ -1859,6 +1860,81 @@ def one_income(view_user_id:UUID|None=None,user=Depends(current_user),db:Session
     h=household(user,db);m=metrics(h,db,view_user_id); income_q=select(IncomeSource).where(IncomeSource.household_id==h,IncomeSource.is_active==True)
     if view_user_id: income_q=income_q.where(or_(IncomeSource.owner_id==None,IncomeSource.owner_id==view_user_id))
     incomes=db.scalars(income_q).all(); return {'monthly_expenses':m['monthly_expenses'],'scenarios':[{'name':x.name,'income':float(x.monthly_amount),'surplus':float(x.monthly_amount)-m['monthly_expenses'],'sustainable':float(x.monthly_amount)>=m['monthly_expenses']} for x in incomes]+[{'name':'Combined income','income':m['monthly_income'],'surplus':m['monthly_savings'],'sustainable':m['monthly_savings']>=0}]}
+
+def assistant_spending_summary(category_id:UUID,h,db:Session,view_user_id:UUID|None,history_months:int):
+    validate_view_member(h,view_user_id,db)
+    category=db.get(Category,category_id)
+    if not category or category.household_id!=h or category.kind!='expense':
+        raise HTTPException(404,'Expense category not found')
+    today=date.today()
+    current_month=date(today.year,today.month,1)
+    history_end=current_month-timedelta(days=1)
+    history_start=add_months(current_month,-history_months)
+    category_rows=db.scalars(select(Category).where(Category.household_id==h)).all()
+    parent_ids={row.id:row.parent_id for row in category_rows}
+    category_ids={category.id,*category_descendants(category.id,parent_ids)}
+    filters=category_tracker_filters(h,history_start,history_end,view_user_id,db)
+    transactions=db.scalars(select(Transaction).where(*filters,Transaction.is_internal_transfer==False).order_by(Transaction.date)).all()
+    total=0.0; count=0
+    for allocation in scope_aware_transaction_allocations(transactions,db,view_user_id):
+        if not allocation['include_in_totals'] or allocation['category_id'] not in category_ids or allocation['amount']>=0:
+            continue
+        total+=abs(float(allocation['amount']));count+=1
+    return {
+        'category_id':str(category.id),'category_name':category.name,
+        'history_start':str(history_start),'history_end':str(history_end),
+        'history_months':history_months,'transaction_count':count,
+        'total_spending':round(total,2),'average_monthly_spending':round(total/history_months,2),
+    }
+
+@app.get('/api/v1/assistant/options')
+def assistant_options(view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db);validate_view_member(h,view_user_id,db)
+    categories=db.scalars(select(Category).where(Category.household_id==h,Category.kind=='expense').order_by(Category.name)).all()
+    goal_rows=db.scalars(select(Goal).where(Goal.household_id==h,Goal.is_complete==False).order_by(Goal.priority_order,Goal.created_at)).all()
+    goals=[{'id':str(goal.id),'name':goal.name,'target_amount':float(goal.target_amount),'current_amount':float(goal.current_amount),'target_date':str(goal.target_date) if goal.target_date else None} for goal in goal_rows]
+    return {'categories':[{'id':str(item.id),'name':item.name,'parent_id':str(item.parent_id) if item.parent_id else None} for item in categories],'goals':goals}
+
+@app.get('/api/v1/assistant/spending-summary')
+def assistant_spending_summary_route(category_id:UUID,history_months:int=6,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    if history_months<3 or history_months>24:raise HTTPException(400,'History months must be between 3 and 24')
+    h=household(user,db)
+    return assistant_spending_summary(category_id,h,db,view_user_id,history_months)
+
+@app.post('/api/v1/assistant/scenario')
+def assistant_scenario(body:AssistantScenarioIn,view_user_id:UUID|None=None,user=Depends(current_user),db:Session=Depends(get_db)):
+    h=household(user,db);validate_view_member(h,view_user_id,db)
+    category=db.get(Category,body.category_id);goal=db.get(Goal,body.goal_id)
+    if not category or category.household_id!=h or category.kind!='expense':raise HTTPException(404,'Expense category not found')
+    if not goal or goal.household_id!=h or goal.is_complete:raise HTTPException(404,'Savings goal not found')
+    history=assistant_spending_summary(body.category_id,h,db,view_user_id,body.history_months)
+    metrics_data=metrics(h,db,view_user_id,'rolling_30_days')
+    ordered_goals=db.scalars(select(Goal).where(Goal.household_id==h,Goal.is_complete==False).order_by(Goal.priority_order,Goal.created_at)).all()
+    if goal.id not in {item.id for item in ordered_goals}:ordered_goals.append(goal)
+    monthly_savings=float(metrics_data['monthly_savings'])
+    one_time_sweep=float(metrics_data['sweep_surplus'])
+    baseline_months,_=project_goal_months(ordered_goals,goal.id,monthly_savings,one_time_sweep)
+    scenario_months,extra_applied=project_goal_months(ordered_goals,goal.id,monthly_savings,one_time_sweep,body.monthly_reduction,body.duration_months)
+    today=date.today()
+    baseline_date=str(add_months(today,baseline_months)) if baseline_months is not None else None
+    scenario_date=str(add_months(today,scenario_months)) if scenario_months is not None else None
+    months_earlier=baseline_months-scenario_months if baseline_months is not None and scenario_months is not None else None
+    warnings=[]
+    if history['transaction_count']==0:warnings.append('No categorized spending was found in this category during the selected history window; the scenario uses only the reduction amount you entered.')
+    if body.monthly_reduction>history['average_monthly_spending']:
+        warnings.append('The planned monthly reduction is greater than the observed average spending for this category in the selected history window.')
+    if monthly_savings<=0:warnings.append('The baseline cash-flow estimate is zero or negative; the forecast assumes no existing monthly contributions toward goals.')
+    return {
+        'category':{'id':str(category.id),'name':category.name},
+        'goal':{'id':str(goal.id),'name':goal.name,'target_amount':float(goal.target_amount),'current_amount':float(goal.current_amount),'remaining_amount':max(0.0,float(goal.target_amount)-float(goal.current_amount)),'configured_target_date':str(goal.target_date) if goal.target_date else None},
+        'history':history,
+        'baseline':{'monthly_savings_estimate':round(max(0.0,monthly_savings),2),'one_time_sweep_estimate':round(max(0.0,one_time_sweep),2),'projected_months':baseline_months,'projected_date':baseline_date},
+        'scenario':{'monthly_reduction':body.monthly_reduction,'duration_months':body.duration_months,'planned_total_reduction':round(body.monthly_reduction*body.duration_months,2),'additional_goal_funding_applied':extra_applied,'projected_months':scenario_months,'projected_date':scenario_date},
+        'estimated_months_earlier':months_earlier,
+        'assumptions':['The goal current amount recorded in PFOS is the starting balance.','The recent 30-day PFOS cash-flow estimate continues as the baseline monthly contribution.','The forecasted one-time checking surplus stays unchanged and follows the existing goal priority order.','The proposed category reduction is added directly to the selected goal for the duration entered.','No investment growth, inflation, future income changes, or home-price changes are included.','Monthly contributions are modeled at month-end; dates are estimates.'],
+        'warnings':warnings,
+        'read_only':True,
+    }
 
 from .plaid_hosted import install_routes as install_plaid_hosted_routes
 install_plaid_hosted_routes(app, current_user, household, next_connection_name)

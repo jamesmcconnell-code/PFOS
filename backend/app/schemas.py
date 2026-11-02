@@ -202,6 +202,12 @@ class GoalUpdate(BaseModel):
     target_date: date
     funding_account_id: UUID|None=None
 class GoalPriorityUpdate(BaseModel): goal_ids: list[UUID]
+class AssistantScenarioIn(BaseModel):
+    category_id: UUID
+    goal_id: UUID
+    monthly_reduction: float = Field(gt=0, le=100000)
+    duration_months: int = Field(ge=1, le=120)
+    history_months: int = Field(default=6, ge=3, le=24)
 class FinancialSettingsUpdate(BaseModel): checking_account_ceiling: float=Field(ge=0)
 class IncomeIn(BaseModel): name: str; monthly_amount: float; owner_id: UUID|None=None
 class ConnectionIn(BaseModel):
