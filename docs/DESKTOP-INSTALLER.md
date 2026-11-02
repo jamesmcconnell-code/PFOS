@@ -17,6 +17,9 @@ and the local API. Users do not need npm, Python, Next.js, or Docker installed.
 Existing local data remains under `~/Library/Application Support/PFOS/`; application
 replacement does not remove that folder. Quit an existing PFOS instance before
 replacing the application. The bundled interface needs loopback port 37841 available.
+Optional local AI requires a separately installed Ollama service and downloaded
+model; see the [Ollama setup and privacy guide](OLLAMA-SETUP.md). The model is
+not included in the DMG.
 
 This is an **unsigned, unnotarized local test build**. A downloaded copy may be blocked
 by macOS security checks. It has not been published or submitted to Apple. A public

@@ -1,6 +1,7 @@
 from datetime import date
+from typing import Literal
 from uuid import UUID
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 class Register(BaseModel): email: EmailStr; password: str = Field(min_length=8); display_name: str
 class Login(BaseModel): email: EmailStr; password: str
 class Token(BaseModel): access_token: str; token_type: str='bearer'
@@ -12,6 +13,28 @@ class PasswordUpdate(BaseModel): current_password: str; new_password: str = Fiel
 class AdminPasswordUpdate(BaseModel): new_password: str = Field(min_length=10,max_length=128)
 class ThemeUpdate(BaseModel): theme_preference: str
 class SimpleModeUpdate(BaseModel): simple_mode_enabled: bool
+class AssistantChatMessage(BaseModel):
+    role: Literal['user','assistant']
+    content: str=Field(min_length=1,max_length=2000)
+
+    @field_validator('content')
+    @classmethod
+    def content_must_not_be_blank(cls,value:str):
+        if not value.strip():raise ValueError('Message content cannot be blank')
+        return value
+
+class AssistantChatIn(BaseModel):
+    messages: list[AssistantChatMessage]=Field(min_length=1,max_length=12)
+
+    @model_validator(mode='after')
+    def validate_conversation(self):
+        if self.messages[0].role!='user' or self.messages[-1].role!='user':
+            raise ValueError('Conversation must start and end with a user message')
+        if any(left.role==right.role for left,right in zip(self.messages,self.messages[1:])):
+            raise ValueError('Conversation messages must alternate between user and assistant')
+        if sum(len(message.content) for message in self.messages)>12000:
+            raise ValueError('Conversation exceeds the supported size')
+        return self
 class HouseholdUserIn(Register): pass
 class TransactionIn(BaseModel): account_id: UUID; date: date; description: str; amount: float; category_id: UUID|None=None; notes: str|None=None; is_essential: bool=False; is_recurring: bool=False
 class ManualTransactionIn(BaseModel):

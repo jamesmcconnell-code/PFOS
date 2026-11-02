@@ -9,7 +9,8 @@ import { FinancialOptionValue, FinancialValue } from '@/components/financial-val
 import { SESSION_EXPIRED_EVENT } from '@/lib/auth-session';
 import { findAssistantHelp, suggestedAssistantTopics } from '@/lib/assistant-help';
 
-type Message = { id: number; role: 'user' | 'assistant'; text: string; href?: string; hrefLabel?: string };
+type Message = { id: number; role: 'user' | 'assistant'; text: string; href?: string; hrefLabel?: string; aiContext?: boolean };
+type OllamaStatus = { enabled: boolean; configured: boolean; reachable: boolean; model_available: boolean; ready: boolean; processing_location: string; reason: string };
 type AssistantOptions = { categories: { id: string; name: string; parent_id: string | null }[]; goals: { id: string; name: string; target_amount: number; current_amount: number; target_date: string | null }[] };
 type ScenarioResult = {
   category: { id: string; name: string };
@@ -33,6 +34,7 @@ export function AssistantWidget() {
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const requestController = useRef<AbortController | null>(null);
   const nextMessageId = useRef(1);
   const [signedIn, setSignedIn] = useState(false);
   const [open, setOpen] = useState(false);
@@ -48,7 +50,20 @@ export function AssistantWidget() {
   const [duration, setDuration] = useState('12');
   const [historyMonths, setHistoryMonths] = useState('6');
   const [loading, setLoading] = useState(false);
+  const [canCancel, setCanCancel] = useState(false);
+  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
   const [scenario, setScenario] = useState<ScenarioResult | null>(null);
+
+  async function refreshOllamaStatus(signal?: AbortSignal): Promise<OllamaStatus | null> {
+    try {
+      const status = await api('/assistant/ollama-status', { signal }) as OllamaStatus;
+      setOllamaStatus(status);
+      return status;
+    } catch {
+      if (!signal?.aborted) setOllamaStatus(null);
+      return null;
+    }
+  }
 
   useEffect(() => {
     const syncAuthentication = () => setSignedIn(Boolean(localStorage.getItem('pfos_token')));
@@ -63,8 +78,12 @@ export function AssistantWidget() {
 
   useEffect(() => {
     if (!signedIn) {
+      requestController.current?.abort();
+      requestController.current = null;
       setOpen(false);
       setMessages([welcome]);
+      setOllamaStatus(null);
+      setCanCancel(false);
       setScenario(null);
       setOptions(null);
       setQuestion('');
@@ -113,23 +132,67 @@ export function AssistantWidget() {
     }
   }
 
-  function addMessage(role: Message['role'], text: string, href?: string, hrefLabel?: string) {
+  function addMessage(role: Message['role'], text: string, href?: string, hrefLabel?: string, aiContext = true) {
     const id = nextMessageId.current++;
-    setMessages((current) => [...current, { id, role, text, href, hrefLabel }]);
+    setMessages((current) => [...current, { id, role, text, href, hrefLabel, aiContext }]);
   }
 
   async function answerQuestion(rawQuestion: string) {
     const value = rawQuestion.trim();
     if (!value || loading) return;
     setQuestion('');
-    addMessage('user', value);
     const normalized = value.toLowerCase();
     const scenarioIntent = /how much sooner|\bsooner\b|if i.{0,120}\b(?:cut|reduce|decrease|lower|spend less)\b|what if.{0,120}\b(?:reduce|decrease|cut|lower|save|spend less)\b|\b(?:reduce|decrease|cut|lower)\b.{0,50}\b(?:spend|spending|shopping|expenses)\b/.test(normalized);
+    const spendingSummaryIntent = /\b(?:how much|average|spend|spending|spent|total)\b/.test(normalized);
+    const financialIntent = scenarioIntent || spendingSummaryIntent;
+    const useLocalFinancialAI = financialIntent && Boolean(ollamaStatus?.ready);
+    const aiContext = !financialIntent || useLocalFinancialAI;
+    addMessage('user', value, undefined, undefined, aiContext);
+    if (useLocalFinancialAI) {
+      setScenario(null);
+      const controller = new AbortController();
+      requestController.current = controller;
+      setCanCancel(true);
+      setLoading(true);
+      try {
+        const history = [
+          ...messages.filter((message) => message.id !== 0 && message.aiContext !== false)
+            .map((message) => ({ role: message.role, content: message.text })),
+          { role: 'user', content: value },
+        ].slice(-12);
+        if (history[0]?.role === 'assistant') history.shift();
+        const response = await api('/assistant/chat', {
+          method: 'POST',
+          body: JSON.stringify({ messages: history }),
+          signal: controller.signal,
+        }) as { content: string; used_financial_tools: boolean; financial_result?: ({ type: 'goal_scenario' } & ScenarioResult) | ({ type: 'spending_summary' } & ScenarioResult['history'] & { category_name: string }) };
+        if (response.financial_result?.type === 'goal_scenario') {
+          setScenario(response.financial_result as ScenarioResult);
+          addMessage('assistant', response.content, undefined, undefined, true);
+        } else if (response.financial_result?.type === 'spending_summary') {
+          const result = response.financial_result;
+          addMessage('assistant', `${response.content}\n\nPFOS calculation: Across ${result.history_months} completed months (${result.history_start} through ${result.history_end}), PFOS recorded ${money(result.total_spending)} in ${result.category_name} outflows over ${result.transaction_count} categorized allocations, averaging ${money(result.average_monthly_spending)} per month. Credits and refunds are not netted against outflows.`, '/category-tracker', 'Open Category Tracker', true);
+        } else {
+          addMessage('assistant', response.content, undefined, undefined, true);
+        }
+      } catch {
+        if (controller.signal.aborted) {
+          addMessage('assistant', 'The request was canceled in PFOS. The Ollama service may finish processing it; you can ask another question.', undefined, undefined, false);
+        } else {
+          addMessage('assistant', 'The local assistant could not complete that request. You can use the What If form or Category Tracker to run the same PFOS calculations.', undefined, undefined, false);
+        }
+      } finally {
+        if (requestController.current === controller) requestController.current = null;
+        setCanCancel(false);
+        setLoading(false);
+      }
+      return;
+    }
     if (scenarioIntent) {
       setMode('scenario');
       const currentOptions = await loadOptions();
       if (!currentOptions) {
-        addMessage('assistant', 'I can model that in PFOS, but could not load the available expense categories and goals. Please try again.');
+        addMessage('assistant', 'I can model that in PFOS, but could not load the available expense categories and goals. Please try again.', undefined, undefined, false);
         return;
       }
       const matchedCategory = currentOptions.categories.slice().sort((a,b)=>b.name.length-a.name.length).find((item)=>normalized.includes(item.name.toLowerCase()));
@@ -144,11 +207,11 @@ export function AssistantWidget() {
       if (durationMatch) setDuration(durationMatch[1]);
       else if (validYearMatch) setDuration(String(Number(yearMatch[1])*12));
       const missing = [!matchedCategory&&'expense category',!matchedGoal&&'savings goal',!amountMatch&&'monthly reduction amount',!durationMatch&&!validYearMatch&&'duration'].filter(Boolean);
-      addMessage('assistant', `I can model that in PFOS.${matchedCategory?` I matched the ${matchedCategory.name} category.`:''}${matchedGoal?` I matched the ${matchedGoal.name} goal.`:''}${amountMatch?` I read ${money(Number(amountMatch[1].replaceAll(',','')))} as the amount.`:''}${durationMatch||validYearMatch?' I filled in the duration.':''} Please review the What If form${missing.length?` and provide the ${missing.join(', ')}${missing.length===1?'':'s'}`:' and confirm the inputs'} before calculating. The calculation will show its assumptions.`);
+      addMessage('assistant', `I can model that in PFOS.${matchedCategory?` I matched the ${matchedCategory.name} category.`:''}${matchedGoal?` I matched the ${matchedGoal.name} goal.`:''}${amountMatch?` I read ${money(Number(amountMatch[1].replaceAll(',','')))} as the amount.`:''}${durationMatch||validYearMatch?' I filled in the duration.':''} Please review the What If form${missing.length?` and provide the ${missing.join(', ')}${missing.length===1?'':'s'}`:' and confirm the inputs'} before calculating. The calculation will show its assumptions.`, undefined, undefined, false);
       return;
     }
 
-    if (/\b(?:how much|average|spend|spending|spent|total)\b/.test(normalized)) {
+    if (spendingSummaryIntent) {
       const currentOptions = await loadOptions();
       const matchedCategory = currentOptions?.categories
         .slice().sort((a, b) => b.name.length - a.name.length)
@@ -157,9 +220,9 @@ export function AssistantWidget() {
         setLoading(true);
         try {
           const result = await api(`/assistant/spending-summary?category_id=${matchedCategory.id}&history_months=${historyMonths}`) as ScenarioResult['history'] & { category_name: string };
-          addMessage('assistant', `Across ${result.history_months} completed months (${result.history_start} through ${result.history_end}), PFOS found ${money(result.total_spending)} in ${result.category_name} outflows across ${result.transaction_count} categorized allocations. That averages ${money(result.average_monthly_spending)} per month. This total counts outflows and does not net credits or refunds.`, '/category-tracker', 'Open Category Tracker');
+          addMessage('assistant', `Across ${result.history_months} completed months (${result.history_start} through ${result.history_end}), PFOS found ${money(result.total_spending)} in ${result.category_name} outflows across ${result.transaction_count} categorized allocations. That averages ${money(result.average_monthly_spending)} per month. This total counts outflows and does not net credits or refunds.`, '/category-tracker', 'Open Category Tracker', false);
         } catch {
-          addMessage('assistant', 'I could not load that category summary right now. Please try again or review it in Category Tracker.', '/category-tracker', 'Open Category Tracker');
+          addMessage('assistant', 'I could not load that category summary right now. Please try again or review it in Category Tracker.', '/category-tracker', 'Open Category Tracker', false);
         } finally {
           setLoading(false);
         }
@@ -167,17 +230,69 @@ export function AssistantWidget() {
       }
       if (/\b(?:category|shopping|groceries|dining|travel|spend|spending)\b/.test(normalized)) {
         setMode('scenario');
-        addMessage('assistant', 'Which expense category should I use? Open What If to choose from the categories in your PFOS household.');
+        addMessage('assistant', 'Which expense category should I use? Open What If to choose from the categories in your PFOS household.', undefined, undefined, false);
         return;
       }
     }
 
-    const topic = findAssistantHelp(value, pathname);
-    if (topic) {
-      addMessage('assistant', topic.content, topic.href, `Open ${topic.title}`);
-      return;
+    const controller = new AbortController();
+    requestController.current = controller;
+    setCanCancel(true);
+    setLoading(true);
+    try {
+      let status = ollamaStatus;
+      if (!status?.ready) status = await refreshOllamaStatus(controller.signal);
+      if (controller.signal.aborted) {
+        if (requestController.current === controller) addMessage('assistant', 'The request was canceled in PFOS. The Ollama service may finish processing it; you can ask another question.');
+        return;
+      }
+      if (status?.ready) {
+        const history = [
+          ...messages.filter((message) => message.id !== 0 && message.aiContext !== false)
+            .map((message) => ({ role: message.role, content: message.text })),
+          { role: 'user', content: value },
+        ].slice(-12);
+        if (history[0]?.role === 'assistant') history.shift();
+        const response = await api('/assistant/chat', {
+          method: 'POST',
+          body: JSON.stringify({ messages: history }),
+          signal: controller.signal,
+        }) as { content: string };
+        addMessage('assistant', response.content);
+        return;
+      }
+
+      const topic = findAssistantHelp(value, pathname);
+      if (topic) {
+        addMessage('assistant', topic.content, topic.href, `Open ${topic.title}`);
+        return;
+      }
+      const explanation = status?.reason === 'disabled' || status?.reason === 'model_not_configured'
+        ? 'Local AI is not configured.'
+        : status?.reason === 'model_unavailable'
+          ? 'The configured local model is unavailable.'
+          : status ? 'Ollama is not reachable.' : 'I could not check the local assistant status.';
+      addMessage('assistant', `${explanation} I also could not find a supported answer in the PFOS help guide. Try asking about Available Cash, transactions, category spending, savings rules, goals, accounts, Plaid connections, or the household view.`);
+    } catch {
+      if (controller.signal.aborted) {
+        if (requestController.current === controller) addMessage('assistant', 'The request was canceled in PFOS. The Ollama service may finish processing it; you can ask another question.');
+        return;
+      }
+      const status = await refreshOllamaStatus(controller.signal);
+      if (controller.signal.aborted) return;
+      const topic = findAssistantHelp(value, pathname);
+      const fallback = topic?.content || 'I could not find a supported answer in the PFOS help guide. Try asking about Available Cash, transactions, category spending, savings rules, goals, accounts, Plaid connections, or the household view.';
+      const explanation = status?.reason === 'model_unavailable'
+        ? 'The configured local model is unavailable.'
+        : status?.reason === 'disabled' || status?.reason === 'model_not_configured'
+          ? 'Local AI is not configured.'
+          : 'The local assistant could not complete the response.';
+      addMessage('assistant', `${explanation} ${fallback}`, topic?.href, topic ? `Open ${topic.title}` : undefined);
+    } finally {
+      if (requestController.current === controller) requestController.current = null;
+      setCanCancel(false);
+      setLoading(false);
     }
-    addMessage('assistant', 'I could not find a supported answer in the PFOS help guide. Try asking about Available Cash, transactions, category spending, savings rules, goals, accounts, Plaid connections, or the household view.');
   }
 
   function submitQuestion(event: FormEvent<HTMLFormElement>) {
@@ -193,7 +308,7 @@ export function AssistantWidget() {
     if (!category || !goal) return;
     setLoading(true);
     setScenario(null);
-    addMessage('user', `What if I reduce ${category.name} by ${money(Number(reduction))} per month for ${duration} months and put it toward ${goal.name}?`);
+    addMessage('user', `What if I reduce ${category.name} by ${money(Number(reduction))} per month for ${duration} months and put it toward ${goal.name}?`, undefined, undefined, false);
     try {
       const result = await api('/assistant/scenario', {
         method: 'POST',
@@ -209,15 +324,20 @@ export function AssistantWidget() {
           : result.estimated_months_earlier === 0
             ? 'The projected month is unchanged under these assumptions.'
             : `Under these assumptions, the scenario is ${Math.abs(result.estimated_months_earlier)} months later.`;
-      addMessage('assistant', `Using the ${result.history.history_months}-month category history and the recent PFOS cash-flow estimate, ${result.goal.name} is projected to reach its target ${baseline} at the current pace and ${changed} in this scenario. ${timing}`);
+      addMessage('assistant', `Using the ${result.history.history_months}-month category history and the recent PFOS cash-flow estimate, ${result.goal.name} is projected to reach its target ${baseline} at the current pace and ${changed} in this scenario. ${timing}`, undefined, undefined, false);
     } catch {
-      addMessage('assistant', 'I could not calculate this scenario. Check that the selected category and goal are still available, then try again.');
+      addMessage('assistant', 'I could not calculate this scenario. Check that the selected category and goal are still available, then try again.', undefined, undefined, false);
     } finally {
       setLoading(false);
     }
   }
 
   function clearConversation() {
+    const activeRequest = requestController.current;
+    requestController.current = null;
+    activeRequest?.abort();
+    setCanCancel(false);
+    setLoading(false);
     setMessages([{ ...welcome, id: 0 }]);
     nextMessageId.current = 1;
     setScenario(null);
@@ -246,13 +366,30 @@ export function AssistantWidget() {
         <button type="button" aria-pressed={mode==='help'} onClick={()=>setMode('help')} className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${mode==='help'?'bg-white text-navy shadow-sm':'text-slate-600'}`}><HelpCircle size={16}/> App help</button>
         <button type="button" aria-pressed={mode==='scenario'} onClick={()=>{setMode('scenario');void loadOptions();}} className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${mode==='scenario'?'bg-white text-navy shadow-sm':'text-slate-600'}`}><Calculator size={16}/> What If</button>
       </div>
-      <p className="border-b border-emerald-100 bg-emerald-50 px-4 py-2 text-xs text-emerald-900">Privacy: PFOS computes scenarios in-app. No chat or financial data is sent to an external AI provider.</p>
+      <p className="border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs text-slate-700">{ollamaStatus?.ready
+        ? 'Your conversation and any requested calculation context are sent to Ollama on the PFOS API host. PFOS does not save chat history. Ollama cloud settings are managed separately; disable cloud features there for local-only inference. PFOS has no cloud AI fallback.'
+        : ollamaStatus?.reason === 'disabled' || ollamaStatus?.reason === 'model_not_configured'
+          ? 'Local AI is not configured. PFOS built-in help and deterministic financial calculations remain available.'
+          : ollamaStatus?.reason === 'model_unavailable'
+            ? 'The configured local Ollama model is unavailable. PFOS built-in help and deterministic financial calculations remain available.'
+            : 'When enabled, conversations and requested calculation context go to Ollama on the PFOS API host. PFOS does not save chat history. Ollama cloud settings are managed separately; PFOS has no cloud AI fallback.'}</p>
+      {ollamaStatus && !ollamaStatus.ready && <details className="max-h-40 overflow-y-auto border-b bg-white px-4 py-2 text-xs text-slate-700">
+        <summary className="cursor-pointer font-semibold text-navy">Set up local Ollama</summary>
+        <ol className="mt-2 list-decimal space-y-1 pl-4">
+          <li><a className="underline" href="https://ollama.com/download" target="_blank" rel="noreferrer">Install Ollama</a>, open it, and download a local tool-capable model such as <code>qwen2.5:7b</code> with <code>ollama pull qwen2.5:7b</code>.</li>
+          <li>For local-only inference, disable Ollama cloud features in <code>~/.ollama/server.json</code> using <code>{'{"disable_ollama_cloud":true}'}</code>, then restart Ollama. PFOS cannot configure this for you.</li>
+          <li>For the macOS desktop app, use Terminal: <code>launchctl setenv PFOS_OLLAMA_ENABLED true</code> and <code>launchctl setenv PFOS_OLLAMA_MODEL qwen2.5:7b</code>. Then fully quit and reopen PFOS.</li>
+          <li>For local development, set <code>PFOS_OLLAMA_ENABLED=true</code> and <code>PFOS_OLLAMA_MODEL=qwen2.5:7b</code> in the backend environment, then restart the API.</li>
+        </ol>
+        <p className="mt-2">The current Intel DMG supports macOS 13+, while current Ollama for Mac requires macOS 14+ and runs CPU-only on Intel. Model weights are downloaded separately and are not bundled with PFOS. See <a className="underline" href="https://docs.ollama.com/faq#how-do-i-disable-ollama-cloud-features" target="_blank" rel="noreferrer">Ollama's cloud privacy setup</a>.</p>
+      </details>}
       <div className="flex-1 space-y-3 overflow-y-auto p-4" role="log" aria-live="polite" aria-relevant="additions">
         {messages.map((message) => <div key={message.id} className={`max-w-[92%] rounded-2xl px-3 py-2.5 text-sm leading-relaxed ${message.role==='user'?'ml-auto rounded-br-sm bg-navy text-white':'rounded-bl-sm bg-slate-100 text-slate-800'}`}>
           <p className="whitespace-pre-wrap"><FinancialValue>{message.text}</FinancialValue></p>
           {message.href&&<Link href={message.href} onClick={()=>setOpen(false)} className={`mt-2 inline-flex items-center gap-1 text-xs font-semibold underline ${message.role==='user'?'text-white':'text-navy'}`}>{message.hrefLabel||'Open in PFOS'} <ExternalLink size={12}/></Link>}
         </div>)}
-        {loading&&<p className="flex items-center gap-2 text-xs text-slate-500" role="status"><LoaderCircle size={14} className="animate-spin"/> Calculating with PFOS data…</p>}
+        {loading&&<p className="flex items-center gap-2 text-xs text-slate-500" role="status"><LoaderCircle size={14} className="animate-spin"/> {ollamaStatus?.ready?'Waiting for the local assistant…':'Preparing your answer…'}</p>}
+        {canCancel&&<button type="button" onClick={()=>requestController.current?.abort()} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">Cancel request</button>}
       </div>
 
       {scenario&&<div className="max-h-56 overflow-y-auto border-t bg-slate-50 p-4 text-sm">
@@ -281,9 +418,9 @@ export function AssistantWidget() {
 
       <div className="border-t p-3">
         <div className="mb-2 flex flex-wrap gap-2">{mode==='help'?suggestions.map((topic)=><button key={topic.id} type="button" onClick={()=>useSuggestedQuestion(topic.title)} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-left text-[11px] text-slate-700 hover:border-navy hover:text-navy">{topic.title}</button>):<button type="button" onClick={()=>useSuggestedQuestion('How much am I spending on shopping?')} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[11px] text-slate-700 hover:border-navy hover:text-navy">Summarize a category</button>}</div>
-        <form onSubmit={submitQuestion} className="flex items-center gap-2"><input ref={inputRef} aria-label="Ask PFOS Assistant" className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3 py-2.5 text-sm outline-none focus:border-navy focus:ring-2 focus:ring-navy/10" value={question} onChange={(event)=>setQuestion(event.target.value)} placeholder="Ask about PFOS or spending…" maxLength={500}/><button type="submit" disabled={!question.trim()||loading} aria-label="Send question" className="rounded-xl bg-navy p-2.5 text-white disabled:opacity-40"><Send size={17}/></button></form>
+        <form onSubmit={submitQuestion} className="flex items-center gap-2"><input ref={inputRef} aria-label="Ask PFOS Assistant" className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3 py-2.5 text-sm outline-none focus:border-navy focus:ring-2 focus:ring-navy/10" value={question} onChange={(event)=>setQuestion(event.target.value)} placeholder="Ask about PFOS or spending…" maxLength={2000}/><button type="submit" disabled={!question.trim()||loading} aria-label="Send question" className="rounded-xl bg-navy p-2.5 text-white disabled:opacity-40"><Send size={17}/></button></form>
       </div>
     </section>}
-    <button ref={triggerRef} type="button" aria-label={open?'Close PFOS Assistant':'Open PFOS Assistant'} aria-expanded={open} onClick={()=>setOpen((current)=>!current)} className="flex items-center gap-2 rounded-full bg-navy px-4 py-3 text-sm font-semibold text-white shadow-lg ring-1 ring-white/20 transition hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-navy"><MessageCircle size={19}/><span className="hidden sm:inline">Ask PFOS</span></button>
+    <button ref={triggerRef} type="button" aria-label={open?'Close PFOS Assistant':'Open PFOS Assistant'} aria-expanded={open} onClick={()=>{const next=!open;setOpen(next);if(next)void refreshOllamaStatus();}} className="flex items-center gap-2 rounded-full bg-navy px-4 py-3 text-sm font-semibold text-white shadow-lg ring-1 ring-white/20 transition hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-navy"><MessageCircle size={19}/><span className="hidden sm:inline">Ask PFOS</span></button>
   </div>;
 }

@@ -12,7 +12,7 @@ export async function api(path: string, init: RequestInit = {}) {
     '/dashboard', '/transactions', '/available-cash-planner', '/planner-carryovers',
     '/planner-adjustments', '/planner-income-allocations', '/planner-income-rules',
     '/classification-rules', '/classification-suggestions', '/category-tracker', '/reports',
-    '/assistant/options', '/assistant/spending-summary', '/assistant/scenario',
+    '/assistant/options', '/assistant/spending-summary', '/assistant/scenario', '/assistant/chat',
   ];
   if (view && !path.includes('view_user_id=') && !path.includes('view_scope=joint')
     && viewScopedPaths.some((prefix) => path.startsWith(prefix))) {

@@ -148,6 +148,11 @@ the launched backend.
 The local desktop browser session is separate from the earlier server-connected
 shell session so old server tokens cannot be mistaken for local login credentials.
 
+The optional PFOS assistant can use an Ollama model running on this same Mac.
+See the [Ollama setup and privacy guide](OLLAMA-SETUP.md) for the supported
+Intel/macOS overlap, local-only configuration, model download, and opt-in steps.
+Ollama and its model weights are separate installs and are not included in PFOS.
+
 The API binds only to `127.0.0.1`. Each launch uses a new random capability delivered
 through a private stdin pipe. Electron attaches it only to requests from the PFOS
 window's trusted local frame, and only to that API. The renderer receives the public

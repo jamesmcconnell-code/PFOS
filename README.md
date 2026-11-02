@@ -169,6 +169,8 @@ then run `npm start --prefix desktop`; PFOS manages its own interface and API.
 Use `npm run dev --prefix desktop` for frontend development.
 An [unsigned Intel macOS installer](docs/DESKTOP-INSTALLER.md) is available in `desktop/dist/`
 (step 8). Signing and notarization remain before public release.
+The optional local AI assistant and Ollama configuration are described in the
+[Ollama setup and privacy guide](docs/OLLAMA-SETUP.md).
 
 ## API surface
 

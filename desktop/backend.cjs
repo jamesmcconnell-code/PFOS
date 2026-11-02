@@ -16,6 +16,11 @@ function backendEnvironment() {
     if (process.env[key]) env[key] = process.env[key];
   }
   // No PATH/PYTHONPATH, server DATABASE_URL, provider keys, or inherited secrets.
+  // These two non-secret settings explicitly opt the local desktop backend into
+  // its loopback-only Ollama integration.
+  for (const key of ['PFOS_OLLAMA_ENABLED', 'PFOS_OLLAMA_MODEL']) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
   return env;
 }
 
